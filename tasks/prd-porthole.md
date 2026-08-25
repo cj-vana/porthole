@@ -31,7 +31,7 @@ Description: As a developer, I need a Rust binary on Linux that captures the pri
 
 Acceptance Criteria:
 - [ ] Rust binary `porthole-agent` runs on the Linux machine and captures the primary display at 30+ fps
-- [ ] Capture path selected automatically: PipeWire (Wayland) with X11 fallback
+- [ ] Capture path selected automatically: wlr-screencopy or PipeWire on Wayland, with X11 fallback
 - [ ] Logs negotiated resolution, framerate, and capture backend on startup
 - [ ] `cargo clippy` passes with no warnings
 
@@ -212,7 +212,7 @@ Mac app:
 ## Technical Considerations
 
 - Agent language: Rust. Single static-ish binary, strong GStreamer/FFmpeg bindings, safe `uinput` handling. GStreamer recommended for the capture+encode pipeline (best PipeWire and NVENC element integration).
-- Capture: PipeWire on Wayland, X11 (XShm/XDamage) fallback. Confirm the target machine's session type early, since it decides which path gets polished first.
+- Capture: the target machine is Hyprland/Wayland, so the primary path is native Wayland capture via wlr-screencopy / ext-image-copy-capture (the approach wl-screenrec uses), which avoids portal permission dialogs and provides damage tracking. PipeWire via xdg-desktop-portal-hyprland is the alternative. X11 (XShm/XDamage) fallback stays for non-Wayland setups.
 - Encode: H.264 default, HEVC optional; low-latency presets for Gaming mode; configurable bitrate (default ~40 Mbps for 1440p60 LAN quality mode). Two encoder backends: NVENC (default) and VAAPI on the Ryzen iGPU (GStreamer `vah264enc`/`vah265enc` or FFmpeg `*_vaapi` on the iGPU's `/dev/dri/renderD*` node). When capture runs on the dGPU and encode on the iGPU, expect one cross-GPU buffer copy; use dma-buf import where the stack allows it.
 - High refresh: 120/144fps modes raise bitrate budgets (expect roughly 60-80 Mbps for H.264 at 1440p144) and require the Linux display to actually run at that refresh rate. HEVC earns its keep here.
 - Decode/render (Mac): VideoToolbox → Metal. Render at the drawable's native resolution for Retina sharpness.
@@ -233,9 +233,9 @@ Mac app:
 
 ## Open Questions
 
-- What distro, desktop environment, and session type (X11 or Wayland) does the Linux machine run? Decides whether PipeWire or X11 capture is the primary path.
-- Resolution confirmed: 2560×1440. The user requires 120/144fps modes, so the Linux display is assumed to run at 144Hz. Confirm its actual maximum refresh rate.
-- Is the Ryzen iGPU enabled in the BIOS? The VAAPI backend needs it exposed as a `/dev/dri` render node; some boards disable the iGPU when a dGPU is installed.
+- Answered: Omarchy (Arch-based), Hyprland on Wayland (verified over SSH). Capture goes through wlr-screencopy or PipeWire; the X11 fallback stays for other setups.
+- Answered: the Ryzen iGPU is enabled. /dev/dri shows both render nodes (NVIDIA pci-0000:01:00.0, AMD pci-0000:0b:00.0), so the VAAPI backend has a device. GStreamer's va plugin is not installed on the box (nvcodec is); FFmpeg is.
+- Resolution confirmed: 2560×1440. Still open: the display's maximum refresh rate (xrandr reports nothing under Wayland; check `hyprctl monitors` on the machine).
 - Is 4:4:4 chroma worth pursuing for perfect text after v1 (VideoToolbox supports it on HEVC; NVENC support varies by GPU)?
 - Headless operation: should the agent be able to create a virtual display when no monitor is attached to the Linux box?
 - Final product name is undecided; "Porthole" is a codename.
