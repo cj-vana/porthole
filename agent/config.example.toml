@@ -1,0 +1,20 @@
+# porthole-agent configuration (PRD FR-11: single config file).
+# All fields optional; uncomment to override. CLI flags override file values.
+
+# UDP port for the video stream.
+# port_video = 52800
+
+# TCP port for the control channel (handshake, settings, keyframe requests).
+# port_control = 52801
+
+# UDP port for the Opus audio stream.
+# port_audio = 52802
+
+# NVENC target bitrate in Mbps (40 is the PRD default for 1440p LAN quality mode).
+# bitrate_mbps = 40
+
+# Video codec: "h264" (default) or "hevc".
+# codec = "h264"
+
+# Stream framerate: 60 (default), 120, or 144.
+# fps = 60

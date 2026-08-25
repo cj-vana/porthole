@@ -1,0 +1,17 @@
+[Unit]
+Description=Porthole Agent (Linux screen capture / NVENC streaming for the Porthole Mac client)
+After=graphical-session.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/porthole-agent
+Restart=on-failure
+RestartSec=2
+# TODO(US-001+): the agent will need access to the active session
+# (XDG_RUNTIME_DIR / PipeWire socket) and /dev/uinput for input injection.
+# A systemd *user* service inside the graphical session covers both; if
+# headless virtual-display support lands later, revisit the unit.
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,36 @@
+name: Porthole
+options:
+  bundleIdPrefix: com.porthole
+  createIntermediateGroups: true
+targets:
+  Porthole:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Porthole
+        excludes:
+          - Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.porthole.mac
+        PRODUCT_NAME: Porthole
+        INFOPLIST_FILE: Porthole/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        SWIFT_VERSION: "5.0"
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        CODE_SIGN_STYLE: Automatic
+        # Ad hoc ("Sign to Run Locally"): no developer cert needed for LAN dev builds.
+        CODE_SIGN_IDENTITY: "-"
+        # App sandbox deliberately OFF for now — see README (raw UDP/TCP + GameController).
+        ENABLE_APP_SANDBOX: NO
+        ENABLE_HARDENED_RUNTIME: NO
+schemes:
+  Porthole:
+    build:
+      targets:
+        Porthole: all
+    run:
+      config: Debug

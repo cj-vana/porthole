@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo build --locked
+        working-directory: agent
+      - run: cargo clippy -- -D warnings
+        working-directory: agent
+      - run: cargo test
+        working-directory: agent
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install xcodegen
+      - run: xcodegen generate
+        working-directory: macos
+      - run: xcodebuild -scheme Porthole -configuration Debug build CODE_SIGNING_ALLOWED=NO
+        working-directory: macos
