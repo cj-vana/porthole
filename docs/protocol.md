@@ -2,7 +2,7 @@
 
 Implemented by `porthole-agent` (Rust, `agent/src/protocol.rs` is the
 reference implementation) and the Porthole Mac client. Version 1 covers
-video only; audio rides its own UDP port later (US-009).
+video, control, and input; audio rides its own UDP port later (US-009).
 
 Two channels:
 
@@ -54,6 +54,69 @@ two of gap and a bitrate spike from the IDR; periodic IDRs (every
 The video sequence number is NOT reset by an encoder restart; receivers
 should treat it as one continuous stream.
 
+### Input messages (client -> agent, US-006)
+
+One control connection carries hello + keyframe_request + input for one
+client. Input messages are fixed-size, applied to a virtual pointer and
+virtual keyboard on the agent's seat as they arrive (no batching). All
+coordinates are for the output the agent captures (the one in hello).
+
+#### pointer_motion_abs (type 0x10)
+
+```
+offset  size  field
+0       4     x (BE i32, output pixels)
+4       4     y (BE i32, output pixels)
+```
+
+#### pointer_motion_rel (type 0x11)
+
+```
+offset  size  field
+0       4     dx (BE i32, 1/256 pixel units; see below)
+4       4     dy (BE i32, 1/256 pixel units)
+```
+
+#### pointer_button (type 0x12)
+
+```
+offset  size  field
+0       2     button (BE u16, evdev BTN_* code; 0x110 left, 0x111 right,
+              0x112 middle)
+2       1     state: 1 = pressed, 0 = released
+```
+
+#### pointer_axis (type 0x13)
+
+```
+offset  size  field
+0       1     axis: 0 = vertical, 1 = horizontal (matches wl_pointer.axis)
+1       1     source: 0 = wheel, 1 = finger, 2 = continuous, 3 = wheel tilt
+              (matches wl_pointer.axis_source)
+2       4     value (BE i32, 1/256 pixel units; see below)
+```
+
+Relative motion and axis values are fixed-point pixels in the wl_fixed
+convention: divide by 256 to get pixels. This is pixel-precise, which the
+Mac trackpad scroll path (pixel deltas, momentum) maps onto directly. For
+axis source 0 (wheel), one click is 10 pixels (value 2560). Positive
+vertical values scroll down.
+
+#### key (type 0x14)
+
+```
+offset  size  field
+0       2     key (BE u16, evdev KEY_* code, e.g. 30 = KEY_A)
+2       1     state: 1 = pressed, 0 = released
+```
+
+The virtual keyboard runs the evdev/pc105/us xkb keymap. Known gap: modifier
+state (shift and friends) is not yet honored for typed characters; the
+virtual-keyboard protocol applies modifiers through a separate `modifiers`
+request that the wire format does not carry yet. Add a `key_modifiers`
+message (type 0x15, four BE u32: depressed/latched/locked/group, matching
+the protocol request) when the Mac client needs shifted characters.
+
 ## Video channel (UDP)
 
 Each encoded access unit (Annex B h264/hevc) is split into fragments with a
@@ -86,7 +149,8 @@ Receiver rules:
 - Start decoding (or dumping) from the first keyframe access unit.
 
 Reference receiver: `cargo run --example receiver -- <agent-ip> [--dump
-out.h264]`.
+out.h264]`. Scripted input sender: `cargo run --example input_sender --
+<agent-ip> <move-abs|move-rel|click|scroll|type> ...`.
 
 ## Notes for later versions
 

@@ -24,6 +24,122 @@ pub const CONTROL_MSG_HELLO: u8 = 1;
 /// Control message type: client -> server, please send a fresh IDR.
 pub const CONTROL_MSG_KEYFRAME_REQUEST: u8 = 2;
 
+// Input messages (client -> agent, US-006). All are fixed-size.
+/// Pointer moved to absolute output pixel coordinates.
+pub const CONTROL_MSG_POINTER_MOTION_ABS: u8 = 0x10;
+/// Pointer moved by a relative delta, in 1/256 pixel units (wl_fixed).
+pub const CONTROL_MSG_POINTER_MOTION_REL: u8 = 0x11;
+/// Pointer button press/release (evdev BTN_* code).
+pub const CONTROL_MSG_POINTER_BUTTON: u8 = 0x12;
+/// Pointer scroll/axis event.
+pub const CONTROL_MSG_POINTER_AXIS: u8 = 0x13;
+/// Keyboard key press/release (evdev KEY_* code).
+pub const CONTROL_MSG_KEY: u8 = 0x14;
+
+/// Axis identifiers for pointer_axis (values match wl_pointer.axis).
+pub const AXIS_VERTICAL: u8 = 0;
+pub const AXIS_HORIZONTAL: u8 = 1;
+
+/// Axis sources for pointer_axis (values match wl_pointer.axis_source).
+pub const AXIS_SOURCE_WHEEL: u8 = 0;
+pub const AXIS_SOURCE_FINGER: u8 = 1;
+pub const AXIS_SOURCE_CONTINUOUS: u8 = 2;
+
+/// One input event from the client. Encoded as fixed-size control message
+/// payloads; see docs/protocol.md for the layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputEvent {
+    /// Absolute position in output pixels.
+    PointerMotionAbs { x: i32, y: i32 },
+    /// Relative delta in 1/256 pixel units.
+    PointerMotionRel { dx256: i32, dy256: i32 },
+    /// evdev BTN_* code (e.g. 0x110 = left), pressed = true on press.
+    PointerButton { button: u16, pressed: bool },
+    /// Scroll: axis (AXIS_VERTICAL/HORIZONTAL), source (AXIS_SOURCE_*),
+    /// value in 1/256 pixel units (2560 = one wheel click, 10 px).
+    PointerAxis { axis: u8, source: u8, value256: i32 },
+    /// evdev KEY_* code, pressed = true on press.
+    Key { code: u16, pressed: bool },
+}
+
+impl InputEvent {
+    /// Encode to (message type, payload).
+    pub fn encode(&self) -> (u8, Vec<u8>) {
+        match *self {
+            Self::PointerMotionAbs { x, y } => (
+                CONTROL_MSG_POINTER_MOTION_ABS,
+                [x.to_be_bytes(), y.to_be_bytes()].concat(),
+            ),
+            Self::PointerMotionRel { dx256, dy256 } => (
+                CONTROL_MSG_POINTER_MOTION_REL,
+                [dx256.to_be_bytes(), dy256.to_be_bytes()].concat(),
+            ),
+            Self::PointerButton { button, pressed } => (
+                CONTROL_MSG_POINTER_BUTTON,
+                [button.to_be_bytes().as_slice(), &[u8::from(pressed)]].concat(),
+            ),
+            Self::PointerAxis {
+                axis,
+                source,
+                value256,
+            } => (
+                CONTROL_MSG_POINTER_AXIS,
+                [
+                    &[axis, source][..],
+                    value256.to_be_bytes().as_slice(),
+                ]
+                .concat(),
+            ),
+            Self::Key { code, pressed } => (
+                CONTROL_MSG_KEY,
+                [code.to_be_bytes().as_slice(), &[u8::from(pressed)]].concat(),
+            ),
+        }
+    }
+
+    /// Decode from (message type, payload); None for unknown types or wrong
+    /// payload lengths.
+    pub fn decode(msg_type: u8, payload: &[u8]) -> Option<Self> {
+        let i32_at = |i: usize| -> Option<i32> {
+            Some(i32::from_be_bytes(payload.get(i..i + 4)?.try_into().ok()?))
+        };
+        let u16_at = |i: usize| -> Option<u16> {
+            Some(u16::from_be_bytes(payload.get(i..i + 2)?.try_into().ok()?))
+        };
+        match msg_type {
+            CONTROL_MSG_POINTER_MOTION_ABS if payload.len() == 8 => Some(Self::PointerMotionAbs {
+                x: i32_at(0)?,
+                y: i32_at(4)?,
+            }),
+            CONTROL_MSG_POINTER_MOTION_REL if payload.len() == 8 => Some(Self::PointerMotionRel {
+                dx256: i32_at(0)?,
+                dy256: i32_at(4)?,
+            }),
+            CONTROL_MSG_POINTER_BUTTON if payload.len() == 3 => Some(Self::PointerButton {
+                button: u16_at(0)?,
+                pressed: payload[2] != 0,
+            }),
+            CONTROL_MSG_POINTER_AXIS if payload.len() == 6 => Some(Self::PointerAxis {
+                axis: payload[0],
+                source: payload[1],
+                value256: i32_at(2)?,
+            }),
+            CONTROL_MSG_KEY if payload.len() == 3 => Some(Self::Key {
+                code: u16_at(0)?,
+                pressed: payload[2] != 0,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Write one input event as a framed control message.
+pub fn write_input_event(stream: &mut impl Write, event: &InputEvent) -> std::io::Result<()> {
+    let (msg_type, payload) = event.encode();
+    write_control_message(stream, msg_type, &payload)
+}
+
+
 /// Codec tag on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecTag {
@@ -388,5 +504,37 @@ mod tests {
         let (msg_type, payload) = read_control_message(&mut cursor).unwrap().expect("message");
         assert_eq!(msg_type, CONTROL_MSG_KEYFRAME_REQUEST);
         assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn input_events_round_trip() {
+        let events = [
+            InputEvent::PointerMotionAbs { x: 500, y: 400 },
+            InputEvent::PointerMotionAbs { x: -1, y: 0 },
+            InputEvent::PointerMotionRel { dx256: 256, dy256: -128 },
+            InputEvent::PointerButton { button: 0x110, pressed: true },
+            InputEvent::PointerButton { button: 0x111, pressed: false },
+            InputEvent::PointerAxis { axis: AXIS_VERTICAL, source: AXIS_SOURCE_CONTINUOUS, value256: 4250 },
+            InputEvent::PointerAxis { axis: AXIS_HORIZONTAL, source: AXIS_SOURCE_WHEEL, value256: -2560 },
+            InputEvent::Key { code: 35, pressed: true },  // KEY_H
+            InputEvent::Key { code: 28, pressed: false }, // KEY_ENTER
+        ];
+        for event in events {
+            let (msg_type, payload) = event.encode();
+            assert_eq!(InputEvent::decode(msg_type, &payload), Some(event));
+            // Full framed round-trip through a stream.
+            let framed = encode_control_message(msg_type, &payload);
+            let mut cursor = std::io::Cursor::new(framed);
+            let (t, p) = read_control_message(&mut cursor).unwrap().expect("message");
+            assert_eq!(InputEvent::decode(t, &p), Some(event));
+        }
+    }
+
+    #[test]
+    fn input_events_reject_malformed() {
+        assert!(InputEvent::decode(CONTROL_MSG_POINTER_MOTION_ABS, &[0; 7]).is_none());
+        assert!(InputEvent::decode(CONTROL_MSG_KEY, &[0; 2]).is_none());
+        assert!(InputEvent::decode(CONTROL_MSG_KEY, &[0; 4]).is_none());
+        assert!(InputEvent::decode(0x7f, &[0; 8]).is_none());
     }
 }

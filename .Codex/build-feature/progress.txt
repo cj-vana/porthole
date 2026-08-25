@@ -21,6 +21,7 @@ Feature: Porthole full build-out (PRD US-002 through US-014)
 - Git: parent agent (orchestrator) commits and pushes per story; subagents never run git.
 - Wire protocol (US-003): implemented once in agent/src/protocol.rs (lib target), spec in docs/protocol.md, reference receiver in agent/examples/receiver.rs. New wire behavior changes there first, tests included.
 - Verification networking: UFW on the box blocks inbound LAN except SSH; use Tailscale (box 100.105.41.71). Also: backgrounded processes over SSH hold the session open; start the agent with `setsid ... </dev/null >log 2>&1 &`, and never `pkill -f` a pattern that matches your own shell cmdline (use `pgrep -x porthole-agent` + kill -INT).
+- Input (US-006a): no uinput (root-only); Hyprland takes zwlr_virtual_pointer_v1 (wayland-protocols-wlr crate) + virtual-keyboard-unstable-v1 (vendored XML in agent/protocols/ + wayland-scanner codegen; the wayland-protocols crate dropped it). xkbcommon crate API lives in xkbcommon::xkb with u32 flag consts. Color tagging: use the setparams filter, not ffmpeg -color_* output options; NVENC needs nv12 input for the matrix tag to stick.
 ---
 
 ## 2026-08-25: US-002 hardware encoding (NVENC + VAAPI) done
@@ -181,3 +182,52 @@ Learnings for future iterations:
 - AppleScript 'tell app Porthole to id of window' returns nothing for this
   SwiftUI app; find the window id via CGWindowListCopyWindowInfo matching
   kCGWindowOwnerName, then screencapture -l<id> works.
+
+## 2026-08-25: BT.709 tagging fix + US-006a input injection done
+
+Task 0 (color): the ffmpeg CLI -color_primaries/-color_trc/-colorspace
+output options do not reach the encoder VUI in FFmpeg 9. Fix is a setparams
+filter prefix. NVENC extra quirk: with bgra input its internal RGB to YUV
+conversion forces a bt470bg matrix tag, so NVENC input is now
+setparams(...),format=nv12 (CPU swscale; measured cheap). VAAPI:
+setparams(...),hwupload,scale_vaapi=format=nv12. ffprobe on fresh dumps:
+bt709/bt709/bt709 on both backends.
+
+US-006a: input rides the control channel as fixed-size messages
+(0x10-0x14: motion_abs, motion_rel, button, axis, key) decoded in
+protocol.rs. Agent injects via zwlr_virtual_pointer_v1 (wayland-protocols-wlr
+crate) and virtual-keyboard-unstable-v1 (vendored XML + wayland-scanner,
+because the wayland-protocols crate no longer ships it; copy from
+hyprwm/Hyprland's protocols dir, which is also our compositor's canonical
+copy). Keymap: evdev/pc105/us built with the xkbcommon crate into a memfd.
+Input events go control-reader thread straight to the input thread's mpsc
+(no capture-tick latency). examples/input_sender.rs sends scripted actions.
+
+Verified on the box (agent headless, sender on the Mac over Tailscale):
+hyprctl cursorpos shows exactly 500, 400 after move-abs; clicking the
+unfocused foot window moved focus (hyprctl activewindow); type "Hello\n"
+into foot running cat produced the file with "hello". Scroll path confirmed
+in debug logs (PointerAxis applied).
+
+Files changed:
+- agent/src/encode/ffmpeg.rs: setparams BT.709 tagging, nv12 input for NVENC.
+- agent/src/protocol.rs: InputEvent + encode/decode + write_input_event,
+  3 new unit tests (round-trips, malformed rejection).
+- agent/src/input/mod.rs (rewritten) + agent/src/input/wayland.rs (new,
+  Linux-gated): WaylandInput session on its own connection/thread.
+- agent/protocols/virtual-keyboard-unstable-v1.xml (new, vendored).
+- agent/src/transport/mod.rs: control reader decodes input messages and
+  forwards to the input session channel.
+- agent/examples/input_sender.rs (new), docs/protocol.md (input section),
+  agent/README.md, agent/Cargo.toml (wayland-scanner, wayland-backend,
+  xkbcommon; wayland-protocols dropped).
+
+Learnings for future iterations:
+- Virtual keyboard modifier gap: key events alone do not shift characters;
+  the protocol applies modifiers via its modifiers() request. protocol.md
+  documents a key_modifiers (0x15) message shape for when the Mac client
+  needs it.
+- Hyprland 0.56 Lua API: hl.dsp.exec_raw returns ok but spawns nothing
+  reliably; for test windows just run the app over SSH with
+  XDG_RUNTIME_DIR/WAYLAND_DISPLAY set. hyprctl dispatch is Lua-routed and
+  mangles unquoted args.

@@ -12,7 +12,6 @@ mod audio;
 mod capture;
 mod config;
 mod encode;
-#[allow(dead_code)]
 mod input;
 mod transport;
 mod virtual_display;
@@ -344,7 +343,8 @@ async fn main() -> anyhow::Result<()> {
             keyframe_interval_secs: cfg.keyframe_interval_secs,
             video_port: cfg.port_video,
         };
-        let events = transport::spawn_control_listener(&cfg, hello)
+        let input_tx = input::spawn(capture_format.width, capture_format.height);
+        let events = transport::spawn_control_listener(&cfg, hello, input_tx)
             .context("transport control channel startup failed")?;
         let sender = transport::VideoSender::new(&cfg).context("transport video socket failed")?;
         let encoder = encode::create(&cfg, &capture_format);

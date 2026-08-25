@@ -8,9 +8,10 @@ the machine's NVIDIA dGPU (NVENC) or on the Ryzen iGPU (VAAPI, selectable via
 Current state: screen capture (US-001) works on Wayland via
 wlr-screencopy, headless virtual displays (US-015) work on Hyprland,
 hardware encode (US-002) works with NVENC or VAAPI via an ffmpeg subprocess,
-and LAN transport (US-003) streams fragmented UDP video with a TCP control
-channel (tested: 2560x1440 at 60 fps to a Mac receiver). Input (US-006) and
-audio (US-009) are still trait stubs with TODOs.
+LAN transport (US-003) streams fragmented UDP video with a TCP control
+channel, and input injection (US-006a) drives a virtual pointer and keyboard
+on the Linux session from control-channel messages. Audio (US-009) is still
+a trait stub with TODOs.
 
 ## Build
 
@@ -22,9 +23,9 @@ cargo build --release  # release binary at target/release/porthole-agent
 The crate builds on macOS and Linux; capture and encode are cfg-gated and
 only active on Linux (macOS keeps noop versions for development). Runtime
 requirement on Linux: `ffmpeg` with the `h264_nvenc`/`hevc_nvenc` and
-`h264_vaapi`/`hevc_vaapi` encoders. Later stories will need:
+`h264_vaapi`/`hevc_vaapi` encoders, plus `libxkbcommon` (input injection,
+already present wherever Hyprland runs). Later stories will need:
 
-- `libevdev`/`uinput` headers (input injection, US-006)
 - An NVIDIA GPU with NVENC and the proprietary driver (default encoder), or a
   Ryzen iGPU with VAAPI support for the `--encoder vaapi` path
 
@@ -70,6 +71,21 @@ the old one. Video goes to the control peer's IP at the negotiated port, so
 anything LAN-like (including Tailscale) works. Verify with the reference
 receiver: `cargo run --example receiver -- <agent-ip> --dump out.h264`,
 then `ffprobe out.h264`.
+
+### Input injection (US-006a)
+
+/dev/uinput is root-only, so pointer and keyboard events from the client
+ride the control channel (message types 0x10-0x14, see `../docs/protocol.md`)
+and are injected through Hyprland's Wayland protocols:
+zwlr_virtual_pointer_v1 (absolute/relative motion, buttons, axis) and
+virtual-keyboard-unstable-v1 (evdev key codes, with an evdev/pc105/us xkb
+keymap uploaded from a memfd via libxkbcommon). The virtual-keyboard
+bindings are generated from a vendored XML copy
+(`protocols/virtual-keyboard-unstable-v1.xml`, from Hyprland's tree) because
+the wayland-protocols crate no longer ships that protocol. Known gap:
+modifier state for typed characters needs a future key_modifiers message
+(protocol.md documents it). Verify without a Mac:
+`cargo run --example input_sender -- <agent-ip> type hello`.
 
 ## Configuration
 
@@ -127,6 +143,6 @@ cargo test
 Module map: `capture` (wlr-screencopy on Wayland, US-001), `virtual_display`
 (Hyprland headless outputs, US-015), `encode` (ffmpeg subprocess: NVENC or
 VAAPI, H.264/HEVC, US-002), `transport` (TCP control + UDP video, US-003),
-`input` (uinput keyboard/mouse/gamepad, US-006/US-014), `audio` (Opus over
-UDP, US-009). The wire format itself lives in the library target
+`input` (zwlr_virtual_pointer_v1 + virtual-keyboard-v1, US-006a), `audio`
+(Opus over UDP, US-009). The wire format itself lives in the library target
 (`src/lib.rs` + `src/protocol.rs`), shared with `examples/receiver.rs`.

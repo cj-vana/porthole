@@ -73,17 +73,28 @@ impl FfmpegEncoder {
         ]);
         match cfg.encoder {
             EncoderBackend::Nvenc => {
-                // NVENC accepts bgra and converts on-GPU (CUDA). `ll` tune:
-                // zero-latency mode, no B-frame reordering.
-                cmd.args(["-preset", "p3", "-tune", "ll"]);
+                // setparams tags BT.709 at the frame level (the Mac client
+                // honors VUI; US-005 follow-up). NVENC's internal RGB to YUV
+                // conversion ignores setparams for the matrix and tags
+                // bt470bg with bgra input, so we convert to nv12 in the
+                // filter chain (CPU swscale, measured cheap at 1440p60).
+                // `ll` tune: zero-latency mode, no B-frame reordering.
+                cmd.args([
+                    "-vf",
+                    "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,format=nv12",
+                    "-preset",
+                    "p3",
+                    "-tune",
+                    "ll",
+                ]);
             }
             EncoderBackend::Vaapi => {
-                // Upload, then convert to nv12 on the iGPU.
+                // Tag BT.709, upload, then convert to nv12 on the iGPU.
                 cmd.args([
                     "-vaapi_device",
                     VAAPI_DEVICE,
                     "-vf",
-                    "hwupload,scale_vaapi=format=nv12",
+                    "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,hwupload,scale_vaapi=format=nv12",
                 ]);
             }
         }

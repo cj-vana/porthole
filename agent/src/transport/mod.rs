@@ -13,7 +13,7 @@ use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::mpsc;
 use std::thread;
 
-use porthole_agent::protocol::{self, Hello};
+use porthole_agent::protocol::{self, Hello, InputEvent};
 
 use crate::config::Config;
 use crate::encode::EncodedFrame;
@@ -30,19 +30,30 @@ pub enum ControlEvent {
     KeyframeRequest,
 }
 
-/// Spawn the TCP control listener. Produces events until the channel closes.
-pub fn spawn_control_listener(cfg: &Config, hello: Hello) -> anyhow::Result<mpsc::Receiver<ControlEvent>> {
+/// Spawn the TCP control listener. Pipeline events go to `rx`; decoded input
+/// events go straight to `input_tx` (the input session's channel) when input
+/// injection is available, otherwise they are logged and dropped.
+pub fn spawn_control_listener(
+    cfg: &Config,
+    hello: Hello,
+    input_tx: Option<mpsc::Sender<InputEvent>>,
+) -> anyhow::Result<mpsc::Receiver<ControlEvent>> {
     let listener = TcpListener::bind(cfg.control_addr())
         .map_err(|e| anyhow::anyhow!("failed to bind control channel {}: {e}", cfg.control_addr()))?;
     tracing::info!(addr = %cfg.control_addr(), "control channel listening");
     let (tx, rx) = mpsc::channel();
     thread::Builder::new()
         .name("control-listener".into())
-        .spawn(move || accept_loop(listener, hello, tx))?;
+        .spawn(move || accept_loop(listener, hello, tx, input_tx))?;
     Ok(rx)
 }
 
-fn accept_loop(listener: TcpListener, hello: Hello, tx: mpsc::Sender<ControlEvent>) {
+fn accept_loop(
+    listener: TcpListener,
+    hello: Hello,
+    tx: mpsc::Sender<ControlEvent>,
+    input_tx: Option<mpsc::Sender<InputEvent>>,
+) {
     let mut current: Option<TcpStream> = None;
     for stream in listener.incoming() {
         let stream = match stream {
@@ -81,7 +92,7 @@ fn accept_loop(listener: TcpListener, hello: Hello, tx: mpsc::Sender<ControlEven
         }
         match stream.try_clone() {
             Ok(read_side) => {
-                spawn_reader(read_side, peer.ip(), tx.clone());
+                spawn_reader(read_side, peer.ip(), tx.clone(), input_tx.clone());
                 current = Some(stream);
             }
             Err(err) => {
@@ -91,7 +102,12 @@ fn accept_loop(listener: TcpListener, hello: Hello, tx: mpsc::Sender<ControlEven
     }
 }
 
-fn spawn_reader(stream: TcpStream, peer: IpAddr, tx: mpsc::Sender<ControlEvent>) {
+fn spawn_reader(
+    stream: TcpStream,
+    peer: IpAddr,
+    tx: mpsc::Sender<ControlEvent>,
+    input_tx: Option<mpsc::Sender<InputEvent>>,
+) {
     let spawned = thread::Builder::new()
         .name("control-reader".into())
         .spawn(move || {
@@ -104,8 +120,22 @@ fn spawn_reader(stream: TcpStream, peer: IpAddr, tx: mpsc::Sender<ControlEvent>)
                             return;
                         }
                     }
-                    Ok(Some((other, payload))) => {
-                        tracing::debug!(%peer, msg_type = other, len = payload.len(), "unknown control message, ignored");
+                    Ok(Some((msg_type, payload))) => {
+                        if let Some(event) = InputEvent::decode(msg_type, &payload) {
+                            tracing::debug!(%peer, ?event, "input event");
+                            match &input_tx {
+                                Some(input_tx) => {
+                                    if input_tx.send(event).is_err() {
+                                        tracing::warn!("input session gone, dropping input event");
+                                    }
+                                }
+                                None => {
+                                    tracing::debug!("input injection unavailable, dropping input event");
+                                }
+                            }
+                        } else {
+                            tracing::debug!(%peer, msg_type, len = payload.len(), "unknown control message, ignored");
+                        }
                     }
                     Ok(None) => {
                         tracing::info!(%peer, "client disconnected");
