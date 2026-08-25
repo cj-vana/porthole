@@ -17,6 +17,7 @@ mod encode;
 mod input;
 #[allow(dead_code)]
 mod transport;
+mod virtual_display;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -68,6 +69,12 @@ struct Cli {
     /// Stream framerate (60, 120, or 144) [default: 60]
     #[arg(long, value_name = "FPS")]
     fps: Option<config::Fps>,
+
+    /// Virtual display geometry for headless operation, e.g. 2560x1440@144.
+    /// When set and no physical monitor is attached, a Hyprland headless
+    /// output at this geometry is created and captured (US-015).
+    #[arg(long, value_name = "WxH@HZ")]
+    virtual_display: Option<config::VirtualDisplay>,
 }
 
 impl Cli {
@@ -93,6 +100,9 @@ impl Cli {
         }
         if let Some(v) = self.fps {
             cfg.fps = v;
+        }
+        if let Some(v) = self.virtual_display {
+            cfg.virtual_display = Some(v);
         }
     }
 }
@@ -148,7 +158,15 @@ async fn main() -> anyhow::Result<()> {
     let mut cfg = config::load(cli.config.as_deref()).context("failed to load configuration")?;
     cli.apply_overrides(&mut cfg);
 
-    let backend = capture::select_backend();
+    let backend = {
+        // Before capture selection: make sure the session env is visible to
+        // the Wayland client (SSH shells and minimal systemd units lack it),
+        // then ensure the configured virtual display exists (US-015) so
+        // capture can prefer it by name.
+        virtual_display::ensure_session_env();
+        let preferred_output = virtual_display::ensure(cfg.virtual_display);
+        capture::select_backend(preferred_output.as_deref())
+    };
     let capture_format = backend.format();
 
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "porthole-agent starting");
@@ -160,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
         codec = %cfg.codec,
         encoder = %cfg.encoder,
         fps = cfg.fps.get(),
+        virtual_display = %cfg.virtual_display.map(|v| v.to_string()).unwrap_or_else(|| "off".into()),
         capture_backend = backend.name(),
         "effective configuration"
     );

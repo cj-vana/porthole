@@ -10,7 +10,7 @@ It's built for two kinds of sessions: long coding sessions where text has to sta
 
 Early scaffold. What exists today:
 
-- `agent/`: Rust service for the Linux machine. CLI, config file, logging, and module skeletons for capture (PipeWire/X11), NVENC encoding, transport, input injection, and audio. No real streaming yet.
+- `agent/`: Rust service for the Linux machine. Captures the screen via wlr-screencopy (60fps verified on Hyprland), with CLI, config file, and module skeletons for encoding, transport, input injection, and audio. Encoding and streaming are next.
 - `macos/`: SwiftUI + Metal app shell. Renders an animated test pattern at a selectable 60/120/144 fps to prove the render path. No networking yet.
 
 The full plan, with phased user stories and acceptance criteria, is in [tasks/prd-porthole.md](tasks/prd-porthole.md).

@@ -22,3 +22,8 @@
 
 # Stream framerate: 60 (default), 120, or 144.
 # fps = 60
+
+# Virtual display for headless operation (US-015, Hyprland only): when set
+# and no physical monitor is attached, the agent creates a headless output at
+# this geometry and captures it. Unset by default.
+# virtual_display = "2560x1440@144"

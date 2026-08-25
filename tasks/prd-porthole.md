@@ -35,6 +35,17 @@ Acceptance Criteria:
 - [x] Logs negotiated resolution, framerate, and capture backend on startup
 - [x] `cargo clippy` passes with no warnings
 
+### US-015: Virtual display for headless operation
+Description: As a user, I want the agent to create a virtual display at the target stream geometry when the machine has no monitor, so headless streaming still gets 2560x1440 at 144Hz.
+
+Acceptance Criteria:
+- [x] Config option `virtual_display` (TOML and CLI), value like "2560x1440@144", default off. Malformed values rejected.
+- [x] When set and no physical output exists, the agent creates a Hyprland headless output at that geometry and capture prefers it over the FALLBACK output
+- [x] Idempotent: a matching headless output already present is reused, not duplicated
+- [x] With a physical monitor attached and the option set, the agent leaves physical outputs alone and logs why
+- [x] Verified on the machine: startup log shows capture of a 2560x1440@144 output (HEADLESS-2), per-second lines show a steady 144 fps
+- [x] `cargo clippy` passes with no warnings
+
 ### US-002: Hardware encoding (NVENC or Ryzen iGPU VAAPI)
 Description: As a developer, I need captured frames encoded to H.264 on a GPU so the CPU stays free for actual work, with the encoder backend selectable so the NVIDIA dGPU can stay fully free for games.
 
@@ -164,7 +175,7 @@ Acceptance Criteria:
 
 Agent (Linux):
 
-- FR-1: Capture the primary display at the negotiated resolution and framerate (PipeWire on Wayland, X11 fallback). Supported stream framerates: 60, 120, and 144 fps.
+- FR-1: Capture the primary display at the negotiated resolution and framerate (wlr-screencopy on Wayland; X11 fallback deferred, no X11 session exists on the target). Supported stream framerates: 60, 120, and 144 fps. When no physical display is attached and `virtual_display` is configured, create a Hyprland headless output at that geometry and capture it.
 - FR-2: Hardware-encode video; default H.264, optional HEVC. Encoder backend selectable via config/CLI: NVIDIA NVENC (default) or AMD VAAPI on the Ryzen iGPU, which keeps the dGPU fully free for gaming.
 - FR-3: Stream video as sequence-numbered UDP datagrams; maintain a TCP control channel for handshake, settings, and keyframe requests.
 - FR-4: On decode-fatal packet loss reported by the client, immediately emit a keyframe.
@@ -235,7 +246,6 @@ Mac app:
 
 - Answered: Omarchy (Arch-based), Hyprland on Wayland (verified over SSH). Capture goes through wlr-screencopy or PipeWire; the X11 fallback stays for other setups.
 - Answered: the Ryzen iGPU is enabled. /dev/dri shows both render nodes (NVIDIA pci-0000:01:00.0, AMD pci-0000:0b:00.0), so the VAAPI backend has a device. GStreamer's va plugin is not installed on the box (nvcodec is); FFmpeg is.
-- Resolution target confirmed: 2560×1440. No physical display is currently attached to the Linux box; the live output is Hyprland's 1080p60 headless fallback, so a real panel's max refresh stays unknown until one is connected or a virtual display is created.
+- Decided: the machine lives headless, so the agent provides the display. See US-015: a virtual Hyprland output at 2560×1440@144 when no physical display is attached. This also fixes the stream geometry at the 1440p/144Hz targets.
 - Is 4:4:4 chroma worth pursuing for perfect text after v1 (VideoToolbox supports it on HEVC; NVENC support varies by GPU)?
-- Headless operation is no longer hypothetical: the box currently runs with no monitor attached (verified via `hyprctl monitors`). Decision needed: attach a physical display, or have the agent ensure a virtual headless output exists at 2560×1440@144 (Hyprland supports this via `hyprctl output create headless`).
 - Final product name is undecided; "Porthole" is a codename.

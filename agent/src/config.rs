@@ -5,7 +5,7 @@
 
 use std::fmt;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{bail, Context};
@@ -78,6 +78,62 @@ impl<'de> Deserialize<'de> for Fps {
     }
 }
 
+/// Virtual display geometry for headless operation (US-015), parsed from
+/// "WxH@Hz" (e.g. "2560x1440@144"). Same CLI (FromStr) / TOML (Deserialize)
+/// validation pattern as the other options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtualDisplay {
+    pub width: u32,
+    pub height: u32,
+    pub refresh_hz: u32,
+}
+
+impl fmt::Display for VirtualDisplay {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}x{}@{}", self.width, self.height, self.refresh_hz)
+    }
+}
+
+impl FromStr for VirtualDisplay {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (dims, refresh) = s
+            .split_once('@')
+            .with_context(|| format!("invalid virtual display {s:?} (expected \"WxH@Hz\")"))?;
+        let (width, height) = dims
+            .split_once('x')
+            .with_context(|| format!("invalid virtual display {s:?} (expected \"WxH@Hz\")"))?;
+        let parse_dim = |v: &str| -> anyhow::Result<u32> {
+            let n: u32 = v
+                .parse()
+                .with_context(|| format!("invalid virtual display {s:?} (expected \"WxH@Hz\")"))?;
+            if n == 0 {
+                bail!("invalid virtual display {s:?} (dimensions and refresh must be positive)");
+            }
+            Ok(n)
+        };
+        Ok(Self {
+            width: parse_dim(width)?,
+            height: parse_dim(height)?,
+            refresh_hz: parse_dim(refresh)?,
+        })
+    }
+}
+
+impl Serialize for VirtualDisplay {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for VirtualDisplay {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 /// Effective agent configuration after defaults, file, and CLI are merged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -97,6 +153,10 @@ pub struct Config {
     pub encoder: EncoderBackend,
     /// Stream framerate (default 60; gaming mode selects 120 or 144, US-013).
     pub fps: Fps,
+    /// Virtual display geometry for headless operation (default unset;
+    /// US-015). When set and no physical output is attached, a Hyprland
+    /// headless output at this geometry is created and captured.
+    pub virtual_display: Option<VirtualDisplay>,
 }
 
 impl Default for Config {
@@ -109,6 +169,7 @@ impl Default for Config {
             codec: Codec::default(),
             encoder: EncoderBackend::default(),
             fps: Fps::default(),
+            virtual_display: None,
         }
     }
 }
@@ -138,6 +199,7 @@ pub struct FileConfig {
     pub codec: Option<Codec>,
     pub encoder: Option<EncoderBackend>,
     pub fps: Option<Fps>,
+    pub virtual_display: Option<VirtualDisplay>,
     // TODO(FR-11): display index/output name, file-transfer folder (US-011,
     // default ~/Downloads), mDNS service name (US-007).
 }
@@ -165,19 +227,37 @@ impl FileConfig {
         if let Some(v) = self.fps {
             cfg.fps = v;
         }
+        if let Some(v) = self.virtual_display {
+            cfg.virtual_display = Some(v);
+        }
     }
 }
 
-/// Load the effective config: defaults, then the TOML file if given.
-/// CLI overrides are applied afterwards by the caller ([`crate::Cli`]).
+/// Default config file location: `$XDG_CONFIG_HOME/porthole-agent/config.toml`,
+/// or `~/.config/porthole-agent/config.toml` when XDG_CONFIG_HOME is unset.
+pub fn default_config_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("porthole-agent").join("config.toml"))
+}
+
+/// Load the effective config: defaults, then the TOML file. The file is the
+/// `--config` path when given, otherwise [`default_config_path`] if it
+/// exists. CLI overrides are applied afterwards by the caller ([`crate::Cli`]).
 pub fn load(path: Option<&Path>) -> anyhow::Result<Config> {
     let mut cfg = Config::default();
+    let path = match path {
+        Some(explicit) => Some(explicit.to_path_buf()),
+        None => default_config_path().filter(|p| p.exists()),
+    };
     if let Some(path) = path {
-        let text = std::fs::read_to_string(path)
+        let text = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read config file {}", path.display()))?;
         let file_cfg: FileConfig = toml::from_str(&text)
             .with_context(|| format!("failed to parse config file {}", path.display()))?;
         file_cfg.merge_into(&mut cfg);
+        tracing::info!(path = %path.display(), "loaded configuration file");
     }
     Ok(cfg)
 }
@@ -196,6 +276,7 @@ mod tests {
         assert_eq!(cfg.codec, Codec::H264);
         assert_eq!(cfg.encoder, EncoderBackend::Nvenc);
         assert_eq!(cfg.fps.get(), 60);
+        assert_eq!(cfg.virtual_display, None);
     }
 
     #[test]
@@ -222,6 +303,40 @@ mod tests {
         assert!(toml::from_str::<FileConfig>("fps = 90").is_err());
         let file_cfg: FileConfig = toml::from_str("fps = 144").unwrap();
         assert_eq!(file_cfg.fps.unwrap().get(), 144);
+    }
+
+    #[test]
+    fn virtual_display_from_str_valid() {
+        let vd: VirtualDisplay = "2560x1440@144".parse().unwrap();
+        assert_eq!(vd.width, 2560);
+        assert_eq!(vd.height, 1440);
+        assert_eq!(vd.refresh_hz, 144);
+        assert_eq!(vd.to_string(), "2560x1440@144");
+        assert!("1920x1080@60".parse::<VirtualDisplay>().is_ok());
+    }
+
+    #[test]
+    fn virtual_display_rejects_malformed() {
+        for bad in [
+            "2560x1440",     // missing refresh
+            "abc",           // garbage
+            "0x0@0",         // zeros
+            "2560x1440@",    // missing refresh value
+            "@144",          // missing dimensions
+            "2560X1440@144", // uppercase separator
+            "2560x1440@144x",  // trailing garbage
+            "-2560x1440@144",  // negative
+            "2560x1440@144@2", // extra separator
+        ] {
+            assert!(bad.parse::<VirtualDisplay>().is_err(), "{bad:?} should be rejected");
+        }
+        // Same validation from the TOML side.
+        assert!(toml::from_str::<FileConfig>(r#"virtual_display = "abc""#).is_err());
+        let file_cfg: FileConfig = toml::from_str(r#"virtual_display = "2560x1440@144""#).unwrap();
+        assert_eq!(
+            file_cfg.virtual_display.unwrap(),
+            VirtualDisplay { width: 2560, height: 1440, refresh_hz: 144 }
+        );
     }
 
     #[test]

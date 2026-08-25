@@ -6,7 +6,8 @@ the machine's NVIDIA dGPU (NVENC) or on the Ryzen iGPU (VAAPI, selectable via
 `tasks/prd-porthole.md` for the full PRD.
 
 Current state: screen capture (US-001) works on Wayland via
-wlr-screencopy (tested on Hyprland at 1920x1080, 60 fps). Hardware encode
+wlr-screencopy, and headless virtual displays (US-015) work on Hyprland
+(tested: 2560x1440 at 144 fps on a headless output). Hardware encode
 (US-002), transport (US-003), input (US-006), and audio (US-009) are still
 trait stubs with TODOs.
 
@@ -42,17 +43,33 @@ with a debug heartbeat every 5s until Ctrl+C, which triggers a clean shutdown.
 
 Single TOML file (PRD FR-11); every field is optional. Precedence:
 built-in defaults < config file < CLI flags. See `config.example.toml`.
+Without `--config`, the agent loads
+`$XDG_CONFIG_HOME/porthole-agent/config.toml` (or
+`~/.config/porthole-agent/config.toml`) when it exists.
 
-| Flag              | Default | Description                       |
-|-------------------|---------|-----------------------------------|
-| `--config`        | none    | Path to TOML config file          |
-| `--port-video`    | 52800   | UDP port for the video stream     |
-| `--port-control`  | 52801   | TCP port for the control channel  |
-| `--port-audio`    | 52802   | UDP port for the audio stream     |
-| `--bitrate-mbps`  | 40      | Encoder target bitrate            |
-| `--codec`         | h264    | `h264` or `hevc`                  |
-| `--encoder`       | nvenc   | `nvenc` (dGPU) or `vaapi` (iGPU)  |
-| `--fps`           | 60      | `60`, `120`, or `144`             |
+| Flag                | Default | Description                                |
+|---------------------|---------|--------------------------------------------|
+| `--config`          | none    | Path to TOML config file                   |
+| `--port-video`      | 52800   | UDP port for the video stream              |
+| `--port-control`    | 52801   | TCP port for the control channel           |
+| `--port-audio`      | 52802   | UDP port for the audio stream              |
+| `--bitrate-mbps`    | 40      | Encoder target bitrate                     |
+| `--codec`           | h264    | `h264` or `hevc`                           |
+| `--encoder`         | nvenc   | `nvenc` (dGPU) or `vaapi` (iGPU)           |
+| `--fps`             | 60      | `60`, `120`, or `144`                      |
+| `--virtual-display` | off     | `WxH@Hz`, e.g. `2560x1440@144` (see below) |
+
+### Virtual display (headless operation, US-015)
+
+The feature is Hyprland-specific: the agent shells out to `hyprctl`, so it
+needs a running Hyprland session. When `virtual_display` is set and no
+physical monitor is attached, the agent creates a headless output at the
+configured geometry and captures it. An existing headless output at that
+geometry is reused (one at another geometry is reconfigured), so repeated
+starts never duplicate outputs. With a physical monitor attached, outputs are
+left alone and the agent logs why. Session environment (XDG_RUNTIME_DIR,
+HYPRLAND_INSTANCE_SIGNATURE) is discovered at runtime, so this works over SSH
+and under systemd.
 
 ## systemd (user service)
 
@@ -64,7 +81,8 @@ systemctl --user enable --now porthole-agent
 journalctl --user -u porthole-agent -f
 ```
 
-Edit the unit to point `--config` at your TOML file if you use one.
+Edit the unit to point `--config` at your TOML file if you use one; otherwise
+the default `~/.config/porthole-agent/config.toml` is picked up.
 
 ## Development
 
@@ -73,7 +91,7 @@ cargo clippy -- -D warnings
 cargo test
 ```
 
-Module map: `capture` (wlr-screencopy on Wayland, US-001), `encode` (NVENC or
-VAAPI, H.264/HEVC, US-002), `transport` (TCP control + UDP video/audio,
-US-003), `input` (uinput keyboard/mouse/gamepad, US-006/US-014), `audio`
-(Opus over UDP, US-009).
+Module map: `capture` (wlr-screencopy on Wayland, US-001), `virtual_display`
+(Hyprland headless outputs, US-015), `encode` (NVENC or VAAPI, H.264/HEVC,
+US-002), `transport` (TCP control + UDP video/audio, US-003), `input` (uinput
+keyboard/mouse/gamepad, US-006/US-014), `audio` (Opus over UDP, US-009).

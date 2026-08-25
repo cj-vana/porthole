@@ -69,19 +69,24 @@ impl CaptureBackend for NoopCapture {
 
 /// Pick the best available capture backend for the current session.
 ///
-/// On Linux this tries wlr-screencopy (Wayland/Hyprland). If that fails (no
-/// Wayland session, unsupported compositor) it falls back to [`NoopCapture`]
-/// for now; an X11 fallback is a later story.
-pub fn select_backend() -> Box<dyn CaptureBackend> {
+/// On Linux this tries wlr-screencopy (Wayland/Hyprland), capturing the
+/// output named `preferred_output` when given (the virtual display from
+/// US-015), otherwise the first output. If the connection fails (no Wayland
+/// session, unsupported compositor) it falls back to [`NoopCapture`] for
+/// now; an X11 fallback is a later story.
+pub fn select_backend(preferred_output: Option<&str>) -> Box<dyn CaptureBackend> {
     #[cfg(target_os = "linux")]
     {
-        match wlr::WlrCapture::new() {
+        match wlr::WlrCapture::new(preferred_output) {
             Ok(backend) => return Box::new(backend),
             Err(err) => tracing::warn!("{err:#}: falling back to noop capture backend"),
         }
     }
     #[cfg(not(target_os = "linux"))]
-    tracing::debug!("non-linux target: screen capture is unavailable, using noop backend");
+    {
+        let _ = preferred_output;
+        tracing::debug!("non-linux target: screen capture is unavailable, using noop backend");
+    }
     Box::new(NoopCapture)
 }
 

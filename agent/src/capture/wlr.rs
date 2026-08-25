@@ -73,11 +73,22 @@ impl ShmBuffer {
     }
 }
 
+/// One bound wl_output and what it has told us about itself.
+struct OutputInfo {
+    proxy: wl_output::WlOutput,
+    name: Option<String>,
+    width: u32,
+    height: u32,
+    refresh_millihz: u32,
+}
+
 /// Wayland globals and per-frame capture state.
 #[derive(Default)]
 struct WlState {
     shm: Option<wl_shm::WlShm>,
     manager: Option<ZwlrScreencopyManagerV1>,
+    outputs: Vec<OutputInfo>,
+    // The capture target, chosen in new() after enumeration.
     output: Option<wl_output::WlOutput>,
     output_name: Option<String>,
     output_width: u32,
@@ -138,10 +149,17 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WlState {
             "zwlr_screencopy_manager_v1" => {
                 state.manager = Some(registry.bind(name, version.min(3), qh, ()));
             }
-            // v1 captures the primary display only; multi-monitor is a
-            // non-goal, so the first wl_output wins.
-            "wl_output" if state.output.is_none() => {
-                state.output = Some(registry.bind(name, version.min(4), qh, ()));
+            // Bind every wl_output so we can pick the configured virtual
+            // display when set (US-015); the target is chosen in new().
+            "wl_output" => {
+                let proxy: wl_output::WlOutput = registry.bind(name, version.min(4), qh, ());
+                state.outputs.push(OutputInfo {
+                    proxy,
+                    name: None,
+                    width: 0,
+                    height: 0,
+                    refresh_millihz: 0,
+                });
             }
             _ => {}
         }
@@ -151,12 +169,15 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WlState {
 impl Dispatch<wl_output::WlOutput, ()> for WlState {
     fn event(
         state: &mut Self,
-        _: &wl_output::WlOutput,
+        output: &wl_output::WlOutput,
         event: wl_output::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        let Some(info) = state.outputs.iter_mut().find(|o| o.proxy == *output) else {
+            return;
+        };
         match event {
             wl_output::Event::Mode {
                 width,
@@ -164,11 +185,11 @@ impl Dispatch<wl_output::WlOutput, ()> for WlState {
                 refresh,
                 ..
             } => {
-                state.output_width = width as u32;
-                state.output_height = height as u32;
-                state.output_refresh_millihz = refresh as u32;
+                info.width = width as u32;
+                info.height = height as u32;
+                info.refresh_millihz = refresh as u32;
             }
-            wl_output::Event::Name { name } => state.output_name = Some(name),
+            wl_output::Event::Name { name } => info.name = Some(name),
             _ => {}
         }
     }
@@ -261,8 +282,10 @@ pub struct WlrCapture {
 }
 
 impl WlrCapture {
-    /// Connect to the Wayland display and bind the globals we need.
-    pub fn new() -> anyhow::Result<Self> {
+    /// Connect to the Wayland display, bind the globals we need, and pick the
+    /// capture target: the output named `preferred_output` when given (the
+    /// virtual display from US-015), otherwise the first advertised output.
+    pub fn new(preferred_output: Option<&str>) -> anyhow::Result<Self> {
         let conn = Connection::connect_to_env()
             .context("failed to connect to Wayland (XDG_RUNTIME_DIR/WAYLAND_DISPLAY set?)")?;
         let display = conn.display();
@@ -271,7 +294,7 @@ impl WlrCapture {
         let registry = display.get_registry(&qh, ());
         let mut state = WlState::default();
         // First roundtrip binds the globals, the second delivers the
-        // wl_output mode/name events for the output we just bound.
+        // wl_output mode/name events for the outputs we just bound.
         event_queue
             .roundtrip(&mut state)
             .context("wayland registry roundtrip failed")?;
@@ -284,9 +307,37 @@ impl WlrCapture {
         if state.shm.is_none() {
             bail!("compositor does not offer wl_shm");
         }
-        if state.output.is_none() {
-            bail!("no wl_output advertised by the compositor");
+
+        // A freshly created headless output can take a beat to appear in the
+        // Wayland registry; retry roundtrips instead of racing it (US-015).
+        if let Some(want) = preferred_output {
+            for _ in 0..20 {
+                if state.outputs.iter().any(|o| o.name.as_deref() == Some(want)) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                event_queue
+                    .roundtrip(&mut state)
+                    .context("wayland roundtrip failed while waiting for preferred output")?;
+            }
         }
+
+        let chosen = preferred_output
+            .and_then(|want| {
+                let found = state.outputs.iter().find(|o| o.name.as_deref() == Some(want));
+                if found.is_none() {
+                    tracing::warn!(output = want, "preferred output not in wayland registry, using first output");
+                }
+                found
+            })
+            .or_else(|| state.outputs.first())
+            .context("no wl_output advertised by the compositor")?;
+        state.output = Some(chosen.proxy.clone());
+        state.output_name = chosen.name.clone();
+        state.output_width = chosen.width;
+        state.output_height = chosen.height;
+        state.output_refresh_millihz = chosen.refresh_millihz;
+
         Ok(Self {
             _conn: conn,
             event_queue,
