@@ -18,6 +18,7 @@ pub const DEFAULT_PORT_CONTROL: u16 = 52801;
 pub const DEFAULT_PORT_AUDIO: u16 = 52802;
 pub const DEFAULT_BITRATE_MBPS: u32 = 40;
 pub const DEFAULT_FPS: u16 = 60;
+pub const DEFAULT_KEYFRAME_INTERVAL_SECS: u32 = 2;
 
 /// Framerates the agent will stream at (PRD: 60 quality mode; 120 targeted by
 /// gaming mode US-013; 144 for high-refresh displays).
@@ -146,6 +147,8 @@ pub struct Config {
     pub port_audio: u16,
     /// NVENC target bitrate in Mbps (default 40, per PRD for 1440p LAN quality mode).
     pub bitrate_mbps: u32,
+    /// Keyframe (IDR) interval in seconds (default 2; US-002).
+    pub keyframe_interval_secs: u32,
     /// Video codec (default h264; hevc optional, US-013).
     pub codec: Codec,
     /// Hardware encoder backend (default nvenc on the dGPU; vaapi offloads
@@ -166,6 +169,7 @@ impl Default for Config {
             port_control: DEFAULT_PORT_CONTROL,
             port_audio: DEFAULT_PORT_AUDIO,
             bitrate_mbps: DEFAULT_BITRATE_MBPS,
+            keyframe_interval_secs: DEFAULT_KEYFRAME_INTERVAL_SECS,
             codec: Codec::default(),
             encoder: EncoderBackend::default(),
             fps: Fps::default(),
@@ -196,6 +200,7 @@ pub struct FileConfig {
     pub port_control: Option<u16>,
     pub port_audio: Option<u16>,
     pub bitrate_mbps: Option<u32>,
+    pub keyframe_interval_secs: Option<u32>,
     pub codec: Option<Codec>,
     pub encoder: Option<EncoderBackend>,
     pub fps: Option<Fps>,
@@ -217,6 +222,9 @@ impl FileConfig {
         }
         if let Some(v) = self.bitrate_mbps {
             cfg.bitrate_mbps = v;
+        }
+        if let Some(v) = self.keyframe_interval_secs {
+            cfg.keyframe_interval_secs = v.max(1);
         }
         if let Some(v) = self.codec {
             cfg.codec = v;
@@ -273,6 +281,7 @@ mod tests {
         assert_eq!(cfg.port_control, 52801);
         assert_eq!(cfg.port_audio, 52802);
         assert_eq!(cfg.bitrate_mbps, 40);
+        assert_eq!(cfg.keyframe_interval_secs, 2);
         assert_eq!(cfg.codec, Codec::H264);
         assert_eq!(cfg.encoder, EncoderBackend::Nvenc);
         assert_eq!(cfg.fps.get(), 60);

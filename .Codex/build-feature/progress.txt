@@ -1,0 +1,65 @@
+# Build Progress Log
+Started: 2026-08-25
+Feature: Porthole full build-out (PRD US-002 through US-014)
+
+## Codebase Patterns
+(Context from before this log started, plus discoveries as we go.)
+
+- Repo: /Users/cjvana/Documents/GitHub/porthole (public, github.com/cj-vana/porthole). agent/ (Rust crate), macos/ (XcodeGen SwiftUI app), tasks/prd-porthole.md (the spec; check boxes as stories complete).
+- Linux target: cjvana@10.0.0.222 (Omarchy/Arch, Hyprland Wayland, RTX 5070 + Ryzen iGPU, headless). Clone at ~/porthole. SSH BatchMode works; ignore ED25519-SK key noise on stderr.
+- Dev loop: edit locally, `rsync -az --exclude target agent/ cjvana@10.0.0.222:porthole/agent/`, then build/run over SSH. Run agent with `XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1` (agent self-discovers session env now too).
+- cargo on the box: via mise/rustup, on PATH in SSH shells (fallback `export PATH="$HOME/.cargo/bin:$PATH"`).
+- Quality gates, BOTH platforms: `cargo build`, `cargo clippy -- -D warnings`, `cargo test`; for macos/: `xcodebuild -scheme Porthole -configuration Debug build` (xcodegen generate first if project.yml changed). CI on GitHub runs both.
+- Agent config plumbing pattern: validated newtype/enums (Codec, Fps, EncoderBackend, VirtualDisplay) with FromStr + serde, FileConfig all-Option TOML merged defaults < file < CLI. Default config path ~/.config/porthole-agent/config.toml.
+- Linux-only deps go in `[target.'cfg(target_os = "linux")'.dependencies]`; Linux-only code cfg-gated so macOS builds stay green.
+- Capture: wlr-screencopy in src/capture/wlr.rs, real 144fps verified on headless 2560x1440 output.
+- Hyprland 0.56: `hyprctl keyword monitor` is gone; use `hyprctl eval 'hl.monitor({...})'` Lua API. `hyprctl monitors -j` parses clean with serde_json.
+- Encoding (US-002): ffmpeg subprocess per session, stdin rawvideo bgra / stdout Annex B with `-aud 1`, AUs cut in Rust (`src/encode/ffmpeg.rs` + `annexb.rs`). NVENC takes bgra directly (GPU convert); VAAPI: `-vaapi_device /dev/dri/by-path/pci-0000:0b:00.0-render -vf hwupload,scale_vaapi=format=nv12`. nvidia-smi encoder field: `utilization.encoder`.
+- Pacing pattern: when a fast capture loop (144Hz) feeds a slower configured rate (60fps), use an accumulating deadline (next_submit += interval), not elapsed>=interval; capture ticks quantize and cost you 25% of the feed.
+- Prose rules (enforced by scanner, zero findings so far): no em/en dashes, no bolded lead-in labels in docs. Run `python3 /Users/cjvana/.claude/skills/unslop-text/scripts/unslop_text_scan.py /Users/cjvana/Documents/GitHub/porthole/` after doc edits; also unslop-code scanner for source comments.
+- No sudo on the Linux box. Prefer user-space solutions: FFmpeg over GStreamer if system packages are missing, wlroots virtual-pointer/virtual-keyboard protocols over uinput where possible.
+- Git: parent agent (orchestrator) commits and pushes per story; subagents never run git.
+---
+
+## 2026-08-25: US-002 hardware encoding (NVENC + VAAPI) done
+
+Implemented real hardware encode of captured frames via an ffmpeg subprocess
+per session (stdin rawvideo bgra, stdout Annex B with -aud 1, AUs cut in
+Rust). Chose subprocess over ffmpeg-next: box runs FFmpeg n9.0.1 (libavcodec
+63), far newer than the crate supports, and subprocess needs no new packages
+and survives FFmpeg upgrades. All four backend/codec combos verified at
+2560x1440 60fps in/out.
+
+Files changed:
+- agent/src/encode/mod.rs: Encoder trait reworked (encode/drain), EncodedFrame
+  gains sequence (pts_us dropped until US-003 needs it), create() factory,
+  module docs describe the subprocess design.
+- agent/src/encode/ffmpeg.rs (new, Linux-only): FfmpegEncoder subprocess,
+  NVENC bgra input (GPU convert), VAAPI hwupload+scale_vaapi on
+  /dev/dri/by-path/pci-0000:0b:00.0-render, Drop closes stdin then kill.
+- agent/src/encode/annexb.rs (new, cross-platform): AUD-based AU splitter +
+  IDR detection for h264/hevc, unit tests run on macOS.
+- agent/src/main.rs: capture thread feeds encoder paced at --fps
+  (accumulating-deadline pacing, see Patterns), merged 1s capture+encode
+  stats line, PORTHOLE_DUMP_VIDEO debug dump hook, --keyframe-interval-secs.
+- agent/src/config.rs: keyframe_interval_secs option (default 2).
+- agent/README.md: encoder architecture section, new flag, current state.
+
+Verification (on the box): NVENC run shows nvidia-smi utilization.encoder
+13-16% with enc_in/enc_out 60/60 at 2560x1440, agent ~9% CPU, ffmpeg ~14%.
+VAAPI run: NVENC 0%, ffmpeg on the AMD by-path node, 60/60 fps. ffprobe on
+PORTHOLE_DUMP_VIDEO output confirms valid h264 2560x1440 for both backends.
+hevc works on both backends. Known gaps: request_keyframe is a no-op for the
+subprocess (FR-4 deferred to US-003); NVENC output kbps on the static desktop
+is far below 40M (VBR, nothing to encode), VAAPI fills the CBR target.
+
+Learnings for future iterations:
+- nvidia-smi field for encoder load: utilization.encoder (NOT
+  encoder_utilization.session). Sample while agent runs, process exits fast.
+- ps -C <comm> -o %cpu= for process CPU; %cpu is lifetime average, sample
+  mid-run.
+- ffmpeg on Arch is VERY new (n9.0.1); check crate bindings version ceilings
+  before choosing linking over subprocess.
+- h264_vaapi rate control fills the CBR -b:v target even for static content;
+  nvenc defaults to VBR-ish and drops to near zero kbps on static images.
+  Neither is a bug.

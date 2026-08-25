@@ -3,20 +3,27 @@
 //! Frames from [`crate::capture`] are hardware-encoded on the Linux machine
 //! by one of two selectable backends ([`EncoderBackend`]):
 //!
-//! - NVENC on the NVIDIA dGPU: GStreamer `nvh264enc` / `nvh265enc`, or
-//!   FFmpeg `h264_nvenc` / `hevc_nvenc`. The PRD-recommended default.
-//! - VAAPI on the Ryzen iGPU (RDNA2): GStreamer `vah264enc` / `vah265enc`,
-//!   or FFmpeg `h264_vaapi` / `hevc_vaapi` on the iGPU's
-//!   `/dev/dri/renderD*` node. Keeps the dGPU fully free for gaming.
+//! - NVENC on the NVIDIA dGPU: FFmpeg `h264_nvenc` / `hevc_nvenc`. Default.
+//! - VAAPI on the Ryzen iGPU (RDNA2): FFmpeg `h264_vaapi` / `hevc_vaapi` on
+//!   the iGPU's by-path `/dev/dri` render node. Keeps the dGPU fully free
+//!   for gaming.
+//!
+//! Integration is an ffmpeg subprocess per encoder session (see the
+//! `ffmpeg` module, Linux only): raw bgra frames are piped to stdin, Annex B
+//! access units are read from stdout. Chosen over linking libavcodec because
+//! the box runs FFmpeg 9, far newer than the available Rust bindings
+//! support, and a subprocess needs no new system packages. Both backends
+//! convert bgra on GPU (NVENC accepts bgra input directly; VAAPI uses
+//! `hwupload,scale_vaapi=format=nv12`), so no CPU swscale runs.
 //!
 //! Note: when the screen is captured from the dGPU but encoded on the iGPU,
-//! frames may need a cross-GPU buffer copy; prefer dma-buf import where
-//! possible to avoid the PCIe round trip.
-//!
-//! GStreamer is the PRD-recommended pipeline; the `gstreamer` crate needs
-//! Linux system dev packages (`libgstreamer1.0-dev`,
-//! `libgstreamer-plugins-base1.0-dev`), so it is intentionally not a
-//! dependency yet (see Cargo.toml TODO).
+//! frames cross the PCIe bus through system memory (shm capture plus pipe).
+//! A dma-buf zero-copy path is a later optimization story.
+
+#[cfg(any(target_os = "linux", test))]
+mod annexb;
+#[cfg(target_os = "linux")]
+mod ffmpeg;
 
 use std::fmt;
 use std::str::FromStr;
@@ -93,31 +100,32 @@ impl FromStr for EncoderBackend {
 
 /// An encoded access unit ready for packetization by [`crate::transport`].
 pub struct EncodedFrame {
-    /// Annex B / length-prefixed bitstream payload, per negotiated format.
+    /// Monotonic sequence number, assigned by the encoder in output order.
+    pub sequence: u64,
+    /// Annex B bitstream for one access unit (starts with an AUD NAL).
     pub data: Vec<u8>,
-    /// Whether this frame starts with an IDR (decoder can resync from it).
+    /// Whether this access unit contains an IDR (decoder can resync from it).
     pub is_keyframe: bool,
-    /// Presentation timestamp in microseconds since stream start.
-    pub pts_us: u64,
 }
 
 /// A hardware encoder instance (NVENC on the dGPU, or VAAPI on the iGPU).
 ///
-/// TODO(US-002): implement a GStreamer-based encoder per selected
-/// [`EncoderBackend`], with configurable bitrate and keyframe interval
-/// (PRD FR-2):
-/// - Nvenc: `capture ! nvh264enc/nvh265enc bitrate=<bps> ! appsink`
-/// - Vaapi: `capture ! vah264enc/vah265enc bitrate=<bps> ! appsink` bound to
-///   the iGPU's `/dev/dri/renderD*` node; cross-GPU frames may need a buffer
-///   copy (dma-buf import where possible)
-///
-/// `request_keyframe` backs FR-4 (client reports decode-fatal loss -> emit
-/// IDR immediately).
+/// Implemented by `ffmpeg::FfmpegEncoder` on Linux; configurable bitrate,
+/// codec, and keyframe interval come from [`crate::config::Config`]
+/// (PRD FR-2). `request_keyframe` backs FR-4 (client reports decode-fatal
+/// loss -> emit IDR immediately); the subprocess encoder cannot force an IDR
+/// mid-session yet, see its TODO.
 pub trait Encoder: Send {
-    /// Encode one raw frame; returns `Ok(None)` if the encoder is buffering.
-    fn encode(&mut self, frame: &crate::capture::RawFrame) -> anyhow::Result<Option<EncodedFrame>>;
+    /// Submit one raw frame for encoding.
+    fn encode(&mut self, frame: &crate::capture::RawFrame) -> anyhow::Result<()>;
 
-    /// Force the next output frame to be a keyframe (IDR).
+    /// Drain all access units produced since the last call. The transport
+    /// (US-003) will consume these.
+    fn drain(&mut self) -> Vec<EncodedFrame>;
+
+    /// Force the next output frame to be a keyframe (IDR). Unused until the
+    /// transport's loss handling (US-003) calls it.
+    #[allow(dead_code)]
     fn request_keyframe(&mut self) -> anyhow::Result<()>;
 
     /// Codec this encoder instance produces.
@@ -127,7 +135,29 @@ pub trait Encoder: Send {
     fn backend(&self) -> EncoderBackend;
 }
 
-/// Placeholder encoder used until US-002 lands. Accepts frames and drops them.
+/// Linux gets the ffmpeg subprocess encoder; everything else (or an encoder
+/// startup failure) gets the null encoder, which drops frames.
+pub fn create(cfg: &crate::config::Config, format: &crate::capture::CaptureFormat) -> Box<dyn Encoder> {
+    #[cfg(target_os = "linux")]
+    {
+        match ffmpeg::FfmpegEncoder::new(cfg, format) {
+            Ok(enc) => {
+                tracing::info!(
+                    backend = %enc.backend(),
+                    codec = %enc.codec(),
+                    "encoder started"
+                );
+                return Box::new(enc);
+            }
+            Err(err) => tracing::error!("{err:#}: encoder startup failed, frames will be dropped"),
+        }
+    }
+    let _ = format; // used only by the Linux encoder
+    Box::new(NullEncoder::new(cfg.codec, cfg.encoder))
+}
+
+/// Placeholder for non-Linux builds and encoder-startup failure. Accepts
+/// frames and drops them.
 pub struct NullEncoder {
     codec: Codec,
     backend: EncoderBackend,
@@ -140,13 +170,15 @@ impl NullEncoder {
 }
 
 impl Encoder for NullEncoder {
-    fn encode(&mut self, _frame: &crate::capture::RawFrame) -> anyhow::Result<Option<EncodedFrame>> {
-        // TODO(US-002): hand the frame to the selected hardware backend.
-        Ok(None)
+    fn encode(&mut self, _frame: &crate::capture::RawFrame) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn drain(&mut self) -> Vec<EncodedFrame> {
+        Vec::new()
     }
 
     fn request_keyframe(&mut self) -> anyhow::Result<()> {
-        // TODO(US-002): force IDR on the next encoded frame.
         Ok(())
     }
 

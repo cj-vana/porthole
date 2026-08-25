@@ -10,8 +10,11 @@
 # UDP port for the Opus audio stream.
 # port_audio = 52802
 
-# NVENC target bitrate in Mbps (40 is the PRD default for 1440p LAN quality mode).
+# NVENC/VAAPI target bitrate in Mbps (40 is the PRD default for 1440p LAN quality mode).
 # bitrate_mbps = 40
+
+# Keyframe (IDR) interval in seconds.
+# keyframe_interval_secs = 2
 
 # Video codec: "h264" (default) or "hevc".
 # codec = "h264"
