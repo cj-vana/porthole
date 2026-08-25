@@ -57,6 +57,12 @@ final class ControlChannel {
         connection?.send(content: message, completion: .contentProcessed { _ in })
     }
 
+    /// Send one framed input message (0x10-0x15). Input rides the same
+    /// control connection as keyframe_request (docs/protocol.md).
+    func sendInput(_ frame: Data) {
+        connection?.send(content: frame, completion: .contentProcessed { _ in })
+    }
+
     private func receiveLoop(_ connection: NWConnection) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) {
             [weak self] data, _, isComplete, error in
@@ -70,8 +76,8 @@ final class ControlChannel {
                         } else {
                             self.onEvent?(.disconnected(reason: "malformed hello"))
                         }
-                    case .keyframeRequest:
-                        break // agent does not send this
+                    default:
+                        break // agent sends only hello; input types are client -> agent
                     }
                 }
             }

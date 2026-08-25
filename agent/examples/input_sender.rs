@@ -15,7 +15,8 @@ use porthole_agent::protocol::{self, InputEvent};
 const BTN_LEFT: u16 = 0x110;
 const BTN_RIGHT: u16 = 0x111;
 const BTN_MIDDLE: u16 = 0x112;
-const KEY_LEFTSHIFT: u16 = 42;
+/// xkb modifier bit for Shift (bit order: 0 Shift, 1 Lock, 2 Control, ...).
+const MOD_SHIFT: u32 = 1;
 
 /// Porthole scripted input sender (verification tool for US-006a).
 #[derive(Parser)]
@@ -43,7 +44,8 @@ enum Cmd {
     Click { button: Option<String> },
     /// Scroll vertically by N pixels (negative scrolls the other way).
     Scroll { amount: f64 },
-    /// Type an ASCII string (uppercase via left shift).
+    /// Type an ASCII string (uppercase and shifted punctuation via
+    /// key_modifiers messages).
     Type { text: String },
 }
 
@@ -99,6 +101,11 @@ fn ascii_to_key(c: char) -> Option<(u16, bool)> {
     }
     match c {
         'A'..='Z' => ascii_to_key(c.to_ascii_lowercase()).map(|(code, _)| (code, true)),
+        // Shifted digit row: ! @ # $ % ^ & * ( )
+        c if "!@#$%^&*()".contains(c) => {
+            let idx = "!@#$%^&*()".find(c)? as u16;
+            Some((idx + 2, true)) // shift + KEY_1..KEY_0
+        }
         _ => None,
     }
 }
@@ -139,13 +146,16 @@ fn main() -> anyhow::Result<()> {
             for c in text.chars() {
                 let (code, shift) = ascii_to_key(c)
                     .with_context(|| format!("no key mapping for {c:?} (small ASCII table only)"))?;
+                // Modifier state goes through key_modifiers messages; the
+                // virtual keyboard protocol does not derive it from key
+                // events (docs/protocol.md, type 0x15).
                 if shift {
-                    send(&mut stream, &InputEvent::Key { code: KEY_LEFTSHIFT, pressed: true })?;
+                    send(&mut stream, &InputEvent::KeyModifiers { depressed: MOD_SHIFT, latched: 0, locked: 0, group: 0 })?;
                     thread::sleep(Duration::from_millis(10));
                 }
                 key_press(&mut stream, code)?;
                 if shift {
-                    send(&mut stream, &InputEvent::Key { code: KEY_LEFTSHIFT, pressed: false })?;
+                    send(&mut stream, &InputEvent::KeyModifiers { depressed: 0, latched: 0, locked: 0, group: 0 })?;
                 }
                 thread::sleep(Duration::from_millis(20));
             }

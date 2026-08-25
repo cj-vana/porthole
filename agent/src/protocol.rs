@@ -35,6 +35,8 @@ pub const CONTROL_MSG_POINTER_BUTTON: u8 = 0x12;
 pub const CONTROL_MSG_POINTER_AXIS: u8 = 0x13;
 /// Keyboard key press/release (evdev KEY_* code).
 pub const CONTROL_MSG_KEY: u8 = 0x14;
+/// Keyboard modifier state (xkb masks: depressed/latched/locked/group).
+pub const CONTROL_MSG_KEY_MODIFIERS: u8 = 0x15;
 
 /// Axis identifiers for pointer_axis (values match wl_pointer.axis).
 pub const AXIS_VERTICAL: u8 = 0;
@@ -60,6 +62,15 @@ pub enum InputEvent {
     PointerAxis { axis: u8, source: u8, value256: i32 },
     /// evdev KEY_* code, pressed = true on press.
     Key { code: u16, pressed: bool },
+    /// xkb modifier masks, matching virtual-keyboard modifiers().
+    /// Bit order is the classic X11/xkb order: 0 Shift, 1 Lock,
+    /// 2 Control, 3 Mod1 (Alt), 6 Mod4 (Super).
+    KeyModifiers {
+        depressed: u32,
+        latched: u32,
+        locked: u32,
+        group: u32,
+    },
 }
 
 impl InputEvent {
@@ -94,6 +105,21 @@ impl InputEvent {
                 CONTROL_MSG_KEY,
                 [code.to_be_bytes().as_slice(), &[u8::from(pressed)]].concat(),
             ),
+            Self::KeyModifiers {
+                depressed,
+                latched,
+                locked,
+                group,
+            } => (
+                CONTROL_MSG_KEY_MODIFIERS,
+                [
+                    depressed.to_be_bytes(),
+                    latched.to_be_bytes(),
+                    locked.to_be_bytes(),
+                    group.to_be_bytes(),
+                ]
+                .concat(),
+            ),
         }
     }
 
@@ -105,6 +131,9 @@ impl InputEvent {
         };
         let u16_at = |i: usize| -> Option<u16> {
             Some(u16::from_be_bytes(payload.get(i..i + 2)?.try_into().ok()?))
+        };
+        let u32_at = |i: usize| -> Option<u32> {
+            Some(u32::from_be_bytes(payload.get(i..i + 4)?.try_into().ok()?))
         };
         match msg_type {
             CONTROL_MSG_POINTER_MOTION_ABS if payload.len() == 8 => Some(Self::PointerMotionAbs {
@@ -127,6 +156,12 @@ impl InputEvent {
             CONTROL_MSG_KEY if payload.len() == 3 => Some(Self::Key {
                 code: u16_at(0)?,
                 pressed: payload[2] != 0,
+            }),
+            CONTROL_MSG_KEY_MODIFIERS if payload.len() == 16 => Some(Self::KeyModifiers {
+                depressed: u32_at(0)?,
+                latched: u32_at(4)?,
+                locked: u32_at(8)?,
+                group: u32_at(12)?,
             }),
             _ => None,
         }
@@ -518,6 +553,8 @@ mod tests {
             InputEvent::PointerAxis { axis: AXIS_HORIZONTAL, source: AXIS_SOURCE_WHEEL, value256: -2560 },
             InputEvent::Key { code: 35, pressed: true },  // KEY_H
             InputEvent::Key { code: 28, pressed: false }, // KEY_ENTER
+            InputEvent::KeyModifiers { depressed: 1, latched: 0, locked: 0, group: 0 }, // shift
+            InputEvent::KeyModifiers { depressed: 0, latched: 0, locked: 2, group: 1 }, // caps lock, group 1
         ];
         for event in events {
             let (msg_type, payload) = event.encode();
@@ -535,6 +572,8 @@ mod tests {
         assert!(InputEvent::decode(CONTROL_MSG_POINTER_MOTION_ABS, &[0; 7]).is_none());
         assert!(InputEvent::decode(CONTROL_MSG_KEY, &[0; 2]).is_none());
         assert!(InputEvent::decode(CONTROL_MSG_KEY, &[0; 4]).is_none());
+        assert!(InputEvent::decode(CONTROL_MSG_KEY_MODIFIERS, &[0; 15]).is_none());
+        assert!(InputEvent::decode(CONTROL_MSG_KEY_MODIFIERS, &[0; 17]).is_none());
         assert!(InputEvent::decode(0x7f, &[0; 8]).is_none());
     }
 }

@@ -82,10 +82,10 @@ virtual-keyboard-unstable-v1 (evdev key codes, with an evdev/pc105/us xkb
 keymap uploaded from a memfd via libxkbcommon). The virtual-keyboard
 bindings are generated from a vendored XML copy
 (`protocols/virtual-keyboard-unstable-v1.xml`, from Hyprland's tree) because
-the wayland-protocols crate no longer ships that protocol. Known gap:
-modifier state for typed characters needs a future key_modifiers message
-(protocol.md documents it). Verify without a Mac:
-`cargo run --example input_sender -- <agent-ip> type hello`.
+the wayland-protocols crate no longer ships that protocol. Modifier state
+for shifted characters rides the key_modifiers message (type 0x15).
+Verify without a Mac:
+`cargo run --example input_sender -- <agent-ip> type 'Hello!'`.
 
 ## Configuration
 

@@ -18,6 +18,13 @@ enum ControlMessageType: UInt8 {
     case hello = 0x01
     /// client -> agent, empty payload. Ask for a fresh IDR.
     case keyframeRequest = 0x02
+    // Input messages (client -> agent, US-006). Layouts in docs/protocol.md.
+    case pointerMotionAbs = 0x10
+    case pointerMotionRel = 0x11
+    case pointerButton = 0x12
+    case pointerAxis = 0x13
+    case key = 0x14
+    case keyModifiers = 0x15
 }
 
 /// Parsed `hello` message (agent -> client).

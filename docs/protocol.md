@@ -110,12 +110,24 @@ offset  size  field
 2       1     state: 1 = pressed, 0 = released
 ```
 
-The virtual keyboard runs the evdev/pc105/us xkb keymap. Known gap: modifier
-state (shift and friends) is not yet honored for typed characters; the
-virtual-keyboard protocol applies modifiers through a separate `modifiers`
-request that the wire format does not carry yet. Add a `key_modifiers`
-message (type 0x15, four BE u32: depressed/latched/locked/group, matching
-the protocol request) when the Mac client needs shifted characters.
+The virtual keyboard runs the evdev/pc105/us xkb keymap. Modifier state is
+not derived from key events; it is applied through the virtual-keyboard
+`modifiers` request, which the wire format carries as key_modifiers below.
+Send it before the key events it should affect, and again to release.
+
+#### key_modifiers (type 0x15)
+
+```
+offset  size  field
+0       4     depressed (BE u32, xkb modifier mask)
+4       4     latched (BE u32)
+8       4     locked (BE u32)
+12      4     group (BE u32)
+```
+
+Payload length is 16. Masks use the classic X11/xkb bit order: bit 0 Shift,
+bit 1 Lock (Caps Lock), bit 2 Control, bit 3 Mod1 (Alt), bit 6 Mod4 (Super).
+Example: holding shift is `depressed=1, latched=0, locked=0, group=0`.
 
 ## Video channel (UDP)
 

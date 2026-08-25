@@ -87,11 +87,11 @@ Acceptance Criteria:
 Description: As a user, I want to control the Linux machine with my Mac's keyboard, trackpad, and mouse.
 
 Acceptance Criteria:
-- [ ] Mouse move/click/scroll and keyboard events captured in the Mac window and injected on Linux via Hyprland's virtual-pointer/virtual-keyboard protocols (no root; `/dev/uinput` is root-only on the target)
-- [ ] Trackpad scrolling feels native (pixel-precise, momentum)
-- [ ] Modifier keys and common shortcuts work; a configurable "send system shortcuts" toggle decides whether e.g. Cmd+Space stays local or goes remote
-- [ ] Pointer lock / relative-mouse mode available for games and 3D apps
-- [ ] Verify in the running app: can open a terminal on Linux and type entirely from the Mac
+- [x] Mouse move/click/scroll and keyboard events captured in the Mac window and injected on Linux via Hyprland's virtual-pointer/virtual-keyboard protocols (no root; `/dev/uinput` is root-only on the target)
+- [x] Trackpad scrolling feels native (pixel-precise deltas verified on the wire; momentum passes through as continued deltas)
+- [x] Modifier keys and common shortcuts work (key_modifiers 0x15 verified: "Hello!" types with shift); a configurable "send system shortcuts" toggle decides whether e.g. Cmd+Space stays local or goes remote (Cmd+Tab interception is best-effort, documented)
+- [x] Pointer lock / relative-mouse mode available for games and 3D apps (toolbar toggle, Esc to exit)
+- [x] Verified in the running app: CGEvent keystrokes through the real app event path arrive in a Linux terminal; cursor lands at exact coordinates; clicks move window focus
 
 ### US-007: Zero-config discovery and one-click connect
 Description: As a user, I want my Linux machine to just appear in the app so I never type an IP address.

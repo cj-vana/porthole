@@ -231,3 +231,98 @@ Learnings for future iterations:
   reliably; for test windows just run the app over SSH with
   XDG_RUNTIME_DIR/WAYLAND_DISPLAY set. hyprctl dispatch is Lua-routed and
   mangles unquoted args.
+
+## 2026-08-25: US-006 input capture and control on macOS done
+
+Mac client now controls the Linux box: NSEvents on the Metal surface
+(SessionSurfaceView, first responder on click, acceptsFirstMouse so the
+activating click lands) translate through InputController into protocol input
+messages and ride the same control connection as keyframe_request. Motion maps
+through the inverse letterbox to output pixels; buttons carry evdev codes
+(0x110/0x111/0x112 plus back/forward 0x113/0x114); trackpad scroll uses
+precise deltas in 1/256 px with finger/continuous/wheel sources and the macOS
+to wl_pointer sign flip; keyboard translates kVK codes to evdev KEY_* via a
+documented table (Cmd to Super, Option to Alt). Modifier state is tracked
+from flagsChanged and sent as key_modifiers (0x15, classic X11 bit order
+1/2/4/8/64) before dependent keys; focus loss releases all held modifiers.
+Chrome gained a persisted Shortcuts toggle (Cmd chords forward best effort;
+Cmd+Tab and Spotlight Cmd+Space are eaten by macOS regardless) and a persisted
+Pointer lock toggle (cursor hidden, CGAssociateMouseAndMouseCursorPosition
+off, relative deltas, Esc releases, engages only while captured). Input flows
+only while the surface has focus; the focusing click also clicks through, and
+a green input captured chip shows state.
+
+Files changed:
+- macos/Porthole/Input/ (new): InputMessages.swift (wire encoders + Letterbox
+  map), KeyMap.swift (kVK to evdev table + US char table), InputController.swift
+  (translation, modifiers, pointer lock), SessionSurfaceView.swift (MTKView
+  subclass with first-responder capture).
+- macos/Porthole/Streaming/WireProtocol.swift: input message types 0x10-0x15.
+- macos/Porthole/Streaming/ControlChannel.swift: sendInput, parser switch made
+  exhaustive over the new types.
+- macos/Porthole/Streaming/StreamSession.swift: owns InputController, wires
+  onSend to control, inputCaptured and pointerLockActive published, videoSize
+  from hello, input reset on disconnect.
+- macos/Porthole/Rendering/MetalRenderer.swift: surface is now
+  SessionSurfaceView with inputHandler.
+- macos/Porthole/SessionView.swift: toggles, indicators, onChange wiring.
+- macos/InputTest/main.swift (new) + project.yml: porthole-input-test CLI,
+  local byte tests plus live move-abs/click/type modes sharing app sources.
+- macos/README.md: Input section (mapping, toggles, limits), gates, files.
+
+IMPORTANT for the orchestrator: key_modifiers (0x15) was specced but not
+decoded by the agent anywhere. I patched the box agent only
+(~/porthole/agent on 10.0.0.222): protocol.rs gains
+CONTROL_MSG_KEY_MODIFIERS, InputEvent::KeyModifiers with encode/decode
+(four BE u32), wayland.rs apply() calls virtual_keyboard.modifiers(). cargo
+build/test/clippy on the box all pass. The patch is NOT in the git repo; it
+must be upstreamed to agent/ or the next rsync will silently break shifted
+typing. Patch script kept at /tmp/porthole-box-patch-0x15.py on the Mac.
+
+Verification. Unit tests (porthole-input-test local): 9/9 PASS with exact
+wire bytes: plain key, shift+a ordering (shift key frame, modifiers frame,
+then key), precise scroll 12 px to -3072, button mapping, letterbox mapping
+(128,120 to 256,160; center to 1280,720; bar point sends nothing), shift+cmd
+mask 65, typeText("Hello!\n") full byte stream. Live integration against the
+patched box agent: move-abs 500 400 then hyprctl cursorpos printed exactly
+500, 400; type "Hello!\n" into a foot running cat produced a file containing
+Hello! (capital H and bang prove 0x15 crosses the wire); click into the
+inactive foot moved hyprctl activewindow to it. Live app run: CGEvent HID-tap
+posts while Porthole was frontmost produced Button/Key/Motion events in the
+agent debug log (Key code 45 = KEY_X) and the characters landed in the
+focused foot (flushed file shows xxxxy after a later newline; canonical tty
+buffers until Enter, which confused early checks). xcodebuild -scheme
+Porthole -configuration Debug clean build: zero warnings from project
+sources; all three schemes build clean.
+
+Learnings for future iterations:
+- One control connection per client: any second client (including the
+  porthole-input-test live CLI) REPLACES the app's connection. Verification
+  scripts must never connect the CLI while the app is connected.
+- CGEvent.postToPid mouse events do not drive the responder/focus path;
+  event.post(tap: .cghidEventTap) works (and warps the physical cursor).
+  `open` on a running app does not re-fire SwiftUI onAppear, so relaunch via
+  kill then open to retrigger auto-connect. CGPreflightPostEventAccess was
+  true here; key posting works without extra grants in this environment.
+- hyprctl over SSH needs HYPRLAND_INSTANCE_SIGNATURE from
+  /run/user/1000/hypr. This Hyprland follows the mouse: motion alone moves
+  window focus, which makes scripted focus assertions racy.
+- Terminal cat tests: canonical tty delivers to the reader only on newline;
+  type a trailing \n or the file stays empty while the echo looks fine.
+- SwiftUI onChange(of:) single-parameter form is deprecated on the 26 SDK;
+  use the two-parameter closure. CGAssociateMouseAndMouseCursorPosition takes
+  boolean_t (Int32) in Swift. CGEvent scrollWheelEvent2Source uses units:
+  .pixel; NSEvent from it reports hasPreciseScrollingDeltas true.
+
+## 2026-08-25: key_modifiers (0x15) implemented in git, box resynced
+
+The Mac client already sent key_modifiers per protocol.md; the agent side
+now exists in git (it previously lived only as a hot patch on the box,
+superseded and removed by this sync). InputEvent::KeyModifiers { depressed,
+latched, locked, group } with 16-byte BE payload encode/decode + round-trip
+and truncation tests; control reader forwards it like other input events;
+input/wayland.rs applies it via the virtual keyboard modifiers() request.
+input_sender type now uses key_modifiers (MOD_SHIFT=1) for shifted chars and
+covers the shifted digit row. Verified on the box: typing 'Hello!' into cat
+produced exactly 'Hello!' (previous behavior: lowercase). Box files
+hash-match local for all touched sources (sha256sum both sides).

@@ -7,20 +7,24 @@ import SwiftUI
 ///
 /// US-005: while a stream is live the renderer draws decoded CVPixelBuffers
 /// (see `MetalRenderer.display`); the test pattern remains as the
-/// disconnected idle state.
+/// disconnected idle state. US-006: the view is a SessionSurfaceView that
+/// captures keyboard/mouse/trackpad input while it holds focus.
 struct MetalSurfaceView: NSViewRepresentable {
     /// Target rate for the view's display link (60/120/144). Applied live on
     /// change; the system clamps it to what the attached display supports.
     let frameRate: Int
     /// Shared renderer owned by `StreamSession`; also the view's delegate.
     let renderer: MetalRenderer
+    /// Input translator owned by `StreamSession`.
+    let input: InputController
 
     func makeCoordinator() -> MetalRenderer {
         renderer
     }
 
     func makeNSView(context: Context) -> MTKView {
-        let view = MTKView(frame: .zero, device: context.coordinator.device)
+        let view = SessionSurfaceView(frame: .zero, device: context.coordinator.device)
+        view.inputHandler = input
         view.delegate = context.coordinator
         view.colorPixelFormat = MetalRenderer.pixelFormat
         view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)

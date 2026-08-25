@@ -45,6 +45,26 @@ targets:
         SWIFT_VERSION: "5.0"
         MACOSX_DEPLOYMENT_TARGET: "14.0"
         CODE_SIGN_IDENTITY: "-"
+  porthole-input-test:
+    type: tool
+    platform: macOS
+    deploymentTarget: "14.0"
+    # Headless gate for the US-006 input path: byte-exact translation tests
+    # plus a live mode that sends input to a real agent using the app's own
+    # ControlChannel and InputController.
+    sources:
+      - path: InputTest
+      - path: Porthole/Streaming/WireProtocol.swift
+      - path: Porthole/Streaming/ControlChannel.swift
+      - path: Porthole/Input/KeyMap.swift
+      - path: Porthole/Input/InputMessages.swift
+      - path: Porthole/Input/InputController.swift
+    settings:
+      base:
+        PRODUCT_NAME: porthole-input-test
+        SWIFT_VERSION: "5.0"
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        CODE_SIGN_IDENTITY: "-"
 schemes:
   Porthole:
     build:
@@ -56,5 +76,11 @@ schemes:
     build:
       targets:
         porthole-decode-test: all
+    run:
+      config: Debug
+  porthole-input-test:
+    build:
+      targets:
+        porthole-input-test: all
     run:
       config: Debug

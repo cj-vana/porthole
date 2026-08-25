@@ -256,6 +256,16 @@ impl WaylandInput {
                 // 1 = pressed, 0 = released.
                 self.keyboard.key(time, u32::from(code), u32::from(pressed));
             }
+            InputEvent::KeyModifiers {
+                depressed,
+                latched,
+                locked,
+                group,
+            } => {
+                // The protocol applies modifier state through this request,
+                // not through key events.
+                self.keyboard.modifiers(depressed, latched, locked, group);
+            }
         }
     }
 

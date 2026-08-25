@@ -1,4 +1,5 @@
 import Combine
+import CoreGraphics
 import CoreVideo
 import Foundation
 import os
@@ -21,9 +22,15 @@ final class StreamSession: ObservableObject {
 
     @Published private(set) var state: State = .disconnected
     @Published private(set) var lastError: String?
+    /// True while the surface holds focus and input flows (US-006).
+    @Published private(set) var inputCaptured = false
+    /// True while pointer lock (relative mouse mode) is engaged.
+    @Published private(set) var pointerLockActive = false
 
     /// The surface's renderer; decoded frames replace the test pattern.
     let renderer = MetalRenderer()
+    /// Keyboard/mouse/scroll translation and wire encoding (US-006).
+    let input = InputController()
 
     private let control = ControlChannel()
     private let video = VideoReceiver()
@@ -89,6 +96,23 @@ final class StreamSession: ObservableObject {
             self?.renderer.setColorState(matrix: colorState.matrix, fullRange: colorState.fullRange)
         }
 
+        // Input flows to the control channel on the same connection (US-006).
+        input.onSend = { [weak self] frame in
+            self?.control.sendInput(frame)
+        }
+        input.onCaptureChanged = { [weak self] captured in
+            DispatchQueue.main.async { self?.inputCaptured = captured }
+        }
+        input.onPointerLockChanged = { [weak self] locked in
+            DispatchQueue.main.async {
+                self?.pointerLockActive = locked
+                if !locked {
+                    // Esc released the lock; turn the chrome toggle off too.
+                    UserDefaults.standard.set(false, forKey: "pointerLock")
+                }
+            }
+        }
+
         logger.info("connecting to \(host, privacy: .public):\(WireProtocol.controlPort)")
         control.connect(host: host)
         startStatsTimer()
@@ -107,6 +131,7 @@ final class StreamSession: ObservableObject {
         try? statsLogHandle?.close()
         statsLogHandle = nil
         renderer.clearStream()
+        input.reset()
         hello = nil
         state = .disconnected
     }
@@ -121,6 +146,10 @@ final class StreamSession: ObservableObject {
                 return
             }
             self.hello = hello
+            // InputController is main-thread; hop for the size update.
+            DispatchQueue.main.async { [weak self] in
+                self?.input.videoSize = CGSize(width: Int(hello.width), height: Int(hello.height))
+            }
             logger.info("hello: \(hello.width)x\(hello.height)@\(hello.fps), keyframe every \(hello.keyframeIntervalSecs)s, video port \(hello.videoPort)")
             setState(.waitingForKeyframe)
             guard video.start(port: hello.videoPort) != nil else {
