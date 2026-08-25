@@ -4,3 +4,4 @@
 //! and later the Mac client implement against the same code/docs.
 
 pub mod protocol;
+pub mod thumbnail;

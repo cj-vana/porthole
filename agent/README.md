@@ -10,8 +10,9 @@ wlr-screencopy, headless virtual displays (US-015) work on Hyprland,
 hardware encode (US-002) works with NVENC or VAAPI via an ffmpeg subprocess,
 LAN transport (US-003) streams fragmented UDP video with a TCP control
 channel, and input injection (US-006a) drives a virtual pointer and keyboard
-on the Linux session from control-channel messages. Audio (US-009) is still
-a trait stub with TODOs.
+on the Linux session from control-channel messages. Discovery (US-007a)
+announces the agent via mDNS and serves one-shot thumbnails for the picker.
+Audio (US-009) is still a trait stub with TODOs.
 
 ## Build
 
@@ -87,6 +88,18 @@ for shifted characters rides the key_modifiers message (type 0x15).
 Verify without a Mac:
 `cargo run --example input_sender -- <agent-ip> type 'Hello!'`.
 
+### Discovery (US-007a)
+
+While running, the agent announces `_porthole._tcp.local.` via mDNS (pure
+Rust mdns-sd crate, no system services) with TXT records for name, ports,
+and capabilities; see `../docs/protocol.md`. The name comes from `--name`
+(TOML `name`), default the system hostname. For the machine picker there is
+a one-shot thumbnail endpoint on `--port-thumbnail` (default 52803):
+connect, get one length-prefixed 320px RGBA thumbnail, close. It never
+touches the single-client control channel, so polling cannot disturb an
+active session. Verify with `cargo run --example thumb_fetch -- <agent-ip>
+out.png`.
+
 ## Configuration
 
 Single TOML file (PRD FR-11); every field is optional. Precedence:
@@ -101,6 +114,8 @@ Without `--config`, the agent loads
 | `--port-video`      | 52800   | UDP port for the video stream              |
 | `--port-control`    | 52801   | TCP port for the control channel           |
 | `--port-audio`      | 52802   | UDP port for the audio stream              |
+| `--port-thumbnail`  | 52803   | TCP port for the thumbnail endpoint        |
+| `--name`            | hostname | Machine name for mDNS and the picker      |
 | `--bitrate-mbps`    | 40      | Encoder target bitrate                     |
 | `--codec`           | h264    | `h264` or `hevc`                           |
 | `--encoder`         | nvenc   | `nvenc` (dGPU) or `vaapi` (iGPU)           |

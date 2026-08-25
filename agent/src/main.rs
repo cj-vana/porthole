@@ -11,6 +11,7 @@
 mod audio;
 mod capture;
 mod config;
+mod discovery;
 mod encode;
 mod input;
 mod transport;
@@ -49,6 +50,15 @@ struct Cli {
     /// UDP port for the audio stream [default: 52802]
     #[arg(long, value_name = "PORT")]
     port_audio: Option<u16>,
+
+    /// TCP port for the thumbnail endpoint [default: 52803]
+    #[arg(long, value_name = "PORT")]
+    port_thumbnail: Option<u16>,
+
+    /// Machine name announced via mDNS and shown in the picker
+    /// [default: system hostname]
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
 
     /// NVENC target bitrate in Mbps [default: 40]
     #[arg(long, value_name = "MBPS")]
@@ -89,6 +99,12 @@ impl Cli {
         }
         if let Some(v) = self.port_audio {
             cfg.port_audio = v;
+        }
+        if let Some(v) = self.port_thumbnail {
+            cfg.port_thumbnail = v;
+        }
+        if let Some(v) = &self.name {
+            cfg.name = v.clone();
         }
         if let Some(v) = self.bitrate_mbps {
             cfg.bitrate_mbps = v;
@@ -134,6 +150,7 @@ fn capture_loop(
     capture_format: capture::CaptureFormat,
     mut sender: transport::VideoSender,
     events: std::sync::mpsc::Receiver<transport::ControlEvent>,
+    latest_frame: discovery::LatestFrame,
     pipeline_start: Instant,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -205,6 +222,13 @@ fn capture_loop(
             }
         };
         frames += 1;
+
+        // FR-10: share a recent frame with the thumbnail endpoint. Every
+        // 30th frame is plenty fresh for a picker thumbnail.
+        if frames % 30 == 1 {
+            *latest_frame.lock().expect("thumbnail slot poisoned") =
+                Some((frame.data.clone(), frame.width, frame.height, frame.stride));
+        }
 
         // Pace encoder submissions to the configured stream rate.
         let now = Instant::now();
@@ -306,6 +330,8 @@ async fn main() -> anyhow::Result<()> {
         video_addr = %cfg.video_addr(),
         control_addr = %cfg.control_addr(),
         audio_addr = %cfg.audio_addr(),
+        thumbnail_addr = %cfg.thumbnail_addr(),
+        name = %cfg.name,
         bitrate_mbps = cfg.bitrate_mbps,
         codec = %cfg.codec,
         encoder = %cfg.encoder,
@@ -347,6 +373,12 @@ async fn main() -> anyhow::Result<()> {
         let events = transport::spawn_control_listener(&cfg, hello, input_tx)
             .context("transport control channel startup failed")?;
         let sender = transport::VideoSender::new(&cfg).context("transport video socket failed")?;
+        // US-007a: discovery. The thumbnail endpoint shares the latest frame
+        // through a slot; mDNS announces name/ports/caps.
+        let latest_frame = discovery::LatestFrame::default();
+        discovery::spawn_thumbnail_server(&cfg, latest_frame.clone())
+            .context("thumbnail endpoint startup failed")?;
+        let announcement = discovery::announce(&cfg);
         let encoder = encode::create(&cfg, &capture_format);
         let pipeline_start = Instant::now();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -354,9 +386,21 @@ async fn main() -> anyhow::Result<()> {
             let shutdown = shutdown.clone();
             let cfg = cfg.clone();
             let capture_format = capture_format.clone();
-            move || capture_loop(backend, encoder, cfg, capture_format, sender, events, pipeline_start, shutdown)
+            move || {
+                capture_loop(
+                    backend,
+                    encoder,
+                    cfg,
+                    capture_format,
+                    sender,
+                    events,
+                    latest_frame,
+                    pipeline_start,
+                    shutdown,
+                )
+            }
         });
-        Some((handle, shutdown))
+        Some((handle, shutdown, announcement))
     } else {
         None
     };
@@ -381,17 +425,20 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    if let Some((handle, shutdown)) = capture {
+    if let Some((handle, shutdown, announcement)) = capture {
         shutdown.store(true, Ordering::Relaxed);
         // The capture thread finishes the in-flight frame, then exits.
         if tokio::time::timeout(Duration::from_secs(3), handle).await.is_err() {
             tracing::warn!("capture thread did not stop within 3s, exiting anyway");
         }
+        // Dropping the announcement unregisters the mDNS service.
+        drop(announcement);
+        tracing::debug!("mDNS announcement withdrawn");
     }
 
     // The encoder drops with the capture thread: closing ffmpeg's stdin
     // flushes and exits the child.
-    // TODO: close transport, release uinput devices.
+    // TODO: close transport.
     tracing::info!("porthole-agent stopped cleanly");
     Ok(())
 }

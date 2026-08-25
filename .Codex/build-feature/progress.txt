@@ -22,6 +22,7 @@ Feature: Porthole full build-out (PRD US-002 through US-014)
 - Wire protocol (US-003): implemented once in agent/src/protocol.rs (lib target), spec in docs/protocol.md, reference receiver in agent/examples/receiver.rs. New wire behavior changes there first, tests included.
 - Verification networking: UFW on the box blocks inbound LAN except SSH; use Tailscale (box 100.105.41.71). Also: backgrounded processes over SSH hold the session open; start the agent with `setsid ... </dev/null >log 2>&1 &`, and never `pkill -f` a pattern that matches your own shell cmdline (use `pgrep -x porthole-agent` + kill -INT).
 - Input (US-006a): no uinput (root-only); Hyprland takes zwlr_virtual_pointer_v1 (wayland-protocols-wlr crate) + virtual-keyboard-unstable-v1 (vendored XML in agent/protocols/ + wayland-scanner codegen; the wayland-protocols crate dropped it). xkbcommon crate API lives in xkbcommon::xkb with u32 flag consts. Color tagging: use the setparams filter, not ffmpeg -color_* output options; NVENC needs nv12 input for the matrix tag to stick.
+- Discovery (US-007a): mdns-sd needs `.enable_addr_auto()` on ServiceInfo with empty ip or nothing is announced. mDNS does not cross Tailscale (link-local only); test from the Mac over the real LAN. Thumbnails are a separate one-shot TCP port (52803), never the control channel. `examples/mdns_probe.rs --announce-test` self-tests announce+browse on any host.
 ---
 
 ## 2026-08-25: US-002 hardware encoding (NVENC + VAAPI) done
@@ -326,3 +327,40 @@ input_sender type now uses key_modifiers (MOD_SHIFT=1) for shifted chars and
 covers the shifted digit row. Verified on the box: typing 'Hello!' into cat
 produced exactly 'Hello!' (previous behavior: lowercase). Box files
 hash-match local for all touched sources (sha256sum both sides).
+
+## 2026-08-25: US-007a discovery (mDNS + thumbnail endpoint) done
+
+FR-8: agent announces _porthole._tcp.local. via the mdns-sd crate (pure
+Rust). TXT: v=1, name, control_port, video_port, thumb_port, caps
+("<encoder>,h264,hevc,144"). New config: name (default system hostname via
+libc gethostname, now a common dep) and port_thumbnail (52803). Announcement
+unregisters on shutdown (Drop on Announcement). Verified from the Mac:
+dns-sd -B shows the box; dns-sd -L resolves depth23jellyfin.local.:52801
+with the full TXT.
+
+FR-10: thumbnail endpoint is a separate one-shot TCP service on 52803
+(connect, one length-prefixed {w u16, h u16, RGBA8} message, close) so the
+picker never touches the single-client control channel. Capture thread
+shares every 30th frame through a slot; downscale is nearest-neighbor to
+320px in src/thumbnail.rs (lib, unit-tested incl. odd strides).
+examples/thumb_fetch.rs (dev-dep png) writes PNG; verified 320x180 at
+/tmp/porthole-thumb.png.
+
+Files changed: agent/src/discovery.rs (new), agent/src/thumbnail.rs (new),
+agent/src/lib.rs, agent/src/config.rs, agent/src/main.rs,
+agent/examples/{thumb_fetch,mdns_probe}.rs (new), docs/protocol.md,
+agent/README.md, agent/config.example.toml, agent/Cargo.toml.
+
+Learnings for future iterations:
+- mdns-sd: ServiceInfo with empty ip needs .enable_addr_auto() or NOTHING is
+  announced (addr_auto defaults false, empty addresses = invalid service).
+  Cost a debug session; the mdns_probe example (--announce-test) self-tests
+  register+browse on any host.
+- The box runs avahi-daemon; mdns-sd coexists fine once addr_auto is set
+  (avahi owns the wildcard 5353 socket, both work).
+- mDNS is link-local only: it does not cross Tailscale. Works over the real
+  LAN (Mac .61, box .222); the Mac sees it because both are on 10.0.0.0.
+- Known stream issue (predates this story, visible at 2s IDR cadence):
+  about one frame lost every few seconds over Tailscale when the IDR burst
+  hits (~2% loss seconds, instant recovery via keyframe_request). Pacing
+  datagram bursts at IDR is a later optimization.

@@ -10,6 +10,12 @@
 # UDP port for the Opus audio stream.
 # port_audio = 52802
 
+# TCP port for the thumbnail endpoint (machine picker).
+# port_thumbnail = 52803
+
+# Machine name announced via mDNS and shown in the picker (default: hostname).
+# name = "my-linux-box"
+
 # NVENC/VAAPI target bitrate in Mbps (40 is the PRD default for 1440p LAN quality mode).
 # bitrate_mbps = 40
 

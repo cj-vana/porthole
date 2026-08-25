@@ -164,6 +164,56 @@ Reference receiver: `cargo run --example receiver -- <agent-ip> [--dump
 out.h264]`. Scripted input sender: `cargo run --example input_sender --
 <agent-ip> <move-abs|move-rel|click|scroll|type> ...`.
 
+## Discovery and thumbnails (US-007a)
+
+### mDNS announce (FR-8)
+
+Agents advertise `_porthole._tcp.local.` while running, with the service
+port set to the control port. The instance name is the configured machine
+name (`--name`, default: system hostname). TXT records:
+
+```
+v=1                                    protocol version
+name=<machine name>                    picker display name
+control_port=52801                     TCP control channel
+video_port=52800                       UDP video datagrams
+thumb_port=52803                       TCP thumbnail endpoint (see below)
+caps=<encoder>,h264,hevc,144           capabilities, e.g. "nvenc,h264,hevc,144"
+```
+
+The announcement is withdrawn when the agent exits.
+
+### Thumbnail endpoint (FR-10)
+
+The machine picker wants a recent frame per agent without disturbing an
+active session. The control channel is single-client, so thumbnails do NOT
+go through it; the picker polls a separate one-shot TCP service on
+`thumb_port` (default 52803) instead of the agent pushing on a timer.
+
+Flow: connect, agent immediately writes one message, connection closes.
+Framing matches the control channel minus the type byte:
+
+```
+offset  size  field
+0       4     payload length in bytes (BE u32); 0 means no frame captured yet
+4       n     payload
+```
+
+Payload:
+
+```
+offset  size  field
+0       2     width (BE u16)
+2       2     height (BE u16)
+4       n     width*height*4 bytes of RGBA8 pixels
+```
+
+The thumbnail is the latest captured frame downscaled to 320 px wide
+(nearest neighbor). Freshness: the capture thread refreshes the source frame
+every 30 frames (a few times per second); a thumbnail is at most a second
+stale in practice. Fetcher: `cargo run --example thumb_fetch -- <agent-ip>
+out.png`.
+
 ## Notes for later versions
 
 - Audio (Opus over UDP 52802) is specified in US-009, not yet on the wire.

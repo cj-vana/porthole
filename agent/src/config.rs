@@ -16,9 +16,39 @@ use crate::encode::{Codec, EncoderBackend};
 pub const DEFAULT_PORT_VIDEO: u16 = 52800;
 pub const DEFAULT_PORT_CONTROL: u16 = 52801;
 pub const DEFAULT_PORT_AUDIO: u16 = 52802;
+pub const DEFAULT_PORT_THUMBNAIL: u16 = 52803;
 pub const DEFAULT_BITRATE_MBPS: u32 = 40;
 pub const DEFAULT_FPS: u16 = 60;
 pub const DEFAULT_KEYFRAME_INTERVAL_SECS: u32 = 2;
+
+/// Default machine name for discovery (FR-8): the system hostname, short
+/// form (no domain).
+#[cfg(unix)]
+fn default_name() -> String {
+    let mut buf = [0u8; 256];
+    // Safety: gethostname writes at most buf.len() bytes into buf.
+    let ok = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if ok == 0 {
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        if let Ok(full) = std::str::from_utf8(&buf[..len]) {
+            let short = full.split('.').next().unwrap_or(full);
+            if !short.is_empty() {
+                return short.to_string();
+            }
+        }
+    }
+    "porthole-agent".to_string()
+}
+
+#[cfg(not(unix))]
+fn default_name() -> String {
+    "porthole-agent".to_string()
+}
+
+/// System hostname, short form. Used as the mDNS host target.
+pub fn hostname() -> String {
+    default_name()
+}
 
 /// Framerates the agent will stream at (PRD: 60 quality mode; 120 targeted by
 /// gaming mode US-013; 144 for high-refresh displays).
@@ -145,6 +175,11 @@ pub struct Config {
     pub port_control: u16,
     /// UDP port for the Opus audio stream (default 52802).
     pub port_audio: u16,
+    /// TCP port for the thumbnail endpoint (default 52803, FR-10).
+    pub port_thumbnail: u16,
+    /// Machine name announced via mDNS and shown in the picker (default:
+    /// system hostname).
+    pub name: String,
     /// NVENC target bitrate in Mbps (default 40, per PRD for 1440p LAN quality mode).
     pub bitrate_mbps: u32,
     /// Keyframe (IDR) interval in seconds (default 2; US-002).
@@ -168,6 +203,8 @@ impl Default for Config {
             port_video: DEFAULT_PORT_VIDEO,
             port_control: DEFAULT_PORT_CONTROL,
             port_audio: DEFAULT_PORT_AUDIO,
+            port_thumbnail: DEFAULT_PORT_THUMBNAIL,
+            name: default_name(),
             bitrate_mbps: DEFAULT_BITRATE_MBPS,
             keyframe_interval_secs: DEFAULT_KEYFRAME_INTERVAL_SECS,
             codec: Codec::default(),
@@ -190,6 +227,10 @@ impl Config {
     pub fn audio_addr(&self) -> SocketAddr {
         SocketAddr::from(([0, 0, 0, 0], self.port_audio))
     }
+
+    pub fn thumbnail_addr(&self) -> SocketAddr {
+        SocketAddr::from(([0, 0, 0, 0], self.port_thumbnail))
+    }
 }
 
 /// Partial config as deserialized from a TOML file; all fields optional.
@@ -199,6 +240,8 @@ pub struct FileConfig {
     pub port_video: Option<u16>,
     pub port_control: Option<u16>,
     pub port_audio: Option<u16>,
+    pub port_thumbnail: Option<u16>,
+    pub name: Option<String>,
     pub bitrate_mbps: Option<u32>,
     pub keyframe_interval_secs: Option<u32>,
     pub codec: Option<Codec>,
@@ -219,6 +262,12 @@ impl FileConfig {
         }
         if let Some(v) = self.port_audio {
             cfg.port_audio = v;
+        }
+        if let Some(v) = self.port_thumbnail {
+            cfg.port_thumbnail = v;
+        }
+        if let Some(v) = self.name {
+            cfg.name = v;
         }
         if let Some(v) = self.bitrate_mbps {
             cfg.bitrate_mbps = v;
@@ -280,6 +329,8 @@ mod tests {
         assert_eq!(cfg.port_video, 52800);
         assert_eq!(cfg.port_control, 52801);
         assert_eq!(cfg.port_audio, 52802);
+        assert_eq!(cfg.port_thumbnail, 52803);
+        assert!(!cfg.name.is_empty());
         assert_eq!(cfg.bitrate_mbps, 40);
         assert_eq!(cfg.keyframe_interval_secs, 2);
         assert_eq!(cfg.codec, Codec::H264);
