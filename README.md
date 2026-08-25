@@ -17,7 +17,7 @@ The full plan, with phased user stories and acceptance criteria, is in [tasks/pr
 
 ## How it will work
 
-- The agent captures the Linux screen (primary display, 2560×1440), encodes H.264 or HEVC on an NVIDIA GPU with NVENC, and sends it over UDP. Input travels back over a TCP control channel and gets injected with uinput.
+- The agent captures the Linux screen (primary display, 2560×1440), encodes H.264 or HEVC with NVENC on the NVIDIA GPU or with VAAPI on the Ryzen iGPU (for keeping the dGPU free for games), and sends it over UDP. Input travels back over a TCP control channel and gets injected with uinput.
 - The Mac app discovers agents with Bonjour, decodes with VideoToolbox, and renders with Metal. Clipboard sync, audio, file drag and drop, and gamepad passthrough are planned phases, not current features.
 - LAN only for now. Running over Tailscale later should work without changes.
 

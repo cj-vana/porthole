@@ -58,6 +58,11 @@ struct Cli {
     #[arg(long, value_enum)]
     codec: Option<Codec>,
 
+    /// Hardware encoder backend: nvenc on the NVIDIA dGPU, or vaapi on the
+    /// Ryzen iGPU (keeps the dGPU free for gaming) [default: nvenc]
+    #[arg(long, value_enum)]
+    encoder: Option<encode::EncoderBackend>,
+
     /// Stream framerate (60, 120, or 144) [default: 60]
     #[arg(long, value_name = "FPS")]
     fps: Option<config::Fps>,
@@ -80,6 +85,9 @@ impl Cli {
         }
         if let Some(v) = self.codec {
             cfg.codec = v;
+        }
+        if let Some(v) = self.encoder {
+            cfg.encoder = v;
         }
         if let Some(v) = self.fps {
             cfg.fps = v;
@@ -112,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
         audio_addr = %cfg.audio_addr(),
         bitrate_mbps = cfg.bitrate_mbps,
         codec = %cfg.codec,
+        encoder = %cfg.encoder,
         fps = %cfg.fps,
         capture_backend = backend.name(),
         "effective configuration"

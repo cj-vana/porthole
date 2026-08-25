@@ -6,7 +6,7 @@ Porthole is a native macOS screen sharing / remote desktop app for controlling a
 
 It consists of two components we build ourselves:
 
-- **Porthole Agent**, a small Rust service running on the Linux machine. Captures the screen, hardware-encodes it with the machine's NVIDIA GPU (NVENC), streams it over the LAN, and injects received input (keyboard/mouse/gamepad) back into Linux.
+- **Porthole Agent**, a small Rust service running on the Linux machine. Captures the screen, hardware-encodes it on the machine's NVIDIA GPU (NVENC) or on the Ryzen iGPU (VAAPI) when the dGPU should stay free for games, streams it over the LAN, and injects received input (keyboard/mouse/gamepad) back into Linux.
 - **Porthole for Mac**, a native Swift/SwiftUI app. Discovers agents on the network, renders the stream with Metal + VideoToolbox hardware decoding, captures local input, and provides the "cool options": clipboard sync, audio, file drag & drop, display modes, and a low-latency gaming mode.
 
 Primary use case: hours-long coding/dev sessions (so text must be razor sharp) plus occasional gaming (so there must be a high-framerate, low-latency mode).
@@ -16,7 +16,7 @@ Primary use case: hours-long coding/dev sessions (so text must be razor sharp) p
 ## Goals
 
 - One-click connect to a Linux machine in under 3 seconds, with zero typing of IPs/ports.
-- Sustain 1440p (2560×1440) streaming at 60fps on a LAN with hardware encode (Linux/NVENC) and hardware decode (Mac/VideoToolbox), plus selectable 120fps and 144fps modes for high-refresh displays.
+- Sustain 1440p (2560×1440) streaming at 60fps on a LAN with hardware encode (Linux, NVENC or VAAPI) and hardware decode (Mac/VideoToolbox), plus selectable 120fps and 144fps modes for high-refresh displays.
 - Glass-to-glass latency under 40ms in the default "quality" mode; target under 25ms in "gaming" mode at up to 144fps.
 - Text in a code editor is crisp and comfortable for multi-hour sessions at 1:1 scaling on a Retina display.
 - Feel 100% native on macOS: trackpad scroll/gestures, system shortcuts, fullscreen spaces, Retina rendering.
@@ -35,12 +35,14 @@ Acceptance Criteria:
 - [ ] Logs negotiated resolution, framerate, and capture backend on startup
 - [ ] `cargo clippy` passes with no warnings
 
-### US-002: NVENC hardware encoding
-Description: As a developer, I need captured frames encoded to H.264 on the GPU so the CPU stays free for actual work.
+### US-002: Hardware encoding (NVENC or Ryzen iGPU VAAPI)
+Description: As a developer, I need captured frames encoded to H.264 on a GPU so the CPU stays free for actual work, with the encoder backend selectable so the NVIDIA dGPU can stay fully free for games.
 
 Acceptance Criteria:
-- [ ] Frames encoded to H.264 via NVENC (GStreamer `nvh264enc` or FFmpeg `h264_nvenc`)
-- [ ] 1440p60 (2560×1440) encode with visible encoder load in `nvidia-smi` and low CPU usage
+- [ ] Frames encoded to H.264 via NVENC (GStreamer `nvh264enc` or FFmpeg `h264_nvenc`) as the default backend
+- [ ] Alternative VAAPI backend encoding on the Ryzen iGPU (GStreamer `vah264enc` or FFmpeg `h264_vaapi`), selectable via config/CLI
+- [ ] 1440p60 (2560×1440) encode on the default backend with visible encoder load in `nvidia-smi` and low CPU usage
+- [ ] With the VAAPI backend active, encoder load shows on the iGPU's `/dev/dri` node and `nvidia-smi` shows no encoder session
 - [ ] Keyframe interval and bitrate are configurable via CLI flags
 - [ ] `cargo clippy` passes with no warnings
 
@@ -163,7 +165,7 @@ Acceptance Criteria:
 Agent (Linux):
 
 - FR-1: Capture the primary display at the negotiated resolution and framerate (PipeWire on Wayland, X11 fallback). Supported stream framerates: 60, 120, and 144 fps.
-- FR-2: Hardware-encode video with NVIDIA NVENC; default H.264, optional HEVC.
+- FR-2: Hardware-encode video; default H.264, optional HEVC. Encoder backend selectable via config/CLI: NVIDIA NVENC (default) or AMD VAAPI on the Ryzen iGPU, which keeps the dGPU fully free for gaming.
 - FR-3: Stream video as sequence-numbered UDP datagrams; maintain a TCP control channel for handshake, settings, and keyframe requests.
 - FR-4: On decode-fatal packet loss reported by the client, immediately emit a keyframe.
 - FR-5: Inject keyboard/mouse input via `uinput`, including a relative-mouse mode.
@@ -211,7 +213,7 @@ Mac app:
 
 - Agent language: Rust. Single static-ish binary, strong GStreamer/FFmpeg bindings, safe `uinput` handling. GStreamer recommended for the capture+encode pipeline (best PipeWire and NVENC element integration).
 - Capture: PipeWire on Wayland, X11 (XShm/XDamage) fallback. Confirm the target machine's session type early, since it decides which path gets polished first.
-- Encode: NVENC H.264 default, HEVC optional; low-latency presets for Gaming mode; configurable bitrate (default ~40 Mbps for 1440p60 LAN quality mode).
+- Encode: H.264 default, HEVC optional; low-latency presets for Gaming mode; configurable bitrate (default ~40 Mbps for 1440p60 LAN quality mode). Two encoder backends: NVENC (default) and VAAPI on the Ryzen iGPU (GStreamer `vah264enc`/`vah265enc` or FFmpeg `*_vaapi` on the iGPU's `/dev/dri/renderD*` node). When capture runs on the dGPU and encode on the iGPU, expect one cross-GPU buffer copy; use dma-buf import where the stack allows it.
 - High refresh: 120/144fps modes raise bitrate budgets (expect roughly 60-80 Mbps for H.264 at 1440p144) and require the Linux display to actually run at that refresh rate. HEVC earns its keep here.
 - Decode/render (Mac): VideoToolbox → Metal. Render at the drawable's native resolution for Retina sharpness.
 - Protocol: TCP control channel (binary or length-prefixed messages) + UDP for video/audio datagrams carrying sequence numbers and timestamps. Keep the transport interface behind a trait/abstraction so a WebRTC or QUIC transport can replace it later for internet play.
@@ -233,6 +235,7 @@ Mac app:
 
 - What distro, desktop environment, and session type (X11 or Wayland) does the Linux machine run? Decides whether PipeWire or X11 capture is the primary path.
 - Resolution confirmed: 2560×1440. The user requires 120/144fps modes, so the Linux display is assumed to run at 144Hz. Confirm its actual maximum refresh rate.
+- Is the Ryzen iGPU enabled in the BIOS? The VAAPI backend needs it exposed as a `/dev/dri` render node; some boards disable the iGPU when a dGPU is installed.
 - Is 4:4:4 chroma worth pursuing for perfect text after v1 (VideoToolbox supports it on HEVC; NVENC support varies by GPU)?
 - Headless operation: should the agent be able to create a virtual display when no monitor is attached to the Linux box?
 - Final product name is undecided; "Porthole" is a codename.

@@ -11,7 +11,7 @@ use std::str::FromStr;
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 
-use crate::encode::Codec;
+use crate::encode::{Codec, EncoderBackend};
 
 pub const DEFAULT_PORT_VIDEO: u16 = 52800;
 pub const DEFAULT_PORT_CONTROL: u16 = 52801;
@@ -92,6 +92,9 @@ pub struct Config {
     pub bitrate_mbps: u32,
     /// Video codec (default h264; hevc optional, US-013).
     pub codec: Codec,
+    /// Hardware encoder backend (default nvenc on the dGPU; vaapi offloads
+    /// to the Ryzen iGPU so the dGPU stays free for gaming).
+    pub encoder: EncoderBackend,
     /// Stream framerate (default 60; gaming mode selects 120 or 144, US-013).
     pub fps: Fps,
 }
@@ -104,6 +107,7 @@ impl Default for Config {
             port_audio: DEFAULT_PORT_AUDIO,
             bitrate_mbps: DEFAULT_BITRATE_MBPS,
             codec: Codec::default(),
+            encoder: EncoderBackend::default(),
             fps: Fps::default(),
         }
     }
@@ -132,6 +136,7 @@ pub struct FileConfig {
     pub port_audio: Option<u16>,
     pub bitrate_mbps: Option<u32>,
     pub codec: Option<Codec>,
+    pub encoder: Option<EncoderBackend>,
     pub fps: Option<Fps>,
     // TODO(FR-11): display index/output name, file-transfer folder (US-011,
     // default ~/Downloads), mDNS service name (US-007).
@@ -153,6 +158,9 @@ impl FileConfig {
         }
         if let Some(v) = self.codec {
             cfg.codec = v;
+        }
+        if let Some(v) = self.encoder {
+            cfg.encoder = v;
         }
         if let Some(v) = self.fps {
             cfg.fps = v;
@@ -186,7 +194,17 @@ mod tests {
         assert_eq!(cfg.port_audio, 52802);
         assert_eq!(cfg.bitrate_mbps, 40);
         assert_eq!(cfg.codec, Codec::H264);
+        assert_eq!(cfg.encoder, EncoderBackend::Nvenc);
         assert_eq!(cfg.fps.get(), 60);
+    }
+
+    #[test]
+    fn encoder_backend_toml_parse_and_reject() {
+        // Valid values parse from TOML (case handled by serde rename_all).
+        let file_cfg: FileConfig = toml::from_str(r#"encoder = "vaapi""#).unwrap();
+        assert_eq!(file_cfg.encoder.unwrap(), EncoderBackend::Vaapi);
+        // Invalid value rejected from the TOML path, same as the CLI path.
+        assert!(toml::from_str::<FileConfig>(r#"encoder = "qsv""#).is_err());
     }
 
     #[test]

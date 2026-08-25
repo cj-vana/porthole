@@ -16,5 +16,9 @@
 # Video codec: "h264" (default) or "hevc".
 # codec = "h264"
 
+# Hardware encoder backend: "nvenc" (default, NVIDIA dGPU) or "vaapi"
+# (Ryzen iGPU; keeps the dGPU free for gaming).
+# encoder = "nvenc"
+
 # Stream framerate: 60 (default), 120, or 144.
 # fps = 60
