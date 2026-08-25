@@ -19,6 +19,8 @@ Feature: Porthole full build-out (PRD US-002 through US-014)
 - Prose rules (enforced by scanner, zero findings so far): no em/en dashes, no bolded lead-in labels in docs. Run `python3 /Users/cjvana/.claude/skills/unslop-text/scripts/unslop_text_scan.py /Users/cjvana/Documents/GitHub/porthole/` after doc edits; also unslop-code scanner for source comments.
 - No sudo on the Linux box. Prefer user-space solutions: FFmpeg over GStreamer if system packages are missing, wlroots virtual-pointer/virtual-keyboard protocols over uinput where possible.
 - Git: parent agent (orchestrator) commits and pushes per story; subagents never run git.
+- Wire protocol (US-003): implemented once in agent/src/protocol.rs (lib target), spec in docs/protocol.md, reference receiver in agent/examples/receiver.rs. New wire behavior changes there first, tests included.
+- Verification networking: UFW on the box blocks inbound LAN except SSH; use Tailscale (box 100.105.41.71). Also: backgrounded processes over SSH hold the session open; start the agent with `setsid ... </dev/null >log 2>&1 &`, and never `pkill -f` a pattern that matches your own shell cmdline (use `pgrep -x porthole-agent` + kill -INT).
 ---
 
 ## 2026-08-25: US-002 hardware encoding (NVENC + VAAPI) done
@@ -63,3 +65,56 @@ Learnings for future iterations:
 - h264_vaapi rate control fills the CBR -b:v target even for static content;
   nvenc defaults to VBR-ish and drops to near zero kbps on static images.
   Neither is a bug.
+
+## 2026-08-25: US-003 LAN transport done
+
+Wire format v1 lives in agent/src/protocol.rs (new lib target) and
+docs/protocol.md (repo root, written for the Swift client). Video: UDP
+52800, AU fragmented into 1400B datagrams, 25B header (magic PHV, version,
+BE u64 frame seq, BE u64 capture timestamp us, u16 frag index/count, flags
+keyframe bit), all big-endian. Control: TCP 52801, length-prefixed (4B BE
+len + 1B type), hello (codec/width/height/fps/bitrate/keyframe interval/
+video port) on connect, keyframe_request from client. One client at a time,
+new connection replaces old. Video is sent to the control peer's IP at the
+negotiated port. Sequence numbers are assigned by the transport and stay
+monotonic across encoder restarts.
+
+FR-4: keyframe_request restarts the ffmpeg encoder session (fresh IDR next
+AU). Measured restart: 100ms. protocol.md documents the tradeoff.
+
+Verification (agent on the box, examples/receiver.rs on the Mac, over
+Tailscale because UFW on the box blocks non-SSH LAN ports): ~60 AUs/s,
+0.00% loss steady state, ffprobe on --dump output: h264 2560x1440. kbps is
+low (~180 to 1100, alternating with the 2s IDR cadence) because the headless
+desktop is static. Loss recovery proven both sides: receiver join and one
+mid-stream loss each triggered keyframe_request, agent logged
+"encoder restarted for keyframe request restart_ms=100", receiver recovered
+to 60 fps 0.00% loss. Receiver restarts reconnect cleanly (new connection
+replaces old).
+
+Files changed:
+- agent/src/lib.rs + agent/src/protocol.rs (new): wire format, fragment(),
+  parse_datagram(), Reassembler (stale-frame sweep = loss), Hello
+  encode/decode, control message framing; 6 unit tests incl. dropped
+  fragment and out-of-order/duplicate cases.
+- agent/src/transport/mod.rs: real control listener (accept loop, hello,
+  reader thread per connection, ControlEvent mpsc) + VideoSender (fragment
+  and send immediately, no buffering).
+- agent/src/main.rs: pipeline wires capture -> encode -> transport; control
+  events handled between frames; keyframe request restarts encoder via
+  encode::create; capture-time FIFO pairs AUs to submitted frame instants.
+- agent/examples/receiver.rs (new): reference receiver, --dump writes Annex
+  B from first keyframe on.
+- docs/protocol.md (new): the spec for the Mac client.
+
+Learnings for future iterations:
+- The box runs UFW; inbound LAN ports other than SSH are blocked and there
+  is no sudo. Both machines are on Tailscale; run verification over the
+  tailnet (box is 100.105.41.71, Mac 100.126.134.75). PRD already blesses
+  Tailscale as LAN-like.
+- ffprobe on raw Annex B reports r_frame_rate 120/1 for a 60fps nvenc
+  stream (h264 timing is field-rate). Trust the AU count and the hello fps.
+- Known race (v1-acceptable): a stale control reader can emit
+  ClientDisconnected just after a new ClientConnected, clearing the live
+  client target. Rare on LAN; fix with connection-tagged events if it ever
+  bites the real client.

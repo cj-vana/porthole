@@ -6,11 +6,11 @@ the machine's NVIDIA dGPU (NVENC) or on the Ryzen iGPU (VAAPI, selectable via
 `tasks/prd-porthole.md` for the full PRD.
 
 Current state: screen capture (US-001) works on Wayland via
-wlr-screencopy, headless virtual displays (US-015) work on Hyprland, and
-hardware encode (US-002) works with NVENC or VAAPI via an ffmpeg subprocess
-(tested: 2560x1440 at 60 fps in and out, H.264 and HEVC). Transport
-(US-003), input (US-006), and audio (US-009) are still trait stubs with
-TODOs.
+wlr-screencopy, headless virtual displays (US-015) work on Hyprland,
+hardware encode (US-002) works with NVENC or VAAPI via an ffmpeg subprocess,
+and LAN transport (US-003) streams fragmented UDP video with a TCP control
+channel (tested: 2560x1440 at 60 fps to a Mac receiver). Input (US-006) and
+audio (US-009) are still trait stubs with TODOs.
 
 ## Build
 
@@ -52,9 +52,24 @@ support, and a subprocess needs no new system packages and survives FFmpeg
 upgrades. NVENC takes bgra input and converts on-GPU; VAAPI uses
 `hwupload,scale_vaapi=format=nv12` on the iGPU's by-path render node
 (`/dev/dri/by-path/pci-0000:0b:00.0-render`), so no CPU pixel conversion runs
-on either backend. One known gap: `request_keyframe` (FR-4) cannot force an
-IDR mid-session in a subprocess; periodic IDRs come from
-`--keyframe-interval-secs` until the transport story revisits this.
+on either backend. Keyframes: periodic IDRs come from
+`--keyframe-interval-secs`; a client `keyframe_request` (FR-4) restarts the
+encoder session, since a subprocess ffmpeg cannot force an IDR mid-session.
+
+### Transport (US-003)
+
+The wire format is specified in `../docs/protocol.md` and implemented once
+in `src/protocol.rs` (shared with the example receiver). TCP control on
+52801: the agent sends a hello (codec, resolution, fps, bitrate, keyframe
+interval, video port) on connect; the client can send `keyframe_request`.
+UDP video on 52800: each access unit is fragmented into 1400-byte datagrams
+with a 25-byte header (magic, version, frame sequence, capture timestamp,
+fragment index/count, keyframe flag), all big-endian, sent immediately with
+no added buffering. One client at a time; a new control connection replaces
+the old one. Video goes to the control peer's IP at the negotiated port, so
+anything LAN-like (including Tailscale) works. Verify with the reference
+receiver: `cargo run --example receiver -- <agent-ip> --dump out.h264`,
+then `ffprobe out.h264`.
 
 ## Configuration
 
@@ -111,6 +126,7 @@ cargo test
 
 Module map: `capture` (wlr-screencopy on Wayland, US-001), `virtual_display`
 (Hyprland headless outputs, US-015), `encode` (ffmpeg subprocess: NVENC or
-VAAPI, H.264/HEVC, US-002), `transport` (TCP control + UDP video/audio,
-US-003), `input` (uinput keyboard/mouse/gamepad, US-006/US-014), `audio`
-(Opus over UDP, US-009).
+VAAPI, H.264/HEVC, US-002), `transport` (TCP control + UDP video, US-003),
+`input` (uinput keyboard/mouse/gamepad, US-006/US-014), `audio` (Opus over
+UDP, US-009). The wire format itself lives in the library target
+(`src/lib.rs` + `src/protocol.rs`), shared with `examples/receiver.rs`.

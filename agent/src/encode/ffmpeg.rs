@@ -73,8 +73,9 @@ impl FfmpegEncoder {
         ]);
         match cfg.encoder {
             EncoderBackend::Nvenc => {
-                // NVENC accepts bgra and converts on-GPU (CUDA).
-                cmd.args(["-preset", "p3"]);
+                // NVENC accepts bgra and converts on-GPU (CUDA). `ll` tune:
+                // zero-latency mode, no B-frame reordering.
+                cmd.args(["-preset", "p3", "-tune", "ll"]);
             }
             EncoderBackend::Vaapi => {
                 // Upload, then convert to nv12 on the iGPU.

@@ -100,7 +100,8 @@ impl FromStr for EncoderBackend {
 
 /// An encoded access unit ready for packetization by [`crate::transport`].
 pub struct EncodedFrame {
-    /// Monotonic sequence number, assigned by the encoder in output order.
+    /// Per-session output order, assigned by the encoder. The transport
+    /// assigns the wire-visible sequence (monotonic across restarts).
     pub sequence: u64,
     /// Annex B bitstream for one access unit (starts with an AUD NAL).
     pub data: Vec<u8>,

@@ -1,12 +1,12 @@
 //! porthole-agent: Linux agent for Porthole.
 //!
 //! Captures the desktop (US-001, wlr-screencopy on Wayland), hardware-encodes
-//! it, and streams it to a Mac client over LAN. Encode (US-002), transport
-//! (US-003), input (US-006), and audio (US-009) are still trait stubs.
+//! it (US-002), and streams it to a Mac client over LAN (US-003). Input
+//! (US-006) and audio (US-009) are still trait stubs.
 
-// These modules hold trait stubs for later stories (US-002, US-003, US-006,
-// US-009) that are not wired into the runtime yet. Remove each allow as the
-// corresponding story lands.
+// These modules hold trait stubs for later stories (US-006, US-009) that are
+// not wired into the runtime yet. Remove each allow as the corresponding
+// story lands.
 #[allow(dead_code)]
 mod audio;
 mod capture;
@@ -14,7 +14,6 @@ mod config;
 mod encode;
 #[allow(dead_code)]
 mod input;
-#[allow(dead_code)]
 mod transport;
 mod virtual_display;
 
@@ -123,20 +122,32 @@ fn init_tracing() {
 
 /// Frame pipeline loop, run on a blocking thread: capture, feed the encoder
 /// paced at the configured stream fps (capture itself can run faster, e.g.
-/// 144 Hz on the headless output), drain encoded access units. Logs a
-/// once-per-second stats line for capture and encode together. The drained
-/// AUs are dropped for now; the transport (US-003) will consume them.
+/// 144 Hz on the headless output), drain encoded access units, fragment and
+/// send them to the connected client. Handles control events: client
+/// connect/disconnect and keyframe requests (answered by restarting the
+/// encoder session, which yields a fresh IDR, FR-4). Logs a once-per-second
+/// stats line for capture, encode, and transmit together.
+#[allow(clippy::too_many_arguments)]
 fn capture_loop(
     mut backend: Box<dyn capture::CaptureBackend>,
     mut encoder: Box<dyn encode::Encoder>,
-    stream_fps: u16,
+    cfg: config::Config,
+    capture_format: capture::CaptureFormat,
+    mut sender: transport::VideoSender,
+    events: std::sync::mpsc::Receiver<transport::ControlEvent>,
+    pipeline_start: Instant,
     shutdown: Arc<AtomicBool>,
 ) {
+    let stream_fps = cfg.fps.get();
     let frame_interval = Duration::from_secs_f64(1.0 / f64::from(stream_fps));
     // Accumulating deadline: captures arrive quantized to the compositor's
     // frame tick (e.g. 6.9ms at 144 Hz), so checking elapsed >= interval
     // would under-feed (45 fps at 60 target). Track the schedule instead.
     let mut next_submit = Instant::now();
+    // Capture instants of submitted frames, FIFO: our encoders emit AUs in
+    // submission order (no B-frame reordering at these settings), so the nth
+    // drained AU pairs with the nth submitted frame's capture time.
+    let mut submitted_at: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
     // Debug aid: PORTHOLE_DUMP_VIDEO=<path> writes the encoded Annex B
     // stream to a file (used to ffprobe-verify encoder output).
     let mut dump: Option<std::io::BufWriter<std::fs::File>> =
@@ -160,6 +171,33 @@ fn capture_loop(
     let mut submit_ms_total = 0.0f64;
     let mut window_start = Instant::now();
     while !shutdown.load(Ordering::Relaxed) {
+        // Control channel events (client connect/disconnect, keyframe
+        // requests) are handled between frames.
+        for event in events.try_iter() {
+            match event {
+                transport::ControlEvent::ClientConnected(ip) => {
+                    sender.set_client(Some(ip));
+                    tracing::info!(client = %sender.client().expect("just set"), "streaming video to client");
+                }
+                transport::ControlEvent::ClientDisconnected => {
+                    sender.set_client(None);
+                    tracing::info!("client gone, video paused");
+                }
+                transport::ControlEvent::KeyframeRequest => {
+                    // FR-4: a subprocess ffmpeg cannot force an IDR
+                    // mid-session, so restart the encoder; the new session
+                    // starts with an IDR.
+                    let restart_start = Instant::now();
+                    encoder = encode::create(&cfg, &capture_format);
+                    submitted_at.clear();
+                    tracing::info!(
+                        restart_ms = restart_start.elapsed().as_millis(),
+                        "encoder restarted for keyframe request"
+                    );
+                }
+            }
+        }
+
         let frame = match backend.next_frame() {
             Ok(frame) => frame,
             Err(err) => {
@@ -185,13 +223,19 @@ fn capture_loop(
             }
             submit_ms_total += submit_start.elapsed().as_secs_f64() * 1000.0;
             submitted += 1;
+            submitted_at.push_back(pipeline_start.elapsed().as_micros() as u64);
         }
 
         for au in encoder.drain() {
-            // TODO(US-003): hand `au` to the transport for packetization.
             if let Some(f) = dump.as_mut() {
                 use std::io::Write;
                 let _ = f.write_all(&au.data);
+            }
+            let timestamp_us = submitted_at
+                .pop_front()
+                .unwrap_or_else(|| pipeline_start.elapsed().as_micros() as u64);
+            if let Err(err) = sender.send(&au, timestamp_us) {
+                tracing::error!("{err:#}: video send failed");
             }
             encoded += 1;
             encoded_bytes += au.data.len() as u64;
@@ -205,6 +249,10 @@ fn capture_loop(
         if elapsed >= Duration::from_secs(1) {
             let secs = elapsed.as_secs_f64();
             let format = backend.format();
+            let tx_kbps = sender.bytes_sent as f64 * 8.0 / secs / 1000.0;
+            let tx_datagrams = sender.datagrams_sent as f64 / secs;
+            sender.bytes_sent = 0;
+            sender.datagrams_sent = 0;
             tracing::info!(
                 backend = backend.name(),
                 resolution = format!("{}x{}", frame.width, frame.height),
@@ -219,6 +267,9 @@ fn capture_loop(
                 enc_kbps = format!("{:.0}", encoded_bytes as f64 * 8.0 / secs / 1000.0),
                 enc_keyframes = keyframes,
                 enc_submit_ms = format!("{:.2}", submit_ms_total / submitted.max(1) as f64),
+                client = sender.client().map(|a| a.to_string()).unwrap_or_else(|| "none".into()),
+                tx_kbps = format!("{tx_kbps:.0}"),
+                tx_dgrams = format!("{tx_datagrams:.0}"),
                 "capture"
             );
             frames = 0;
@@ -276,24 +327,41 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("no capture backend available; running without capture");
     }
 
-    // Spawn the capture/encode pipeline on a blocking thread (Wayland
-    // dispatch and ffmpeg stdin writes are synchronous). Only when a real
-    // backend was found: the noop backend errors immediately, and there is
-    // nothing to capture.
+    // Spawn the capture/encode/transport pipeline on a blocking thread
+    // (Wayland dispatch, ffmpeg stdin writes, and UDP sends are all
+    // synchronous). Only when a real backend was found: the noop backend
+    // errors immediately, and there is nothing to capture or stream.
     let capture = if capture_format.width > 0 {
+        let hello = porthole_agent::protocol::Hello {
+            codec: match cfg.codec {
+                Codec::H264 => porthole_agent::protocol::CodecTag::H264,
+                Codec::Hevc => porthole_agent::protocol::CodecTag::Hevc,
+            },
+            width: capture_format.width,
+            height: capture_format.height,
+            fps: u32::from(cfg.fps.get()),
+            bitrate_mbps: cfg.bitrate_mbps,
+            keyframe_interval_secs: cfg.keyframe_interval_secs,
+            video_port: cfg.port_video,
+        };
+        let events = transport::spawn_control_listener(&cfg, hello)
+            .context("transport control channel startup failed")?;
+        let sender = transport::VideoSender::new(&cfg).context("transport video socket failed")?;
         let encoder = encode::create(&cfg, &capture_format);
+        let pipeline_start = Instant::now();
         let shutdown = Arc::new(AtomicBool::new(false));
         let handle = tokio::task::spawn_blocking({
             let shutdown = shutdown.clone();
-            move || capture_loop(backend, encoder, cfg.fps.get(), shutdown)
+            let cfg = cfg.clone();
+            let capture_format = capture_format.clone();
+            move || capture_loop(backend, encoder, cfg, capture_format, sender, events, pipeline_start, shutdown)
         });
         Some((handle, shutdown))
     } else {
         None
     };
 
-    // TODO(US-003): stream the encoded frames, plus the TCP control
-    // listener, audio task (US-009), input injection (US-006), and mDNS
+    // TODO: audio task (US-009), input injection (US-006), and mDNS
     // announcement (US-007). Each joins the ctrl-c shutdown path.
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
