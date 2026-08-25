@@ -1,10 +1,14 @@
 //! Screen capture (US-001).
 //!
-//! Backend selection per PRD FR-1: PipeWire (Wayland, via the xdg-desktop
-//! portal + GStreamer `pipewiresrc`) is the primary path; X11
-//! (XShm/XDamage via `ximagesrc` or `x11rb`) is the fallback. Both are
-//! Linux-only and need system libraries, so no capture dependency exists
-//! yet (see Cargo.toml TODO).
+//! The Hyprland/Wayland target is captured with the wlr-screencopy-unstable-v1
+//! protocol (see the `wlr` module, Linux only). Hyprland implements it
+//! natively, so no portal and no permission dialog is involved. Damage-aware
+//! capture and zero-copy (linux-dmabuf) are later stories; frames are plain
+//! per-frame copies for now. An X11 (XShm/XDamage) fallback for X11 sessions
+//! also remains a TODO.
+
+#[cfg(target_os = "linux")]
+mod wlr;
 
 /// A single captured frame, in a pixel format agreed with the encoder.
 pub struct RawFrame {
@@ -14,34 +18,26 @@ pub struct RawFrame {
     pub height: u32,
     /// Row stride in bytes.
     pub stride: usize,
-    /// Pixel data (format TBD by US-001; likely NV12 or BGRA to feed NVENC directly).
+    /// Pixel data (format reported via [`CaptureFormat::pixel_format`];
+    /// typically XRGB8888 from wl_shm, to be converted or handed to the
+    /// encoder zero-copy in later stories).
     pub data: Vec<u8>,
 }
 
-/// Which capture path the agent is using.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CaptureBackendKind {
-    /// PipeWire / xdg-desktop-portal (Wayland). Primary path.
-    PipeWire,
-    /// X11 XShm/XDamage. Fallback path.
-    X11,
-}
-
-impl std::fmt::Display for CaptureBackendKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::PipeWire => write!(f, "pipewire"),
-            Self::X11 => write!(f, "x11"),
-        }
-    }
+/// Negotiated capture parameters. Resolution and refresh come from the
+/// wl_output mode at backend construction; the pixel format is known once
+/// the first frame is negotiated.
+#[derive(Debug, Clone, Default)]
+pub struct CaptureFormat {
+    pub width: u32,
+    pub height: u32,
+    /// Output refresh rate in millihertz (60000 = 60 Hz).
+    pub refresh_millihz: u32,
+    pub pixel_format: Option<String>,
+    pub output_name: Option<String>,
 }
 
 /// A screen capture backend.
-///
-/// TODO(US-001): implement `PipeWireCapture` (GStreamer `pipewiresrc` with
-/// portal negotiation) and `X11Capture` behind `cfg(target_os = "linux")`,
-/// then have [`select_backend`] probe the session type (`XDG_SESSION_TYPE`)
-/// and pick per PRD FR-1.
 pub trait CaptureBackend: Send {
     /// Human-readable backend name, logged on startup (US-001 AC).
     fn name(&self) -> &str;
@@ -49,11 +45,12 @@ pub trait CaptureBackend: Send {
     /// Grab the next frame from the primary display.
     fn next_frame(&mut self) -> anyhow::Result<RawFrame>;
 
-    /// Negotiated resolution and framerate.
-    fn format(&self) -> (u32, u32, u32);
+    /// Negotiated resolution, refresh, and pixel format.
+    fn format(&self) -> CaptureFormat;
 }
 
-/// Placeholder backend so the scaffold can run before US-001 lands.
+/// Placeholder used when no real backend is available (non-Linux dev
+/// machines, or a Linux session with no supported compositor).
 pub struct NoopCapture;
 
 impl CaptureBackend for NoopCapture {
@@ -62,28 +59,41 @@ impl CaptureBackend for NoopCapture {
     }
 
     fn next_frame(&mut self) -> anyhow::Result<RawFrame> {
-        anyhow::bail!("capture backend not implemented yet (US-001)")
+        anyhow::bail!("no capture backend available on this session")
     }
 
-    fn format(&self) -> (u32, u32, u32) {
-        (0, 0, 0)
+    fn format(&self) -> CaptureFormat {
+        CaptureFormat::default()
     }
 }
 
 /// Pick the best available capture backend for the current session.
 ///
-/// TODO(US-001): on Linux, prefer PipeWire when `XDG_SESSION_TYPE=wayland`
-/// (or a portal is reachable), else fall back to X11. Until then this always
-/// returns [`NoopCapture`].
+/// On Linux this tries wlr-screencopy (Wayland/Hyprland). If that fails (no
+/// Wayland session, unsupported compositor) it falls back to [`NoopCapture`]
+/// for now; an X11 fallback is a later story.
 pub fn select_backend() -> Box<dyn CaptureBackend> {
     #[cfg(target_os = "linux")]
     {
-        // TODO(US-001): real probing goes here.
-        tracing::debug!("linux target: PipeWire/X11 probing not implemented yet (US-001)");
+        match wlr::WlrCapture::new() {
+            Ok(backend) => return Box::new(backend),
+            Err(err) => tracing::warn!("{err:#}: falling back to noop capture backend"),
+        }
     }
     #[cfg(not(target_os = "linux"))]
-    {
-        tracing::debug!("non-linux target: screen capture is unavailable, using noop backend");
-    }
+    tracing::debug!("non-linux target: screen capture is unavailable, using noop backend");
     Box::new(NoopCapture)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn noop_capture_is_a_placeholder() {
+        let mut backend = NoopCapture;
+        assert_eq!(backend.name(), "none (not implemented)");
+        assert_eq!(backend.format().width, 0);
+        assert!(backend.next_frame().is_err());
+    }
 }

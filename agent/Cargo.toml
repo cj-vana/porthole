@@ -5,14 +5,7 @@ edition = "2021"
 description = "Linux agent for Porthole: captures the desktop, NVENC-encodes it, and streams it to a Mac client over LAN."
 license = "MIT OR Apache-2.0"
 
-# Cross-platform dependencies only for now.
-#
-# TODO(US-001/US-002): Linux-only deps land behind target-gated entries once
-# the scaffold runs on Linux, e.g.:
-#   [target.'cfg(target_os = "linux")'.dependencies]
-#   gstreamer = "..."   # capture + NVENC encode pipeline (needs system GStreamer dev packages)
-#   x11rb               # X11 (XShm/XDamage) fallback capture
-# TODO(US-006/US-014): evdev/uinput for keyboard/mouse/gamepad injection (Linux-only).
+# Cross-platform dependencies only in this section.
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
@@ -21,3 +14,16 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "tim
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Linux-only screen capture (US-001): wlr-screencopy-unstable-v1 over Wayland.
+# The wayland-rs crates are pure Rust and need no system libraries.
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+memmap2 = "0.9"
+libc = "0.2" # memfd_create for shm frame buffers
+
+# TODO(US-002): GStreamer for the encode pipeline needs system dev packages:
+#   [target.'cfg(target_os = "linux")'.dependencies]
+#   gstreamer = "..."
+# TODO(US-006/US-014): evdev/uinput for keyboard/mouse/gamepad injection.

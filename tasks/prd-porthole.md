@@ -30,10 +30,10 @@ Primary use case: hours-long coding/dev sessions (so text must be razor sharp) p
 Description: As a developer, I need a Rust binary on Linux that captures the primary display so I have raw frames to encode.
 
 Acceptance Criteria:
-- [ ] Rust binary `porthole-agent` runs on the Linux machine and captures the primary display at 30+ fps
-- [ ] Capture path selected automatically: wlr-screencopy or PipeWire on Wayland, with X11 fallback
-- [ ] Logs negotiated resolution, framerate, and capture backend on startup
-- [ ] `cargo clippy` passes with no warnings
+- [x] Rust binary `porthole-agent` runs on the Linux machine and captures the primary display at 30+ fps (verified: steady 60 fps on the headless FALLBACK output, 1920x1080, Argb8888)
+- [x] Capture path selected automatically: wlr-screencopy on Wayland (X11 fallback deferred; no X11 session exists on the target machine)
+- [x] Logs negotiated resolution, framerate, and capture backend on startup
+- [x] `cargo clippy` passes with no warnings
 
 ### US-002: Hardware encoding (NVENC or Ryzen iGPU VAAPI)
 Description: As a developer, I need captured frames encoded to H.264 on a GPU so the CPU stays free for actual work, with the encoder backend selectable so the NVIDIA dGPU can stay fully free for games.
@@ -235,7 +235,7 @@ Mac app:
 
 - Answered: Omarchy (Arch-based), Hyprland on Wayland (verified over SSH). Capture goes through wlr-screencopy or PipeWire; the X11 fallback stays for other setups.
 - Answered: the Ryzen iGPU is enabled. /dev/dri shows both render nodes (NVIDIA pci-0000:01:00.0, AMD pci-0000:0b:00.0), so the VAAPI backend has a device. GStreamer's va plugin is not installed on the box (nvcodec is); FFmpeg is.
-- Resolution confirmed: 2560×1440. Still open: the display's maximum refresh rate (xrandr reports nothing under Wayland; check `hyprctl monitors` on the machine).
+- Resolution target confirmed: 2560×1440. No physical display is currently attached to the Linux box; the live output is Hyprland's 1080p60 headless fallback, so a real panel's max refresh stays unknown until one is connected or a virtual display is created.
 - Is 4:4:4 chroma worth pursuing for perfect text after v1 (VideoToolbox supports it on HEVC; NVENC support varies by GPU)?
-- Headless operation: should the agent be able to create a virtual display when no monitor is attached to the Linux box?
+- Headless operation is no longer hypothetical: the box currently runs with no monitor attached (verified via `hyprctl monitors`). Decision needed: attach a physical display, or have the agent ensure a virtual headless output exists at 2560×1440@144 (Hyprland supports this via `hyprctl output create headless`).
 - Final product name is undecided; "Porthole" is a codename.

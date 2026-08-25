@@ -5,9 +5,10 @@ the machine's NVIDIA dGPU (NVENC) or on the Ryzen iGPU (VAAPI, selectable via
 `--encoder`), and streams it over LAN to the native Mac client. See
 `tasks/prd-porthole.md` for the full PRD.
 
-Current state: **scaffold only**. CLI, config loading, logging, and graceful
-shutdown work; capture (US-001), hardware encode (US-002), and transport
-(US-003) are trait stubs with TODOs.
+Current state: screen capture (US-001) works on Wayland via
+wlr-screencopy (tested on Hyprland at 1920x1080, 60 fps). Hardware encode
+(US-002), transport (US-003), input (US-006), and audio (US-009) are still
+trait stubs with TODOs.
 
 ## Build
 
@@ -16,13 +17,12 @@ cargo build            # debug
 cargo build --release  # release binary at target/release/porthole-agent
 ```
 
-The scaffold builds on macOS and Linux (cross-platform deps only). The real
-capture/encode pipeline targets Linux and will need system packages installed
-before the Linux-only crates land (not required yet):
+The crate builds on macOS and Linux; capture is cfg-gated and only active on
+Linux (macOS keeps a noop backend for development). The encode pipeline will
+need system packages installed before its crates land (not required yet):
 
 - GStreamer dev: `libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev`
-  (Debian/Ubuntu), for the capture + hardware encode pipeline
-- PipeWire dev (Wayland capture), X11 dev (fallback capture)
+  (Debian/Ubuntu), for the hardware encode pipeline
 - `libevdev`/`uinput` headers (input injection, US-006)
 - An NVIDIA GPU with NVENC and the proprietary driver (default encoder), or a
   Ryzen iGPU with VAAPI support for the `--encoder vaapi` path
@@ -73,7 +73,7 @@ cargo clippy -- -D warnings
 cargo test
 ```
 
-Module map: `capture` (PipeWire primary / X11 fallback, US-001),
-`encode` (NVENC or VAAPI, H.264/HEVC, US-002), `transport` (TCP control + UDP
-video/audio, US-003), `input` (uinput keyboard/mouse/gamepad, US-006/US-014),
-`audio` (Opus over UDP, US-009).
+Module map: `capture` (wlr-screencopy on Wayland, US-001), `encode` (NVENC or
+VAAPI, H.264/HEVC, US-002), `transport` (TCP control + UDP video/audio,
+US-003), `input` (uinput keyboard/mouse/gamepad, US-006/US-014), `audio`
+(Opus over UDP, US-009).

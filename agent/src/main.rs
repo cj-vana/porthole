@@ -1,25 +1,27 @@
 //! porthole-agent: Linux agent for Porthole.
 //!
-//! Captures the desktop, NVENC-encodes it, and streams it to a Mac client
-//! over LAN. This is the scaffold: CLI + config + logging + graceful
-//! shutdown. Capture (US-001), encode (US-002), and transport (US-003)
-//! are stubbed behind traits in their modules.
+//! Captures the desktop (US-001, wlr-screencopy on Wayland), hardware-encodes
+//! it, and streams it to a Mac client over LAN. Encode (US-002), transport
+//! (US-003), input (US-006), and audio (US-009) are still trait stubs.
 
-// Scaffold: the trait stubs in these modules are the boundaries for
-// US-001..US-003/US-006/US-009 but are not wired into the runtime yet, so
-// allow dead code until the real pipeline lands. Remove this once the stubs
-// are replaced.
-#![allow(dead_code)]
-
+// These modules hold trait stubs for later stories (US-002, US-003, US-006,
+// US-009) that are not wired into the runtime yet. Remove each allow as the
+// corresponding story lands.
+#[allow(dead_code)]
 mod audio;
 mod capture;
 mod config;
+#[allow(dead_code)]
 mod encode;
+#[allow(dead_code)]
 mod input;
+#[allow(dead_code)]
 mod transport;
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::Parser;
@@ -103,6 +105,41 @@ fn init_tracing() {
         .init();
 }
 
+/// Frame-grab loop, run on a blocking thread. Logs a once-per-second line
+/// with resolution, pixel format, backend, and measured fps. Encode and
+/// transport plug in here in US-002/US-003.
+fn capture_loop(mut backend: Box<dyn capture::CaptureBackend>, shutdown: Arc<AtomicBool>) {
+    let mut frames = 0u64;
+    let mut window_start = Instant::now();
+    while !shutdown.load(Ordering::Relaxed) {
+        match backend.next_frame() {
+            Ok(frame) => {
+                frames += 1;
+                let elapsed = window_start.elapsed();
+                if elapsed >= Duration::from_secs(1) {
+                    let fps = frames as f64 / elapsed.as_secs_f64();
+                    let format = backend.format();
+                    tracing::info!(
+                        backend = backend.name(),
+                        resolution = format!("{}x{}", frame.width, frame.height),
+                        stride = frame.stride,
+                        frame_bytes = frame.data.len(),
+                        pixel_format = format.pixel_format.as_deref().unwrap_or("unknown"),
+                        fps = format!("{fps:.0}"),
+                        "capture"
+                    );
+                    frames = 0;
+                    window_start = Instant::now();
+                }
+            }
+            Err(err) => {
+                tracing::error!("{err:#}: capture frame failed, stopping capture loop");
+                break;
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -112,6 +149,7 @@ async fn main() -> anyhow::Result<()> {
     cli.apply_overrides(&mut cfg);
 
     let backend = capture::select_backend();
+    let capture_format = backend.format();
 
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "porthole-agent starting");
     tracing::info!(
@@ -121,23 +159,45 @@ async fn main() -> anyhow::Result<()> {
         bitrate_mbps = cfg.bitrate_mbps,
         codec = %cfg.codec,
         encoder = %cfg.encoder,
-        fps = %cfg.fps,
+        fps = cfg.fps.get(),
         capture_backend = backend.name(),
         "effective configuration"
     );
+    if capture_format.width > 0 {
+        tracing::info!(
+            output = capture_format.output_name.as_deref().unwrap_or("unknown"),
+            resolution = format!("{}x{}", capture_format.width, capture_format.height),
+            refresh_hz = format!("{:.0}", capture_format.refresh_millihz as f64 / 1000.0),
+            "capture backend negotiated"
+        );
+    } else {
+        tracing::warn!("no capture backend available; running without capture");
+    }
 
-    // TODO(US-001..US-003): replace the heartbeat loop with the real pipeline:
-    // capture frames -> NVENC encode -> UDP video datagrams, plus the TCP
-    // control listener, audio task (US-009), input injection (US-006), and
-    // mDNS announcement (US-007). Each should run as a tokio task joined
-    // into the same ctrl-c shutdown path below.
+    // Spawn the capture loop on a blocking thread (Wayland dispatch is
+    // synchronous). Only when a real backend was found: the noop backend
+    // errors immediately, and there is nothing to capture.
+    let capture = if capture_format.width > 0 {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = tokio::task::spawn_blocking({
+            let shutdown = shutdown.clone();
+            move || capture_loop(backend, shutdown)
+        });
+        Some((handle, shutdown))
+    } else {
+        None
+    };
+
+    // TODO(US-002/US-003): encode captured frames and stream them, plus the
+    // TCP control listener, audio task (US-009), input injection (US-006),
+    // and mDNS announcement (US-007). Each joins the ctrl-c shutdown path.
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
-                tracing::debug!("heartbeat: agent idle (capture/encode/transport not implemented)");
+                tracing::debug!("heartbeat: agent running");
             }
             result = tokio::signal::ctrl_c() => {
                 match result {
@@ -149,7 +209,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // TODO: drain encoder, close transport, release capture/uinput devices.
+    if let Some((handle, shutdown)) = capture {
+        shutdown.store(true, Ordering::Relaxed);
+        // The capture thread finishes the in-flight frame, then exits.
+        if tokio::time::timeout(Duration::from_secs(3), handle).await.is_err() {
+            tracing::warn!("capture thread did not stop within 3s, exiting anyway");
+        }
+    }
+
+    // TODO: drain encoder, close transport, release uinput devices.
     tracing::info!("porthole-agent stopped cleanly");
     Ok(())
 }
