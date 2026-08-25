@@ -118,3 +118,66 @@ Learnings for future iterations:
   ClientDisconnected just after a new ClientConnected, clearing the live
   client target. Rare on LAN; fix with connection-tagged events if it ever
   bites the real client.
+
+## 2026-08-25: US-005 hardware decode and live display on macOS done
+
+Mac client now speaks wire protocol v1 (docs/protocol.md): TCP control via
+NWConnection (hello parse, keyframe_request throttled to 1/s except forced on
+join), UDP video via NWListener bound to the hello-negotiated port, fragment
+reassembly with the protocol's receiver rules (500 ms stale sweep, sequence
+gap means whole-frame loss, any loss is decode-fatal and waits for the next
+IDR). VideoToolbox decodes Annex B access units; SPS/PPS are lifted from the
+stream, a CMVideoFormatDescription is built with
+CMVideoFormatDescriptionCreateFromH264ParameterSets, and the decode session is
+rebuilt whenever the parameter set bytes change, which also covers encoder
+restarts and resolution changes. Decoded NV12 CVPixelBuffers render through
+the existing Metal surface via CVMetalTextureCache, aspect-fit with
+letterboxing, YCbCr to RGB in the fragment shader. Test pattern stays as the
+disconnected idle state. Chrome gained a host field and connect button, last
+host persisted via @AppStorage (default 100.105.41.71), with auto-reconnect
+on launch until US-012 owns it. Stats once per second to os_log and
+/tmp/porthole-mac-stats.log: decoded fps, avg decode ms, loss %, queue depth.
+
+Files changed:
+- macos/Porthole/Streaming/ (new): WireProtocol.swift, ControlChannel.swift,
+  VideoReceiver.swift, Reassembler.swift, AnnexB.swift, H264SPS.swift (SPS
+  parser with Exp-Golomb reader, crop-adjusted dims, VUI color), H264Decoder.swift,
+  StreamSession.swift (coordinator, stats).
+- macos/Porthole/Rendering/MetalRenderer.swift: video path (texture cache,
+  letterbox, color coefficients) beside the test pattern path; two pipelines.
+- macos/Porthole/Rendering/Shaders.metal: videoVertex (letterbox scale, v
+  flip) and videoFragment (NV12 two-plane to RGB).
+- macos/Porthole/SessionView.swift: host field, connect button, state-driven
+  status text, auto-connect on appear.
+- macos/DecodeTest/main.swift (new) + project.yml: porthole-decode-test CLI
+  target sharing the streaming sources; headless gate.
+- macos/README.md: live decode state, connecting, stats, decisions.
+
+Verification. Headless gate: porthole-decode-test on /tmp/porthole-lan.h264
+(14.5 MB) decoded 10886/10886 access units at 2560x1440, PASS. Live proof over
+Tailscale (agent started headless on the box, NVENC 60fps): 20 s of stats show
+fps=60 every second, decode_ms 1.37 to 1.60, loss=0.00%, queue=0. Window
+screenshot /tmp/porthole-window.png shows the remote desktop letterboxed in
+the Porthole window with status Live 2560x1440@60. xcodebuild -scheme Porthole
+-configuration Debug clean build: zero warnings from project sources.
+
+Learnings for future iterations:
+- VT session rebuild gotchas: format descriptions come from raw SPS/PPS NALs
+  including the NAL header byte, start codes stripped; sample buffers must be
+  AVCC (4-byte BE length per NAL) to match nalUnitHeaderLength 4. Rebuild on
+  parameter set byte change, not on every keyframe: ffmpeg/NVENC repeats
+  SPS/PPS per IDR, so naive rebuild-per-keyframe would thrash every 2 s.
+- CMBlockBuffer: create with memoryBlock nil + default allocator, then
+  CMBlockBufferReplaceDataBytes to copy the payload in; ownership stays clean.
+- Xcode 26 SDK renames to watch: VTDecompressionSessionWaitForAsynchronousFrames
+  (was ...ToComplete), CVMetalTextureGetTexture (was GetImage),
+  CMSampleBufferCreateReady uses sampleTimingEntryCount/sampleSizeEntryCount.
+- Color: the agent's ffmpeg/NVENC stream declares bt470bg (BT.601) limited in
+  VUI even at 2560x1440; ffprobe confirms. Client honors VUI, else BT.709 for
+  HD / BT.601 for SD. If text ever looks off, check what the encoder tags.
+- Agent stream has 1:1 AU to frame ratio (no B-frames), so decode order equals
+  presentation order; synchronous per-AU decode on a serial queue is enough
+  and gives honest decode_ms measurement.
+- AppleScript 'tell app Porthole to id of window' returns nothing for this
+  SwiftUI app; find the window id via CGWindowListCopyWindowInfo matching
+  kCGWindowOwnerName, then screencapture -l<id> works.

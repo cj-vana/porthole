@@ -27,10 +27,34 @@ targets:
         # App sandbox deliberately OFF for now — see README (raw UDP/TCP + GameController).
         ENABLE_APP_SANDBOX: NO
         ENABLE_HARDENED_RUNTIME: NO
+  porthole-decode-test:
+    type: tool
+    platform: macOS
+    deploymentTarget: "14.0"
+    # Headless gate for the US-005 decode path; shares the streaming
+    # primitives with the app, no app/UI code.
+    sources:
+      - path: DecodeTest
+      - path: Porthole/Streaming/WireProtocol.swift
+      - path: Porthole/Streaming/AnnexB.swift
+      - path: Porthole/Streaming/H264SPS.swift
+      - path: Porthole/Streaming/H264Decoder.swift
+    settings:
+      base:
+        PRODUCT_NAME: porthole-decode-test
+        SWIFT_VERSION: "5.0"
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        CODE_SIGN_IDENTITY: "-"
 schemes:
   Porthole:
     build:
       targets:
         Porthole: all
+    run:
+      config: Debug
+  porthole-decode-test:
+    build:
+      targets:
+        porthole-decode-test: all
     run:
       config: Debug

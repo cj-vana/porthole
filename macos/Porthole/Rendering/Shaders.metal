@@ -19,6 +19,44 @@ vertex VertexOut testPatternVertex(uint vertexID [[vertex_id]]) {
     return out;
 }
 
+/// Fullscreen triangle scaled to letterbox the video (US-005). Texture v is
+/// flipped: Metal's texture origin is the top row of the CVPixelBuffer,
+/// while the triangle's uv origin is the bottom-left of the screen.
+vertex VertexOut videoVertex(uint vertexID [[vertex_id]],
+                             constant float2 &scale [[buffer(0)]]) {
+    const float2 positions[3] = {
+        float2(-1.0, -1.0),
+        float2( 3.0, -1.0),
+        float2(-1.0,  3.0)
+    };
+    VertexOut out;
+    out.position = float4(positions[vertexID] * scale, 0.0, 1.0);
+    float2 uv = positions[vertexID] * 0.5 + 0.5;
+    out.uv = float2(uv.x, 1.0 - uv.y);
+    return out;
+}
+
+/// NV12 stream frame to RGB. Samples the luma plane and the interleaved
+/// CbCr plane (half resolution, linear upsample), expands range, applies
+/// the color matrix chosen from the stream's SPS VUI (default BT.709).
+///
+/// colorCoeffs = (rCr, gCb, gCr, bCb), rangeCoeffs = (yOffset, yScale,
+/// cOffset, cScale), both precomputed on the CPU per color state.
+fragment float4 videoFragment(VertexOut in [[stage_in]],
+                              texture2d<float> lumaTexture [[texture(0)]],
+                              texture2d<float> chromaTexture [[texture(1)]],
+                              constant float4 &colorCoeffs [[buffer(0)]],
+                              constant float4 &rangeCoeffs [[buffer(1)]]) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    float y = (lumaTexture.sample(s, in.uv).r - rangeCoeffs.x) * rangeCoeffs.y;
+    float cb = (chromaTexture.sample(s, in.uv).r - rangeCoeffs.z) * rangeCoeffs.w;
+    float cr = (chromaTexture.sample(s, in.uv).g - rangeCoeffs.z) * rangeCoeffs.w;
+    return float4(y + colorCoeffs.x * cr,
+                  y - colorCoeffs.y * cb - colorCoeffs.z * cr,
+                  y + colorCoeffs.w * cb,
+                  1.0);
+}
+
 /// US-004 test pattern. Everything is derived from `time`, never from frame
 /// count, so missed vsyncs are visible instead of merely slowing animation:
 ///   - top:    SMPTE-style 75% color bars with a sweeping luminance gradient

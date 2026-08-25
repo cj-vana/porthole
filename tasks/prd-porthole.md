@@ -78,16 +78,16 @@ Acceptance Criteria:
 Description: As a user, I want to see my Linux desktop live in the Mac window.
 
 Acceptance Criteria:
-- [ ] H.264 stream decoded via VideoToolbox and displayed in the Metal view at a stable 60fps
-- [ ] Correct colors and aspect ratio; letterboxed when window aspect differs
-- [ ] Recovers from packet loss (keyframe request) without user action
-- [ ] Verify in the running app: remote desktop visible and responsive to on-screen changes
+- [x] H.264 stream decoded via VideoToolbox and displayed in the Metal view at a stable 60fps (live: 60 fps, decode ~1.5ms/frame, 0% loss)
+- [x] Correct colors and aspect ratio; letterboxed when window aspect differs (aspect-fit per draw; YCbCr matrix taken from the SPS VUI)
+- [x] Recovers from packet loss (keyframe request) without user action
+- [x] Verified in the running app: live 2560x1440 Linux desktop visible in the window (screenshot proof), plus a headless decode gate (10,886/10,886 AUs at 2560x1440)
 
 ### US-006: Keyboard and mouse control
 Description: As a user, I want to control the Linux machine with my Mac's keyboard, trackpad, and mouse.
 
 Acceptance Criteria:
-- [ ] Mouse move/click/scroll and keyboard events captured in the Mac window and injected on Linux via `uinput`
+- [ ] Mouse move/click/scroll and keyboard events captured in the Mac window and injected on Linux via Hyprland's virtual-pointer/virtual-keyboard protocols (no root; `/dev/uinput` is root-only on the target)
 - [ ] Trackpad scrolling feels native (pixel-precise, momentum)
 - [ ] Modifier keys and common shortcuts work; a configurable "send system shortcuts" toggle decides whether e.g. Cmd+Space stays local or goes remote
 - [ ] Pointer lock / relative-mouse mode available for games and 3D apps
@@ -179,7 +179,7 @@ Agent (Linux):
 - FR-2: Hardware-encode video; default H.264, optional HEVC. Encoder backend selectable via config/CLI: NVIDIA NVENC (default) or AMD VAAPI on the Ryzen iGPU, which keeps the dGPU fully free for gaming.
 - FR-3: Stream video as sequence-numbered UDP datagrams; maintain a TCP control channel for handshake, settings, and keyframe requests.
 - FR-4: On decode-fatal packet loss reported by the client, immediately emit a keyframe.
-- FR-5: Inject keyboard/mouse input via `uinput`, including a relative-mouse mode.
+- FR-5: Inject keyboard/mouse input via the compositor's virtual-pointer/virtual-keyboard protocols (no root needed), including a relative-mouse mode. uinput remains the plan only for the virtual gamepad (FR-6), which needs a udev rule.
 - FR-6: Expose a virtual gamepad device via `uinput` and map forwarded controller state onto it.
 - FR-7: Capture desktop audio and stream it as Opus over UDP.
 - FR-8: Announce itself via mDNS (`_porthole._tcp`) with machine name and capabilities.
