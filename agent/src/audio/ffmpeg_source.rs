@@ -72,6 +72,14 @@ impl FfmpegAudioSource {
             &FRAME_MS.to_string(),
             "-b:a",
             "128k",
+            // The Ogg muxer buffers a page up to a second long by default,
+            // which would deliver audio in one-second bursts that overrun
+            // the client's jitter buffer. Cap the page at one frame and
+            // flush each packet so audio streams in real time.
+            "-page_duration",
+            "20000",
+            "-flush_packets",
+            "1",
             "-f",
             "ogg",
             "-",
