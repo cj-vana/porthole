@@ -37,7 +37,7 @@ final class StreamSession: ObservableObject {
 
     private let control = ControlChannel()
     private let video: VideoIngest
-    private let decoder = H264Decoder()
+    private let decoder = CodecSwitchingDecoder()
     private let decodeQueue: DispatchQueue
     private let logger = Logger(subsystem: "com.porthole.mac", category: "session")
     /// Candidate walk for connect(machine:): the host that last answered a
@@ -49,6 +49,8 @@ final class StreamSession: ObservableObject {
 
     private var hello: Hello?
     private var needsKeyframe = true
+    /// The stored gaming toggle has been applied to this session (US-013).
+    private var appliedStoredSettings = false
     /// Sequence of the access unit currently inside decode(); valid because
     /// the decode queue is serial and decoding is synchronous.
     private var decodingSequence: UInt64?
@@ -92,6 +94,7 @@ final class StreamSession: ObservableObject {
         lastError = nil
         state = .connecting
         needsKeyframe = true
+        appliedStoredSettings = false
         highestSubmittedSequence = nil
         consecutiveEmptySeconds = 0
         if connectStartedAt == nil {
@@ -205,29 +208,7 @@ final class StreamSession: ObservableObject {
             // Connected to a candidate; stop the fallback walk.
             dialer.cancel()
         case .hello(let hello):
-            guard hello.codec == .h264 else {
-                fail("agent streams codec \(hello.codec.rawValue); US-005 supports h264 only")
-                return
-            }
-            self.hello = hello
-            // InputController is main-thread; hop for the size update.
-            DispatchQueue.main.async { [weak self] in
-                self?.input.videoSize = CGSize(width: Int(hello.width), height: Int(hello.height))
-            }
-            logger.info("""
-                hello: \(hello.width)x\(hello.height)@\(hello.fps), \
-                keyframe every \(hello.keyframeIntervalSecs)s, video port \(hello.videoPort)
-                """)
-            setState(.waitingForKeyframe)
-            guard video.start(port: hello.videoPort) != nil else {
-                fail("could not bind UDP video port \(hello.videoPort)")
-                return
-            }
-            // Joining mid-GOP: ask for an IDR to start decoding, and probe
-            // the clock offset early; the stats timer pings once per second
-            // after this burst.
-            control.requestKeyframe(force: true)
-            control.sendPingBurst(count: 5, interval: 0.1)
+            handleHello(hello)
         case .pong(let pong):
             clockOffset.addPong(pong, receivedMicros: receivedMicros)
         case .agentStats(let agentStats):
@@ -292,6 +273,7 @@ final class StreamSession: ObservableObject {
                 connectStartedAt = nil
             }
             setState(.live(width: Int(hello.width), height: Int(hello.height), fps: Int(hello.fps)))
+            applyStoredSettingsOnce()
         }
     }
 
@@ -328,8 +310,7 @@ final class StreamSession: ObservableObject {
         logger.info("\(line, privacy: .public)")
         statsLog.append(line)
 
-        let latency = LatencyStats(capturePresentMs: stats.captureToPresented.milliseconds,
-                                   rttMs: rttMicros.map { Double($0) / 1000 })
+        let latency = stats.snapshot(rttMicros: rttMicros, agentStats: latestAgentStats)
         DispatchQueue.main.async { [weak self] in self?.latency = latency }
 
         // Stall recovery: nothing decoded for a while means the stream died
@@ -366,6 +347,93 @@ final class StreamSession: ObservableObject {
             guard let self, self.state != .disconnected else { return }
             self.lastError = message
             self.disconnect()
+        }
+    }
+}
+
+// MARK: Hello and stream settings (US-013)
+
+extension StreamSession {
+    /// Decode queue. A first hello starts the video path; a reconfigured
+    /// hello (a settings request answered, or an agent-side encoder
+    /// restart) keeps the session up and rebinds only what changed.
+    private func handleHello(_ hello: Hello) {
+        let previous = self.hello
+        self.hello = hello
+        // InputController is main-thread; hop for the size update.
+        DispatchQueue.main.async { [weak self] in
+            self?.input.videoSize = CGSize(width: Int(hello.width), height: Int(hello.height))
+        }
+        logger.info("""
+            hello: codec \(hello.codec.rawValue), \(hello.width)x\(hello.height)@\(hello.fps), \
+            keyframe every \(hello.keyframeIntervalSecs)s, video port \(hello.videoPort)
+            """)
+        if decoder.select(hello.codec) {
+            needsKeyframe = true
+        }
+        guard let previous else {
+            setState(.waitingForKeyframe)
+            guard bindVideo(port: hello.videoPort) else { return }
+            // Joining mid-GOP: ask for an IDR to start decoding, and probe
+            // the clock offset early; the stats timer pings once per second
+            // after this burst.
+            control.requestKeyframe(force: true)
+            control.sendPingBurst(count: 5, interval: 0.1)
+            return
+        }
+        // Reconfigured: the encoder restart makes the next access unit an
+        // IDR, so decode continues without a teardown.
+        if previous.videoPort != hello.videoPort {
+            video.stop()
+            guard bindVideo(port: hello.videoPort) else { return }
+        }
+        if case .live = state {
+            setState(.live(width: Int(hello.width), height: Int(hello.height), fps: Int(hello.fps)))
+        }
+    }
+
+    /// Bind (or rebind) the UDP video port from a hello. Fails the session
+    /// when the bind does not stick.
+    private func bindVideo(port: UInt16) -> Bool {
+        guard video.start(port: port) != nil else {
+            fail("could not bind UDP video port \(port)")
+            return false
+        }
+        return true
+    }
+
+    /// Gaming mode: 144 (or 120) fps HEVC at 80 Mbps with the encoder
+    /// biased toward latency; off restores 60 fps H.264 at 40 Mbps. The
+    /// decoder switches codec immediately rather than waiting for the
+    /// reconfigured hello, which is advisory (docs/protocol.md "settings").
+    func setGamingMode(_ enabled: Bool, fps: Int = 144) {
+        decodeQueue.async { [weak self] in
+            self?.apply(enabled ? .gaming(fps: fps) : .quality)
+        }
+    }
+
+    /// Decode queue. Before hello there is no live encoder to reconfigure,
+    /// so the request is dropped; the stored toggle covers the next connect.
+    private func apply(_ settings: StreamSettings) {
+        guard hello != nil else { return }
+        control.sendSettings(fps: settings.fps,
+                             codec: settings.codec,
+                             bitrateMbps: settings.bitrateMbps,
+                             lowLatency: settings.lowLatency)
+        if decoder.select(settings.codec) {
+            needsKeyframe = true
+        }
+    }
+
+    /// Once per session, on the first decoded frame: a stored gaming toggle
+    /// reconfigures the stream only after connect has delivered a frame,
+    /// keeping click-to-first-frame fast.
+    private func applyStoredSettingsOnce() {
+        guard !appliedStoredSettings else { return }
+        appliedStoredSettings = true
+        let stored = StreamSettings.stored()
+        if stored != .quality, let hello, !stored.matches(hello) {
+            apply(stored)
         }
     }
 }

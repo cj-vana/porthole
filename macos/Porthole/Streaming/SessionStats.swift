@@ -1,12 +1,26 @@
 import Foundation
 
-/// The per-second latency figures StreamSession publishes for the session
-/// chrome. Optionals are unknown values: no pong yet (older agent, or the
-/// first second of a session) leaves every offset-based field nil.
+/// The per-second figures StreamSession publishes for the session chrome
+/// and the US-013 stats HUD. Optionals are unknown values: no pong yet
+/// (older agent, or the first second of a session) leaves every
+/// offset-based field nil, and agent-side figures wait for agent_stats.
 struct LatencyStats: Equatable {
     /// Capture on the agent to pixels presented on this display.
     var capturePresentMs: Double?
     var rttMs: Double?
+    /// Frames decoded in the last second.
+    var decodedFps: Int?
+    /// Mean decode wall time over the last second.
+    var decodeMs: Double?
+    /// Agent-side mean from frame submit to access unit ready.
+    var encodeMs: Double?
+    /// Frames lost as a share of frames seen, over the last second.
+    var lossPercent: Double?
+
+    /// One-way network estimate: half the control round trip.
+    var networkMs: Double? {
+        rttMs.map { $0 / 2 }
+    }
 
     static let empty = LatencyStats()
 
@@ -82,6 +96,18 @@ struct StatsWindow {
             + " queue=\(queueDepth)"
             + " agent_fps=\(agentFps)"
             + " tx_kbps=\(txKbps)"
+    }
+
+    /// The published per-second figures (header summary and stats HUD).
+    /// Optionals follow the same rule as `line`: n/a until a source has
+    /// reported.
+    func snapshot(rttMicros: UInt64?, agentStats: AgentStats?) -> LatencyStats {
+        LatencyStats(capturePresentMs: captureToPresented.milliseconds,
+                     rttMs: rttMicros.map { Double($0) / 1000 },
+                     decodedFps: decoded,
+                     decodeMs: decoded > 0 ? averageDecodeMs : nil,
+                     encodeMs: agentStats.map { Double($0.encodeLatencyMicros) / 1000 },
+                     lossPercent: UInt64(completed) + lost > 0 ? lossPercent : nil)
     }
 
     mutating func reset() {

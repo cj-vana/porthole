@@ -38,6 +38,7 @@ targets:
       - path: Porthole/Streaming/WireProtocol.swift
       - path: Porthole/Streaming/AnnexB.swift
       - path: Porthole/Streaming/H264SPS.swift
+      - path: Porthole/Streaming/VideoDecoder.swift
       - path: Porthole/Streaming/H264Decoder.swift
     settings:
       base:

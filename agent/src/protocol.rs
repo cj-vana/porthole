@@ -33,6 +33,37 @@ pub fn datagram_size_for_mtu(mtu: usize) -> usize {
         .clamp(MIN_DATAGRAM_SIZE, MAX_DATAGRAM_SIZE)
 }
 
+/// Magic bytes at the start of every audio datagram: "PHA" (US-009).
+pub const AUDIO_MAGIC: [u8; 3] = *b"PHA";
+/// Audio datagram header length: magic(3) + version(1) + seq(4) + ts(8).
+pub const AUDIO_HEADER_LEN: usize = 16;
+
+/// Build one audio datagram: header + one Opus packet. `timestamp_us` is
+/// microseconds on the agent pipeline clock (the same clock as the video
+/// datagram timestamps and pong answers), so the client can line audio up
+/// with video.
+pub fn audio_datagram(sequence: u32, timestamp_us: u64, opus: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(AUDIO_HEADER_LEN + opus.len());
+    out.extend_from_slice(&AUDIO_MAGIC);
+    out.push(PROTOCOL_VERSION);
+    out.extend_from_slice(&sequence.to_be_bytes());
+    out.extend_from_slice(&timestamp_us.to_be_bytes());
+    out.extend_from_slice(opus);
+    out
+}
+
+/// Parse one audio datagram into (sequence, timestamp_us, Opus packet).
+/// None when the magic, version, or length is wrong.
+pub fn parse_audio_datagram(bytes: &[u8]) -> Option<(u32, u64, &[u8])> {
+    if bytes.len() <= AUDIO_HEADER_LEN || bytes[0..3] != AUDIO_MAGIC || bytes[3] != PROTOCOL_VERSION
+    {
+        return None;
+    }
+    let sequence = u32::from_be_bytes(bytes[4..8].try_into().ok()?);
+    let timestamp_us = u64::from_be_bytes(bytes[8..16].try_into().ok()?);
+    Some((sequence, timestamp_us, &bytes[AUDIO_HEADER_LEN..]))
+}
+
 /// Control message type: server -> client stream parameters.
 pub const CONTROL_MSG_HELLO: u8 = 1;
 /// Control message type: client -> server, please send a fresh IDR.
@@ -709,6 +740,25 @@ mod tests {
         assert_eq!(datagram_size_for_mtu(9000), MAX_DATAGRAM_SIZE);
         assert_eq!(datagram_size_for_mtu(100), MIN_DATAGRAM_SIZE);
         assert_eq!(datagram_size_for_mtu(0), MIN_DATAGRAM_SIZE);
+    }
+
+    #[test]
+    fn audio_datagram_round_trip() {
+        let opus = sample_au(180);
+        let dgram = audio_datagram(7, 123_456, &opus);
+        assert_eq!(dgram.len(), AUDIO_HEADER_LEN + opus.len());
+        let (seq, ts, payload) = parse_audio_datagram(&dgram).expect("valid");
+        assert_eq!(seq, 7);
+        assert_eq!(ts, 123_456);
+        assert_eq!(payload, &opus[..]);
+        // Wrong magic, version, or an empty payload are rejected.
+        let mut bad = dgram.clone();
+        bad[0] = b'X';
+        assert!(parse_audio_datagram(&bad).is_none());
+        let mut bad = dgram.clone();
+        bad[3] = 9;
+        assert!(parse_audio_datagram(&bad).is_none());
+        assert!(parse_audio_datagram(&audio_datagram(1, 0, &[])).is_none());
     }
 
     #[test]

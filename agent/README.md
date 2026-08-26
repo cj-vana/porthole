@@ -11,8 +11,8 @@ hardware encode (US-002) works with NVENC or VAAPI via an ffmpeg subprocess,
 LAN transport (US-003) streams fragmented UDP video with a TCP control
 channel, and input injection (US-006a) drives a virtual pointer and keyboard
 on the Linux session from control-channel messages. Discovery (US-007a)
-announces the agent via mDNS and serves one-shot thumbnails for the picker.
-Audio (US-009) is still a trait stub with TODOs.
+announces the agent via mDNS and serves one-shot thumbnails for the picker,
+and desktop audio (US-009) is captured, Opus-encoded, and streamed over UDP.
 
 ## Build
 
@@ -140,6 +140,17 @@ connect, get one length-prefixed 320px RGBA thumbnail, close. It never
 touches the single-client control channel, so polling cannot disturb an
 active session. Verify with `cargo run --example thumb_fetch -- <agent-ip>
 out.png`.
+
+### Audio (US-009)
+
+Desktop audio is captured from the PulseAudio/PipeWire default sink monitor
+(resolved at runtime with `pactl get-default-sink`) and encoded to Opus by
+an ffmpeg subprocess, the same integration as video. Each Opus packet is
+sent as one UDP datagram on `--port-audio` (default 52802) to the connected
+client, tagged with a pipeline-clock timestamp so the client can line audio
+up with video (wire format in `../docs/protocol.md`). Audio flows only while
+a client is connected; on a machine without ffmpeg or an audio server the
+agent logs a warning and streams video only. Capture is Linux only.
 
 ## Configuration
 

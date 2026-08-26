@@ -9,9 +9,6 @@
 //! glass-to-glass number into encode and transport. Audio (US-009) is still
 //! a trait stub.
 
-// Trait stub for a later story (US-009), not wired into the runtime yet.
-// Remove the allow when it lands.
-#[allow(dead_code)]
 mod audio;
 mod capture;
 mod config;
@@ -194,6 +191,7 @@ fn capture_loop(
     mut sender: transport::VideoSender,
     events: std::sync::mpsc::Receiver<transport::ControlEvent>,
     control: transport::ControlSender,
+    audio: Option<audio::AudioHandle>,
     latest_frame: discovery::LatestFrame,
     pipeline_start: Instant,
     shutdown: Arc<AtomicBool>,
@@ -249,6 +247,9 @@ fn capture_loop(
             match event {
                 transport::ControlEvent::ClientConnected { generation, ip } => {
                     sender.set_client(Some(ip));
+                    if let Some(audio) = &audio {
+                        audio.set_client(Some(ip));
+                    }
                     client_generation = Some(generation);
                     tracing::info!(client = %sender.client().expect("just set"), generation, "streaming video to client");
                 }
@@ -261,6 +262,9 @@ fn capture_loop(
                         continue;
                     }
                     sender.set_client(None);
+                    if let Some(audio) = &audio {
+                        audio.set_client(None);
+                    }
                     client_generation = None;
                     tracing::info!(generation, "client gone, video paused");
                 }
@@ -505,6 +509,10 @@ async fn main() -> anyhow::Result<()> {
             .context("thumbnail endpoint startup failed")?;
         let announcement = discovery::announce(&cfg);
         let encoder = encode::create(&cfg, &capture_format);
+        // US-009: desktop audio, Opus over UDP. Its packets are stamped on
+        // the pipeline clock; the epoch is how far into the pipeline audio
+        // starts, so the first audio packet lines up with video.
+        let audio = audio::spawn(cfg.port_audio, pipeline_start.elapsed().as_micros() as u64);
         let shutdown = Arc::new(AtomicBool::new(false));
         let handle = tokio::task::spawn_blocking({
             let shutdown = shutdown.clone();
@@ -519,6 +527,7 @@ async fn main() -> anyhow::Result<()> {
                     sender,
                     events,
                     control,
+                    audio,
                     latest_frame,
                     pipeline_start,
                     shutdown,
@@ -530,7 +539,6 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // TODO: audio task (US-009) joins the ctrl-c shutdown path.
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 

@@ -26,8 +26,11 @@ identifier_name:
 type_body_length:
   warning: 300
   error: 400
+# StreamSession.swift again: US-013 adds runtime settings and the codec
+# switch to the same lifecycle, pushing the file (comments included) past
+# 400 lines. Warning raised to 450, error kept at 600.
 file_length:
-  warning: 400
+  warning: 450
   error: 600
 excluded:
   - Porthole.xcodeproj

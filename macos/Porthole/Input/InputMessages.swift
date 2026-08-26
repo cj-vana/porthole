@@ -91,13 +91,6 @@ enum InputMessages {
     }
 }
 
-extension Data {
-    mutating func appendUInt16BE(_ value: UInt16) {
-        append(UInt8(truncatingIfNeeded: value >> 8))
-        append(UInt8(truncatingIfNeeded: value))
-    }
-}
-
 /// Maps a point in the Metal surface's view coordinates (top-left origin,
 /// points) to remote output pixels, reversing the aspect-fit letterbox the
 /// renderer applies. Returns nil inside the letterbox/pillarbox bars, where

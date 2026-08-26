@@ -300,9 +300,34 @@ every 30 frames (a few times per second); a thumbnail is at most a second
 stale in practice. Fetcher: `cargo run --example thumb_fetch -- <agent-ip>
 out.png`.
 
+## Audio channel (UDP, US-009)
+
+Desktop audio is captured from the machine's default sink monitor, encoded
+as Opus (48 kHz stereo, 20 ms frames, 128 kbit/s), and sent as UDP datagrams
+on the audio port (default 52802, agent `--port-audio`) to the same client
+the control channel connected. One Opus packet per datagram; packets are
+small, so no fragmentation.
+
+```
+offset  size  field
+0       3     magic: "PHA" (0x50 0x48 0x41)
+3       1     protocol version (1)
+4       4     sequence (BE u32): per packet, from 0
+8       8     timestamp (BE u64): microseconds on the agent pipeline clock,
+              the same clock as the video datagram timestamps, so the client
+              can line audio up with video
+16      n     one Opus packet
+```
+
+The timestamp counts encoded samples at 48 kHz rather than wall clock, so it
+carries no scheduling jitter; the client turns it into a play time through
+the same clock offset it measures with ping/pong, and absorbs the fixed
+capture-to-play delay in a small jitter buffer. Audio flows only while a
+client is connected. There is no separate handshake: the Opus parameters are
+fixed by this spec.
+
 ## Notes for later versions
 
-- Audio (Opus over UDP 52802) is specified in US-009, not yet on the wire.
 - The transport behind `protocol.rs` is deliberately simple so a WebRTC or
   QUIC transport can replace it for internet play later; nothing here
   assumes more than "UDP + TCP reachability", so Tailscale already works.

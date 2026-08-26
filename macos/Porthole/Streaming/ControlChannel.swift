@@ -85,6 +85,14 @@ final class ControlChannel {
         connection?.send(content: frame, completion: .contentProcessed { _ in })
     }
 
+    /// Reconfigure the live stream (US-013 gaming mode). The agent applies
+    /// it by restarting its encoder and answers with a fresh hello.
+    func sendSettings(fps: UInt16, codec: Hello.Codec, bitrateMbps: UInt16, lowLatency: Bool) {
+        let frame = WireProtocol.encodeSettings(fps: fps, codec: codec,
+                                                bitrateMbps: bitrateMbps, lowLatency: lowLatency)
+        connection?.send(content: frame, completion: .contentProcessed { _ in })
+    }
+
     /// Latency probe; the agent echoes the timestamp in a pong.
     func sendPing() {
         let frame = WireProtocol.encodePing(clientTimestampMicros: ClientClock.nowMicros())

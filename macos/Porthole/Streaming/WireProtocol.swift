@@ -26,6 +26,9 @@ enum ControlMessageType: UInt8 {
     /// agent -> client once per second: capture/encode fps, encode latency,
     /// transmit rate, keyframes. 14 bytes.
     case agentStats = 0x05
+    /// client -> agent (US-013): reconfigure the live stream. 6 bytes; the
+    /// agent restarts its encoder and answers with a fresh hello.
+    case settings = 0x06
     // Input messages (client -> agent, US-006). Layouts in docs/protocol.md.
     case pointerMotionAbs = 0x10
     case pointerMotionRel = 0x11
@@ -135,6 +138,25 @@ extension WireProtocol {
         return encodeControlMessage(.ping, payload: payload)
     }
 
+    /// Encode a `settings` control frame (US-013):
+    ///
+    /// ```
+    /// offset  size  field
+    /// 0       2     fps (BE u16): 60, 120, or 144
+    /// 2       1     codec: 0 = h264, 1 = hevc
+    /// 3       2     bitrate in Mbps (BE u16)
+    /// 5       1     low_latency: 1 biases the encoder toward latency
+    /// ```
+    static func encodeSettings(fps: UInt16, codec: Hello.Codec,
+                               bitrateMbps: UInt16, lowLatency: Bool) -> Data {
+        var payload = Data(capacity: 6)
+        payload.appendUInt16BE(fps)
+        payload.append(codec.rawValue)
+        payload.appendUInt16BE(bitrateMbps)
+        payload.append(lowLatency ? 1 : 0)
+        return encodeControlMessage(.settings, payload: payload)
+    }
+
     /// Header of one video datagram fragment (25 bytes, fixed):
     ///
     /// ```
@@ -216,6 +238,11 @@ struct ControlFrameParser {
 }
 
 extension Data {
+    mutating func appendUInt16BE(_ value: UInt16) {
+        append(UInt8(truncatingIfNeeded: value >> 8))
+        append(UInt8(truncatingIfNeeded: value))
+    }
+
     func readUInt16BE(at offset: Int) -> UInt16 {
         UInt16(self[offset]) << 8 | UInt16(self[offset + 1])
     }

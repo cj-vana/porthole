@@ -1,50 +1,6 @@
 import CoreVideo
 import MetalKit
 import QuartzCore
-import SwiftUI
-
-/// SwiftUI wrapper around the `MTKView` that presents the session surface.
-///
-/// US-005: while a stream is live the renderer draws decoded CVPixelBuffers
-/// (see `MetalRenderer.display`); the test pattern remains as the
-/// disconnected idle state. US-006: the view is a SessionSurfaceView that
-/// captures keyboard/mouse/trackpad input while it holds focus.
-struct MetalSurfaceView: NSViewRepresentable {
-    /// Target rate for the view's display link: 60/120/144, or 0 for the
-    /// screen's maximum. The system clamps it to what the display supports.
-    let frameRate: Int
-    /// Pointer lock state, so the view can refresh its cursor rects on
-    /// transitions (the cursor itself is decided in SessionSurfaceView).
-    let pointerLocked: Bool
-    /// Shared renderer owned by `StreamSession`; also the view's delegate.
-    let renderer: MetalRenderer
-    /// Input translator owned by `StreamSession`.
-    let input: InputController
-
-    func makeCoordinator() -> MetalRenderer {
-        renderer
-    }
-
-    func makeNSView(context: Context) -> SessionSurfaceView {
-        let view = SessionSurfaceView(frame: .zero, device: context.coordinator.device)
-        view.inputHandler = input
-        view.delegate = context.coordinator
-        context.coordinator.view = view
-        view.colorPixelFormat = MetalRenderer.pixelFormat
-        view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
-        // Idle: the display link drives the test pattern. Live: the renderer
-        // pauses the link and draws as frames arrive (see MetalRenderer.display).
-        view.targetFrameRate = frameRate
-        view.isPaused = false
-        view.enableSetNeedsDisplay = false
-        return view
-    }
-
-    func updateNSView(_ nsView: SessionSurfaceView, context: Context) {
-        nsView.targetFrameRate = frameRate
-        nsView.pointerLocked = pointerLocked
-    }
-}
 
 /// Draws the session surface: the decoded video stream when connected, the
 /// US-004 procedural test pattern otherwise.
@@ -108,7 +64,9 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     /// A main-thread draw has been queued and not yet run; frames that land
     /// meanwhile are drawn by that one draw (the newest wins).
     private var drawQueued = false
-    private var colorState = H264Decoder.ColorState(matrix: .bt709, fullRange: false)
+    private var colorState = ColorState(matrix: .bt709, fullRange: false)
+    /// US-010 one-to-one mode draws the quad unscaled; see setFillsDrawable.
+    private var fillsDrawable = false
     /// Generation whose presentation has been registered; display-link
     /// thread only.
     private var lastPresentedGeneration: UInt64?
@@ -205,7 +163,16 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     /// Color conversion parameters from the decoder's SPS parsing.
     func setColorState(matrix: H264SPS.ColorMatrix, fullRange: Bool) {
         frameLock.lock()
-        colorState = H264Decoder.ColorState(matrix: matrix, fullRange: fullRange)
+        colorState = ColorState(matrix: matrix, fullRange: fullRange)
+        frameLock.unlock()
+    }
+
+    /// US-010 one-to-one mode: the hosting view sizes the drawable to match
+    /// the video pixel for pixel, so the quad must fill it exactly rather
+    /// than trusting the letterbox math to land on a scale of 1.
+    func setFillsDrawable(_ fills: Bool) {
+        frameLock.lock()
+        fillsDrawable = fills
         frameLock.unlock()
     }
 
@@ -224,11 +191,12 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         frameLock.lock()
         let frame = latestFrame
         let colors = colorState
+        let fills = fillsDrawable
         frameLock.unlock()
 
         var drewVideo = false
         if let frame {
-            drewVideo = drawVideo(frame: frame, colors: colors, view: view, encoder: encoder)
+            drewVideo = drawVideo(frame: frame, colors: colors, fills: fills, view: view, encoder: encoder)
         }
         if !drewVideo {
             drawTestPattern(view: view, encoder: encoder)
@@ -272,7 +240,8 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     /// Returns false when textures could not be produced; the caller falls
     /// back to the test pattern for this draw.
     private func drawVideo(frame: StreamFrame,
-                           colors: H264Decoder.ColorState,
+                           colors: ColorState,
+                           fills: Bool,
                            view: MTKView,
                            encoder: MTLRenderCommandEncoder) -> Bool {
         // NV12: plane 0 is luma (r8), plane 1 is interleaved CbCr (rg8).
@@ -281,14 +250,17 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
             return false
         }
 
-        // Aspect-fit the video into the drawable (letterbox or pillarbox).
-        let drawableAspect = Float(view.drawableSize.width / view.drawableSize.height)
-        let videoAspect = Float(frame.width) / Float(frame.height)
+        // Aspect-fit the video into the drawable (letterbox or pillarbox),
+        // unless one-to-one mode already sized the drawable to the video.
         var scale = SIMD2<Float>(1, 1)
-        if videoAspect > drawableAspect {
-            scale.y = drawableAspect / videoAspect
-        } else {
-            scale.x = videoAspect / drawableAspect
+        if !fills {
+            let drawableAspect = Float(view.drawableSize.width / view.drawableSize.height)
+            let videoAspect = Float(frame.width) / Float(frame.height)
+            if videoAspect > drawableAspect {
+                scale.y = drawableAspect / videoAspect
+            } else {
+                scale.x = videoAspect / drawableAspect
+            }
         }
 
         var colorCoeffs = Self.colorCoefficients(for: colors.matrix)
