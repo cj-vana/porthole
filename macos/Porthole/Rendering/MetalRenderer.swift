@@ -155,8 +155,9 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
 
     // MARK: Stream frame handoff (called from the decode queue)
 
-    /// Main-thread attachment performed once when SwiftUI creates the native
-    /// surface. `nextDrawable()` is explicitly designed to be called from a
+    /// Main-thread attachment when SwiftUI creates the surface and whenever
+    /// MTKView reports that its concrete CAMetalLayer is ready.
+    /// `nextDrawable()` is explicitly designed to be called from a
     /// rendering thread, so gaming mode keeps the layer and never touches the
     /// AppKit view off-main.
     func attach(view: MTKView) {

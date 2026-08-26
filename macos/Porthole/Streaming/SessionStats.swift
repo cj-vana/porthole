@@ -37,6 +37,75 @@ struct LatencyStats: Equatable {
     }
 }
 
+/// Metal callbacks arrive on driver-owned threads. Accumulate their timing
+/// inline and drain one batch per stats window instead of enqueuing two jobs
+/// per frame onto the serial decode queue that the telemetry is measuring.
+final class RenderTelemetry {
+    struct Batch {
+        var rendered = 0
+        var presented = 0
+        var captureToPresented = StatsWindow.Average()
+        var captureToRendered = StatsWindow.Average()
+        var submitToRendered = StatsWindow.Average()
+        var decodedToDraw = StatsWindow.Average()
+        var drawToPresented = StatsWindow.Average()
+        var submitToPresented = StatsWindow.Average()
+        var renderCadence = StatsWindow.Cadence()
+        var presentationCadence = StatsWindow.Cadence()
+    }
+
+    private let lock = NSLock()
+    private var batch = Batch()
+
+    func recordPresented(_ timing: MetalRenderer.PresentationTiming) {
+        lock.lock()
+        batch.presented += 1
+        batch.presentationCadence.observe(timing.presentedMicros)
+        if let captureClientMicros = timing.captureClientMicros {
+            batch.captureToPresented.add(
+                Int64(timing.presentedMicros) - Int64(captureClientMicros)
+            )
+        }
+        batch.decodedToDraw.add(Int64(timing.drawStartedMicros) - Int64(timing.decodedMicros))
+        batch.drawToPresented.add(
+            Int64(timing.presentedMicros) - Int64(timing.drawStartedMicros)
+        )
+        batch.submitToPresented.add(
+            Int64(timing.presentedMicros) - Int64(timing.submittedMicros)
+        )
+        lock.unlock()
+    }
+
+    func recordRendered(_ timing: MetalRenderer.RenderCompletionTiming) {
+        lock.lock()
+        batch.rendered += 1
+        batch.renderCadence.observe(timing.completedMicros)
+        if let captureClientMicros = timing.captureClientMicros {
+            batch.captureToRendered.add(
+                Int64(timing.completedMicros) - Int64(captureClientMicros)
+            )
+        }
+        batch.submitToRendered.add(
+            Int64(timing.completedMicros) - Int64(timing.submittedMicros)
+        )
+        lock.unlock()
+    }
+
+    func drain() -> Batch {
+        lock.lock()
+        let drained = batch
+        batch = Batch()
+        lock.unlock()
+        return drained
+    }
+
+    func reset() {
+        lock.lock()
+        batch = Batch()
+        lock.unlock()
+    }
+}
+
 /// One second of session counters. StreamSession mutates it on the decode
 /// queue and calls `line` from the stats timer, then `reset`.
 struct StatsWindow {
@@ -117,6 +186,19 @@ struct StatsWindow {
     var lossPercent: Double {
         let total = UInt64(completed) + lost
         return total > 0 ? Double(lost) / Double(total) * 100 : 0
+    }
+
+    mutating func apply(_ telemetry: RenderTelemetry.Batch) {
+        rendered = telemetry.rendered
+        presented = telemetry.presented
+        captureToPresented = telemetry.captureToPresented
+        captureToRendered = telemetry.captureToRendered
+        submitToRendered = telemetry.submitToRendered
+        decodedToDraw = telemetry.decodedToDraw
+        drawToPresented = telemetry.drawToPresented
+        submitToPresented = telemetry.submitToPresented
+        renderCadence = telemetry.renderCadence
+        presentationCadence = telemetry.presentationCadence
     }
 
     /// The stats line written to os_log and /tmp/porthole-mac-stats.log.

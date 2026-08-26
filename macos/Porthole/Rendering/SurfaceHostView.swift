@@ -110,6 +110,10 @@ final class SurfaceHostView: NSScrollView {
         drawsBackground = false
         scrollerStyle = .overlay
         automaticallyAdjustsContentInsets = false
+        surface.onPresentationLayerReady = { [weak renderer, weak surface] in
+            guard let renderer, let surface else { return }
+            renderer.attach(view: surface)
+        }
         let clipView = CenteringClipView()
         clipView.drawsBackground = false
         contentView = clipView

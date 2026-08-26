@@ -8,6 +8,9 @@ import os
 /// releases (resignFirstResponder).
 final class SessionSurfaceView: MTKView {
     var inputHandler: InputController?
+    /// Fires only after MTKView exposes the CAMetalLayer that direct gaming
+    /// presentation may retain off-main.
+    var onPresentationLayerReady: (() -> Void)?
 
     /// Display link target; 0 means auto, the screen's maximum. Re-resolved
     /// when the view lands in a window and when that window changes screen,
@@ -108,6 +111,7 @@ final class SessionSurfaceView: MTKView {
         metalLayer.backgroundColor = NSColor.black.cgColor
         metalLayer.presentsWithTransaction = false
         metalLayer.displaySyncEnabled = !lowLatencyPresentation
+        onPresentationLayerReady?()
         logger.info("presentation sync \(self.lowLatencyPresentation ? "off (gaming)" : "on")")
     }
 

@@ -56,6 +56,7 @@ final class StreamSession: ObservableObject {
     /// because each try drives the published state through connect(host:).
     private let dialer: DialWalker
     private let statsLog = StatsLog()
+    private let renderTelemetry = RenderTelemetry()
 
     private var hello: Hello?
     private var needsKeyframe = true
@@ -112,6 +113,7 @@ final class StreamSession: ObservableObject {
             connectStartedAt = Date()
         }
         connectedHost = host
+        renderTelemetry.reset()
         statsLog.open()
         logger.info("connecting to \(host, privacy: .public):\(controlPort)")
         control.connect(host: host, port: controlPort)
@@ -201,40 +203,10 @@ final class StreamSession: ObservableObject {
 
     private func wireRendererTelemetry() {
         renderer.onFramePresented = { [weak self] timing in
-            self?.decodeQueue.async {
-                guard let self else { return }
-                self.stats.presented += 1
-                self.stats.presentationCadence.observe(timing.presentedMicros)
-                if let captureClientMicros = timing.captureClientMicros {
-                    self.stats.captureToPresented.add(
-                        Int64(timing.presentedMicros) - Int64(captureClientMicros)
-                    )
-                }
-                self.stats.decodedToDraw.add(
-                    Int64(timing.drawStartedMicros) - Int64(timing.decodedMicros)
-                )
-                self.stats.drawToPresented.add(
-                    Int64(timing.presentedMicros) - Int64(timing.drawStartedMicros)
-                )
-                self.stats.submitToPresented.add(
-                    Int64(timing.presentedMicros) - Int64(timing.submittedMicros)
-                )
-            }
+            self?.renderTelemetry.recordPresented(timing)
         }
         renderer.onFrameRenderCompleted = { [weak self] timing in
-            self?.decodeQueue.async {
-                guard let self else { return }
-                self.stats.rendered += 1
-                self.stats.renderCadence.observe(timing.completedMicros)
-                if let captureClientMicros = timing.captureClientMicros {
-                    self.stats.captureToRendered.add(
-                        Int64(timing.completedMicros) - Int64(captureClientMicros)
-                    )
-                }
-                self.stats.submitToRendered.add(
-                    Int64(timing.completedMicros) - Int64(timing.submittedMicros)
-                )
-            }
+            self?.renderTelemetry.recordRendered(timing)
         }
     }
 
@@ -374,6 +346,7 @@ final class StreamSession: ObservableObject {
     }
 
     private func emitStats() {
+        stats.apply(renderTelemetry.drain())
         let rttMicros = clockOffset.latestRttMicros
         let line = stats.line(rttMicros: rttMicros, agentStats: latestAgentStats,
                               queueDepth: video.backlogDepth, audio: audio.perSecond())
