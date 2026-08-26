@@ -101,6 +101,7 @@ pub fn spawn_control_listener(
     hello: Hello,
     input_tx: Option<mpsc::Sender<InputEvent>>,
     clipboard_tx: Option<mpsc::Sender<String>>,
+    gamepad_tx: Option<mpsc::Sender<protocol::GamepadState>>,
     pipeline_start: Instant,
 ) -> anyhow::Result<(mpsc::Receiver<ControlEvent>, ControlSender)> {
     let listener = TcpListener::bind(cfg.control_addr()).map_err(|e| {
@@ -123,6 +124,7 @@ pub fn spawn_control_listener(
                 tx,
                 input_tx,
                 clipboard_tx,
+                gamepad_tx,
                 slot,
                 pipeline_start,
             })
@@ -136,6 +138,7 @@ struct AcceptArgs {
     tx: mpsc::Sender<ControlEvent>,
     input_tx: Option<mpsc::Sender<InputEvent>>,
     clipboard_tx: Option<mpsc::Sender<String>>,
+    gamepad_tx: Option<mpsc::Sender<protocol::GamepadState>>,
     slot: WriterSlot,
     pipeline_start: Instant,
 }
@@ -147,6 +150,7 @@ fn accept_loop(args: AcceptArgs) {
         tx,
         input_tx,
         clipboard_tx,
+        gamepad_tx,
         slot,
         pipeline_start,
     } = args;
@@ -221,6 +225,7 @@ fn accept_loop(args: AcceptArgs) {
             tx: tx.clone(),
             input_tx: input_tx.clone(),
             clipboard_tx: clipboard_tx.clone(),
+            gamepad_tx: gamepad_tx.clone(),
             writer_tx,
             slot: slot.clone(),
             pipeline_start,
@@ -266,6 +271,7 @@ struct ReaderArgs {
     tx: mpsc::Sender<ControlEvent>,
     input_tx: Option<mpsc::Sender<InputEvent>>,
     clipboard_tx: Option<mpsc::Sender<String>>,
+    gamepad_tx: Option<mpsc::Sender<protocol::GamepadState>>,
     writer_tx: mpsc::SyncSender<Vec<u8>>,
     slot: WriterSlot,
     pipeline_start: Instant,
@@ -288,6 +294,7 @@ fn read_loop(args: ReaderArgs) {
         tx,
         input_tx,
         clipboard_tx,
+        gamepad_tx,
         writer_tx,
         slot,
         pipeline_start,
@@ -329,6 +336,18 @@ fn read_loop(args: ReaderArgs) {
                     None => {
                         tracing::debug!(%peer, len = payload.len(), "malformed settings, ignored")
                     }
+                }
+            }
+            Ok(Some((protocol::CONTROL_MSG_GAMEPAD, payload))) => {
+                match protocol::GamepadState::decode(&payload) {
+                    Some(state) => {
+                        if let Some(gamepad_tx) = &gamepad_tx {
+                            if gamepad_tx.send(state).is_err() {
+                                tracing::debug!("gamepad sink gone, dropping gamepad state");
+                            }
+                        }
+                    }
+                    None => tracing::debug!(%peer, "malformed gamepad message, ignored"),
                 }
             }
             Ok(Some((protocol::CONTROL_MSG_CLIPBOARD, payload))) => {

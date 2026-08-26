@@ -152,6 +152,26 @@ up with video (wire format in `../docs/protocol.md`). Audio flows only while
 a client is connected; on a machine without ffmpeg or an audio server the
 agent logs a warning and streams video only. Capture is Linux only.
 
+### Gamepad (US-014)
+
+A controller plugged into the Mac shows up on the Linux machine as a standard
+gamepad. The client sends the full controller state (protocol message 0x08,
+docs/protocol.md) and the agent maps it onto a virtual device with the evdev
+crate through `/dev/uinput`. uinput is root-only by default, so grant the
+`input` group access with a udev rule:
+
+```sh
+echo 'KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"' \
+  | sudo tee /etc/udev/rules.d/99-porthole-uinput.rules
+sudo udevadm control --reload-rules
+sudo modprobe uinput   # or reboot, so the rule applies to the node
+```
+
+Make sure your user is in the `input` group (`sudo usermod -aG input $USER`,
+then log out and back in). Without a writable `/dev/uinput` the agent logs a
+warning and runs without the gamepad; the rest of the session is unaffected.
+Verify with `evtest`: the device shows up as "Porthole Gamepad".
+
 ### File transfer (US-011)
 
 Files dragged onto the Mac window arrive on their own TCP endpoint
@@ -238,7 +258,7 @@ Module map: `capture` (wlr-screencopy on Wayland, US-001), `virtual_display`
 VAAPI, H.264/HEVC, US-002), `transport` (TCP control + UDP video, US-003),
 `input` (zwlr_virtual_pointer_v1 + virtual-keyboard-v1, US-006a), `audio`
 (Opus over UDP, US-009), `clipboard` (wl-clipboard subprocess, US-008), `transfer` (file drag and
-drop endpoint, US-011). The wire format itself lives in the library target
+drop endpoint, US-011), `gamepad` (virtual uinput gamepad, US-014). The wire format itself lives in the library target
 (`src/lib.rs` + `src/protocol.rs`), shared with `examples/receiver.rs`.
 `examples/wl_globals.rs` lists the compositor's advertised protocols, for
 checking what a session offers before pointing the agent at it.

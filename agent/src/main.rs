@@ -16,6 +16,7 @@ mod clipboard;
 mod config;
 mod discovery;
 mod encode;
+mod gamepad;
 mod input;
 mod transfer;
 mod transport;
@@ -522,9 +523,18 @@ async fn main() -> anyhow::Result<()> {
         // copied through clip_tx; the clipboard module applies it and watches
         // the Linux clipboard, sending changes back over the control channel.
         let (clip_tx, clip_rx) = std::sync::mpsc::channel::<String>();
-        let (events, control) =
-            transport::spawn_control_listener(&cfg, hello, input_tx, Some(clip_tx), pipeline_start)
-                .context("transport control channel startup failed")?;
+        // US-014: virtual gamepad. The control reader forwards gamepad state
+        // to the uinput device.
+        let gamepad_tx = gamepad::spawn();
+        let (events, control) = transport::spawn_control_listener(
+            &cfg,
+            hello,
+            input_tx,
+            Some(clip_tx),
+            gamepad_tx,
+            pipeline_start,
+        )
+        .context("transport control channel startup failed")?;
         let clipboard = {
             let control = control.clone();
             clipboard::spawn(clip_rx, move |text| {
