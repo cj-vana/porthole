@@ -34,6 +34,7 @@ memmap2 = "0.9"
 serde_json = "1" # parsing `hyprctl monitors -j` for virtual display setup (US-015)
 xkbcommon = "0.9" # building the virtual keyboard keymap (links system libxkbcommon)
 evdev = "0.13" # virtual uinput gamepad (US-014)
+socket2 = "0.5" # packet-preserving local ffmpeg output (SOCK_SEQPACKET)
 
 # TODO(US-002): GStreamer for the encode pipeline needs system dev packages:
 #   [target.'cfg(target_os = "linux")'.dependencies]

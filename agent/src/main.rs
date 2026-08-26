@@ -23,8 +23,9 @@ mod transport;
 mod virtual_display;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -200,9 +201,129 @@ fn hello_for(
     }
 }
 
+/// One compositor frame and the pipeline timestamp taken immediately after
+/// Wayland reports it ready.
+struct CapturedFrame {
+    frame: capture::RawFrame,
+    captured_us: u64,
+}
+
+/// Single-slot handoff from blocking Wayland capture to encode/transport.
+/// Replacing the slot makes overload explicitly newest-frame-wins instead of
+/// allowing old screen contents to build latency in a queue.
+struct CaptureMailbox {
+    slot: Mutex<Option<CapturedFrame>>,
+    ready: Condvar,
+    format: Mutex<capture::CaptureFormat>,
+    captured: AtomicU64,
+    replaced: AtomicU64,
+    done: AtomicBool,
+}
+
+impl CaptureMailbox {
+    fn new(format: capture::CaptureFormat) -> Self {
+        Self {
+            slot: Mutex::new(None),
+            ready: Condvar::new(),
+            format: Mutex::new(format),
+            captured: AtomicU64::new(0),
+            replaced: AtomicU64::new(0),
+            done: AtomicBool::new(false),
+        }
+    }
+
+    fn publish(&self, captured: CapturedFrame) {
+        self.captured.fetch_add(1, Ordering::Relaxed);
+        let mut slot = self.slot.lock().expect("capture mailbox poisoned");
+        if slot.replace(captured).is_some() {
+            self.replaced.fetch_add(1, Ordering::Relaxed);
+        }
+        self.ready.notify_one();
+    }
+
+    fn take_timeout(&self, timeout: Duration) -> Option<CapturedFrame> {
+        let mut slot = self.slot.lock().expect("capture mailbox poisoned");
+        if slot.is_none() && !self.done.load(Ordering::Acquire) {
+            slot = self
+                .ready
+                .wait_timeout(slot, timeout)
+                .expect("capture mailbox poisoned while waiting")
+                .0;
+        }
+        slot.take()
+    }
+
+    fn finish(&self) {
+        self.done.store(true, Ordering::Release);
+        self.ready.notify_all();
+    }
+
+    fn is_done_and_empty(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+            && self
+                .slot
+                .lock()
+                .expect("capture mailbox poisoned")
+                .is_none()
+    }
+
+    fn update_format(&self, format: capture::CaptureFormat) {
+        *self.format.lock().expect("capture format poisoned") = format;
+    }
+
+    fn format(&self) -> capture::CaptureFormat {
+        self.format.lock().expect("capture format poisoned").clone()
+    }
+
+    fn take_window_counts(&self) -> (u64, u64) {
+        (
+            self.captured.swap(0, Ordering::Relaxed),
+            self.replaced.swap(0, Ordering::Relaxed),
+        )
+    }
+}
+
+fn spawn_capture_producer(
+    mut backend: Box<dyn capture::CaptureBackend>,
+    mailbox: Arc<CaptureMailbox>,
+    latest_frame: discovery::LatestFrame,
+    pipeline_start: Instant,
+    shutdown: Arc<AtomicBool>,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("wayland-capture".into())
+        .spawn(move || {
+            let mut sequence = 0u64;
+            while !shutdown.load(Ordering::Relaxed) {
+                let frame = match backend.next_frame() {
+                    Ok(frame) => frame,
+                    Err(err) => {
+                        tracing::error!("{err:#}: capture frame failed, stopping capture producer");
+                        break;
+                    }
+                };
+                let captured_us = pipeline_start.elapsed().as_micros() as u64;
+                sequence += 1;
+
+                // The negotiated pixel format becomes known with the first
+                // frame. Geometry is stable for this capture session.
+                if sequence == 1 {
+                    mailbox.update_format(backend.format());
+                }
+                // Picker thumbnails need freshness, not every video frame.
+                if sequence % 30 == 1 {
+                    *latest_frame.lock().expect("thumbnail slot poisoned") =
+                        Some((frame.data.clone(), frame.width, frame.height, frame.stride));
+                }
+                mailbox.publish(CapturedFrame { frame, captured_us });
+            }
+            mailbox.finish();
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn capture_loop(
-    mut backend: Box<dyn capture::CaptureBackend>,
+    backend: Box<dyn capture::CaptureBackend>,
     mut encoder: Box<dyn encode::Encoder>,
     mut cfg: config::Config,
     capture_format: capture::CaptureFormat,
@@ -214,6 +335,21 @@ fn capture_loop(
     pipeline_start: Instant,
     shutdown: Arc<AtomicBool>,
 ) {
+    let capture_backend = backend.name().to_string();
+    let mailbox = Arc::new(CaptureMailbox::new(capture_format.clone()));
+    let capture_thread = match spawn_capture_producer(
+        backend,
+        mailbox.clone(),
+        latest_frame,
+        pipeline_start,
+        shutdown.clone(),
+    ) {
+        Ok(handle) => handle,
+        Err(err) => {
+            tracing::error!(%err, "failed to start Wayland capture thread");
+            return;
+        }
+    };
     // Recomputed whenever a settings message (US-013) changes the framerate.
     let mut frame_interval = Duration::from_secs_f64(1.0 / f64::from(cfg.fps.get()));
     // Accumulating deadline: captures arrive quantized to the compositor's
@@ -239,7 +375,6 @@ fn capture_loop(
             None
         }
     });
-    let mut frames = 0u64;
     let mut submitted = 0u64;
     let mut encoded = 0u64;
     let mut encoded_bytes = 0u64;
@@ -253,6 +388,11 @@ fn capture_loop(
     // from its arrival and present times, so nothing falls between the two.
     let mut enc_latency_us_total = 0u64;
     let mut enc_latency_samples = 0u64;
+    // Once the reader has a complete AU, it should reach packetization
+    // immediately rather than waiting behind the next compositor capture.
+    let mut ready_wait_us_total = 0u64;
+    let mut send_us_total = 0u64;
+    let mut send_samples = 0u64;
     // Generation of the client video goes to. A replaced connection's
     // reader reports its disconnect after the new client connected; the
     // generation tells that stale event apart from a real disconnect.
@@ -339,43 +479,39 @@ fn capture_loop(
             }
         }
 
-        let frame = match backend.next_frame() {
-            Ok(frame) => frame,
-            Err(err) => {
-                tracing::error!("{err:#}: capture frame failed, stopping capture loop");
-                break;
+        // Encoded output wins over the next capture. Only wait for a frame
+        // when there is no AU ready to transmit, which prevents a blocking
+        // 14.7 MB stdin write from getting in front of completed video.
+        let mut access_units = encoder.drain();
+        if access_units.is_empty() {
+            // Wait at most 100 us for a new capture. Short polling bounds how
+            // long an AU that becomes ready meanwhile can sit before transmit.
+            let captured = mailbox.take_timeout(Duration::from_micros(100));
+            if let Some(captured) = captured {
+                // Pace encoder submissions to the configured stream rate.
+                let now = Instant::now();
+                if now >= next_submit {
+                    next_submit += frame_interval;
+                    if next_submit < now {
+                        // Way behind (stall); restart the schedule instead of
+                        // bursting to catch up.
+                        next_submit = now + frame_interval;
+                    }
+                    let submit_start = Instant::now();
+                    if let Err(err) = encoder.encode(&captured.frame) {
+                        tracing::error!("{err:#}: encoder submit failed, stopping capture loop");
+                        break;
+                    }
+                    submit_ms_total += submit_start.elapsed().as_secs_f64() * 1000.0;
+                    submitted += 1;
+                    submitted_at.push_back(captured.captured_us);
+                }
             }
-        };
-        frames += 1;
-        let captured_us = pipeline_start.elapsed().as_micros() as u64;
-
-        // FR-10: share a recent frame with the thumbnail endpoint. Every
-        // 30th frame is plenty fresh for a picker thumbnail.
-        if frames % 30 == 1 {
-            *latest_frame.lock().expect("thumbnail slot poisoned") =
-                Some((frame.data.clone(), frame.width, frame.height, frame.stride));
+            // A previous frame can finish while the pipe write is in flight.
+            access_units.extend(encoder.drain());
         }
 
-        // Pace encoder submissions to the configured stream rate.
-        let now = Instant::now();
-        if now >= next_submit {
-            next_submit += frame_interval;
-            if next_submit < now {
-                // Way behind (stall); restart the schedule instead of
-                // bursting to catch up.
-                next_submit = now + frame_interval;
-            }
-            let submit_start = Instant::now();
-            if let Err(err) = encoder.encode(&frame) {
-                tracing::error!("{err:#}: encoder submit failed, stopping capture loop");
-                break;
-            }
-            submit_ms_total += submit_start.elapsed().as_secs_f64() * 1000.0;
-            submitted += 1;
-            submitted_at.push_back(captured_us);
-        }
-
-        for au in encoder.drain() {
+        for au in access_units {
             if let Some(f) = dump.as_mut() {
                 use std::io::Write;
                 let _ = f.write_all(&au.data);
@@ -392,9 +528,15 @@ fn capture_loop(
                 }
                 None => ready_us,
             };
+            let send_start = Instant::now();
+            ready_wait_us_total += send_start
+                .saturating_duration_since(au.ready_at)
+                .as_micros() as u64;
             if let Err(err) = sender.send(&au, timestamp_us) {
                 tracing::error!("{err:#}: video send failed");
             }
+            send_us_total += send_start.elapsed().as_micros() as u64;
+            send_samples += 1;
             encoded += 1;
             encoded_bytes += au.data.len() as u64;
             if au.is_keyframe {
@@ -406,19 +548,21 @@ fn capture_loop(
         let elapsed = window_start.elapsed();
         if elapsed >= Duration::from_secs(1) {
             let secs = elapsed.as_secs_f64();
-            let format = backend.format();
+            let format = mailbox.format();
+            let (frames, capture_replaced) = mailbox.take_window_counts();
             let tx_kbps = sender.bytes_sent as f64 * 8.0 / secs / 1000.0;
             let tx_datagrams = sender.datagrams_sent as f64 / secs;
             let enc_latency_us = enc_latency_us_total / enc_latency_samples.max(1);
             sender.bytes_sent = 0;
             sender.datagrams_sent = 0;
             tracing::info!(
-                backend = backend.name(),
-                resolution = format!("{}x{}", frame.width, frame.height),
-                stride = frame.stride,
-                frame_bytes = frame.data.len(),
+                backend = capture_backend,
+                resolution = format!("{}x{}", format.width, format.height),
+                stride = format.width as usize * 4,
+                frame_bytes = format.width as usize * format.height as usize * 4,
                 pixel_format = format.pixel_format.as_deref().unwrap_or("unknown"),
                 fps = format!("{:.0}", frames as f64 / secs),
+                capture_replaced,
                 enc_backend = %encoder.backend(),
                 enc_codec = %encoder.codec(),
                 enc_in = format!("{:.0}", submitted as f64 / secs),
@@ -427,6 +571,8 @@ fn capture_loop(
                 enc_keyframes = keyframes,
                 enc_submit_ms = format!("{:.2}", submit_ms_total / submitted.max(1) as f64),
                 enc_latency_ms = format!("{:.2}", enc_latency_us as f64 / 1000.0),
+                enc_ready_wait_ms = format!("{:.3}", ready_wait_us_total as f64 / send_samples.max(1) as f64 / 1000.0),
+                tx_frame_ms = format!("{:.3}", send_us_total as f64 / send_samples.max(1) as f64 / 1000.0),
                 client = sender.client().map(|a| a.to_string()).unwrap_or_else(|| "none".into()),
                 tx_kbps = format!("{tx_kbps:.0}"),
                 tx_dgrams = format!("{tx_datagrams:.0}"),
@@ -445,7 +591,6 @@ fn capture_loop(
                     &stats.encode(),
                 );
             }
-            frames = 0;
             submitted = 0;
             encoded = 0;
             encoded_bytes = 0;
@@ -453,9 +598,19 @@ fn capture_loop(
             submit_ms_total = 0.0;
             enc_latency_us_total = 0;
             enc_latency_samples = 0;
+            ready_wait_us_total = 0;
+            send_us_total = 0;
+            send_samples = 0;
             window_start = Instant::now();
         }
+
+        if mailbox.is_done_and_empty() && submitted_at.is_empty() {
+            break;
+        }
     }
+    shutdown.store(true, Ordering::Relaxed);
+    mailbox.ready.notify_all();
+    let _ = capture_thread.join();
 }
 
 #[tokio::main]
@@ -623,4 +778,38 @@ async fn main() -> anyhow::Result<()> {
     // TODO: close transport.
     tracing::info!("porthole-agent stopped cleanly");
     Ok(())
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+
+    fn captured(value: u8) -> CapturedFrame {
+        CapturedFrame {
+            frame: capture::RawFrame {
+                width: 1,
+                height: 1,
+                stride: 4,
+                data: vec![value; 4],
+            },
+            captured_us: u64::from(value),
+        }
+    }
+
+    #[test]
+    fn capture_mailbox_replaces_old_frame_with_newest() {
+        let mailbox = CaptureMailbox::new(capture::CaptureFormat::default());
+        mailbox.publish(captured(1));
+        mailbox.publish(captured(2));
+
+        let newest = mailbox
+            .take_timeout(Duration::ZERO)
+            .expect("newest frame remains queued");
+        assert_eq!(newest.captured_us, 2);
+        assert_eq!(newest.frame.data, vec![2; 4]);
+        assert_eq!(mailbox.take_window_counts(), (2, 1));
+
+        mailbox.finish();
+        assert!(mailbox.is_done_and_empty());
+    }
 }

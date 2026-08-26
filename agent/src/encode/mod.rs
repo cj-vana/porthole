@@ -10,11 +10,10 @@
 //!
 //! Integration is an ffmpeg subprocess per encoder session (see the
 //! `ffmpeg` module, Linux only): raw bgra frames are piped to stdin, Annex B
-//! access units are read from stdout. Chosen over linking libavcodec because
-//! the box runs FFmpeg 9, far newer than the available Rust bindings
-//! support, and a subprocess needs no new system packages. Both backends
-//! convert bgra on GPU (NVENC accepts bgra input directly; VAAPI uses
-//! `hwupload,scale_vaapi=format=nv12`), so no CPU swscale runs.
+//! access units return through a packet-preserving Unix socket. Chosen over
+//! linking libavcodec because the box runs FFmpeg 9, far newer than the
+//! available Rust bindings support, and a subprocess needs no new system
+//! packages.
 //!
 //! Note: when the screen is captured from the dGPU but encoded on the iGPU,
 //! frames cross the PCIe bus through system memory (shm capture plus pipe).
