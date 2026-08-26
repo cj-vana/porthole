@@ -70,13 +70,59 @@ final class StreamSession: ObservableObject {
 
     // MARK: Lifecycle
 
-    func connect(host: String) {
+    /// Set at connect() so the first decoded frame can report the
+    /// click-to-first-frame latency (US-007 target: under 3 s on LAN).
+    private var connectStartedAt: Date?
+
+    /// Remaining address candidates for the in-flight dial (US-007): mDNS
+    /// LAN addresses are tried first, then the bare host name fallback
+    /// (MagicDNS/Tailscale). Each candidate gets dialTimeoutSeconds before
+    /// the next is tried.
+    private var dialCandidates: [(host: String, port: UInt16)] = []
+    private var dialTimeout: DispatchWorkItem?
+    private let dialTimeoutSeconds: Double = 1.0
+
+    /// Connect to a picker machine, walking its address candidates.
+    func connect(machine: Machine) {
+        connectStartedAt = Date() // the fallback re-dial must not reset this
+        let candidates = machine.addressCandidates.isEmpty ? [machine.host] : machine.addressCandidates
+        dialCandidates = candidates.map { ($0, machine.controlPort) }
+        guard let first = dialCandidates.first else { return }
+        dialCandidates.removeFirst()
+        connect(host: first.host, controlPort: first.port)
+        armDialTimeout()
+    }
+
+    /// Give up on the in-flight dial after dialTimeoutSeconds and try the
+    /// next candidate; only fails the connect when none remain.
+    private func armDialTimeout() {
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.state == .connecting else { return }
+            guard let next = self.dialCandidates.first else {
+                self.fail("no address for this machine is reachable")
+                return
+            }
+            self.dialCandidates.removeFirst()
+            self.logger.info("dial timed out; trying \(next.host, privacy: .public)")
+            self.control.disconnect()
+            self.state = .disconnected // connect(host:) requires the idle state
+            self.connect(host: next.host, controlPort: next.port)
+            self.armDialTimeout()
+        }
+        dialTimeout = work
+        decodeQueue.asyncAfter(deadline: .now() + dialTimeoutSeconds, execute: work)
+    }
+
+    func connect(host: String, controlPort: UInt16 = WireProtocol.controlPort) {
         guard state == .disconnected else { return }
         lastError = nil
         state = .connecting
         needsKeyframe = true
         highestSubmittedSequence = nil
         consecutiveEmptySeconds = 0
+        if connectStartedAt == nil {
+            connectStartedAt = Date()
+        }
         openStatsLog()
 
         control.onEvent = { [weak self] event in
@@ -113,13 +159,16 @@ final class StreamSession: ObservableObject {
             }
         }
 
-        logger.info("connecting to \(host, privacy: .public):\(WireProtocol.controlPort)")
-        control.connect(host: host)
+        logger.info("connecting to \(host, privacy: .public):\(controlPort)")
+        control.connect(host: host, port: controlPort)
         startStatsTimer()
     }
 
     func disconnect() {
         guard state != .disconnected else { return }
+        dialTimeout?.cancel()
+        dialTimeout = nil
+        dialCandidates = []
         control.disconnect()
         video.stop()
         decodeQueue.sync {
@@ -140,6 +189,11 @@ final class StreamSession: ObservableObject {
 
     private func handleControlEvent(_ event: ControlChannel.Event) {
         switch event {
+        case .ready:
+            // Connected to a candidate; stop the fallback walk.
+            dialTimeout?.cancel()
+            dialTimeout = nil
+            dialCandidates = []
         case .hello(let hello):
             guard hello.codec == .h264 else {
                 fail("agent streams codec \(hello.codec.rawValue); US-005 supports h264 only")
@@ -237,6 +291,11 @@ final class StreamSession: ObservableObject {
         decodeMillisecondsThisSecond += decoder.lastDecodeMilliseconds
         renderer.display(pixelBuffer)
         if case .waitingForKeyframe = state, let hello {
+            if let started = connectStartedAt {
+                let milliseconds = Int(Date().timeIntervalSince(started) * 1000)
+                logger.info("connect to first decoded frame: \(milliseconds) ms")
+                connectStartedAt = nil
+            }
             setState(.live(width: Int(hello.width), height: Int(hello.height), fps: Int(hello.fps)))
         }
     }

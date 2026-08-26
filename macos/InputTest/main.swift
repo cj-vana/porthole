@@ -218,6 +218,8 @@ func runLive(host: String, command: [String]) -> Never {
     let helloReceived = DispatchSemaphore(value: 0)
     control.onEvent = { event in
         switch event {
+        case .ready:
+            break
         case .hello(let hello):
             print("hello: \(hello.width)x\(hello.height)@\(hello.fps) from \(host)")
             helloReceived.signal()

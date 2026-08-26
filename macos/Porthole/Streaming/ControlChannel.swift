@@ -5,6 +5,8 @@ import Network
 /// server; we connect, receive `hello`, and send `keyframe_request`.
 final class ControlChannel {
     enum Event {
+        /// TCP connection is up; hello follows immediately after.
+        case ready
         case hello(Hello)
         case disconnected(reason: String)
     }
@@ -26,8 +28,12 @@ final class ControlChannel {
         self.connection = connection
 
         connection.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
+            // Stale connections (a cancelled dial during candidate fallback)
+            // must not report into the live session.
+            guard let self, self.connection === connection else { return }
             switch state {
+            case .ready:
+                self.onEvent?(.ready)
             case .failed(let error):
                 self.onEvent?(.disconnected(reason: "control channel failed: \(error.localizedDescription)"))
             case .cancelled:
@@ -66,7 +72,9 @@ final class ControlChannel {
     private func receiveLoop(_ connection: NWConnection) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) {
             [weak self] data, _, isComplete, error in
-            guard let self else { return }
+            // Same stale-connection guard: a cancelled dial's in-flight
+            // receive fires its completion with an error; ignore it.
+            guard let self, self.connection === connection else { return }
             if let data, !data.isEmpty {
                 for frame in self.parser.append(data) {
                     switch frame.type {
