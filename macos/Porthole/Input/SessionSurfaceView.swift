@@ -111,6 +111,14 @@ final class SessionSurfaceView: MTKView {
         logger.info("presentation sync \(self.lowLatencyPresentation ? "off (gaming)" : "on")")
     }
 
+    /// AppKit may rebuild the layer's swapchain while entering or leaving a
+    /// native fullscreen Space. Reassert every queue and synchronization
+    /// property after the transition before the renderer acquires a drawable.
+    func reapplyPresentationMode() {
+        applyPresentationMode()
+        applyFrameRate()
+    }
+
     private func applyFrameRate() {
         let resolved: Int
         if targetFrameRate > 0 {

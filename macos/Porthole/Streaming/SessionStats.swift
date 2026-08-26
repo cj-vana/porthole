@@ -55,6 +55,39 @@ struct StatsWindow {
         }
     }
 
+    /// Per-second timestamp cadence. Standard deviation identifies micro-
+    /// stutter even when a source still averages exactly 144 frames/second;
+    /// the maximum gap distinguishes one long stall from steady noise.
+    struct Cadence {
+        private var previousMicros: UInt64?
+        private var sumMicros = 0.0
+        private var squaredMicros = 0.0
+        private var samples = 0
+        private(set) var maxMilliseconds: Double?
+
+        mutating func observe(_ timestampMicros: UInt64) {
+            guard let previousMicros else {
+                self.previousMicros = timestampMicros
+                return
+            }
+            guard timestampMicros >= previousMicros else { return }
+            self.previousMicros = timestampMicros
+            let interval = Double(timestampMicros - previousMicros)
+            sumMicros += interval
+            squaredMicros += interval * interval
+            samples += 1
+            let milliseconds = interval / 1000
+            maxMilliseconds = max(maxMilliseconds ?? milliseconds, milliseconds)
+        }
+
+        var jitterMilliseconds: Double? {
+            guard samples > 0 else { return nil }
+            let mean = sumMicros / Double(samples)
+            let variance = max(0, squaredMicros / Double(samples) - mean * mean)
+            return variance.squareRoot() / 1000
+        }
+    }
+
     var decoded = 0
     /// Distinct video frames whose Metal command buffers completed.
     var rendered = 0
@@ -71,6 +104,11 @@ struct StatsWindow {
     var decodedToDraw = Average()
     var drawToPresented = Average()
     var submitToPresented = Average()
+    var captureCadence = Cadence()
+    var arrivalCadence = Cadence()
+    var decodeCadence = Cadence()
+    var renderCadence = Cadence()
+    var presentationCadence = Cadence()
 
     var averageDecodeMs: Double {
         decoded > 0 ? decodeMilliseconds / Double(decoded) : 0
@@ -110,6 +148,16 @@ struct StatsWindow {
             + " draw_present_ms=\(ms(drawToPresented.milliseconds, 2))"
             + " submit_present_ms=\(ms(submitToPresented.milliseconds, 2))"
             + " submit_gpu_ms=\(ms(submitToRendered.milliseconds, 2))"
+            + " jitter_ms=\(ms(captureCadence.jitterMilliseconds, 2))/"
+            + "\(ms(arrivalCadence.jitterMilliseconds, 2))/"
+            + "\(ms(decodeCadence.jitterMilliseconds, 2))/"
+            + "\(ms(renderCadence.jitterMilliseconds, 2))/"
+            + "\(ms(presentationCadence.jitterMilliseconds, 2))"
+            + " max_gap_ms=\(ms(captureCadence.maxMilliseconds, 1))/"
+            + "\(ms(arrivalCadence.maxMilliseconds, 1))/"
+            + "\(ms(decodeCadence.maxMilliseconds, 1))/"
+            + "\(ms(renderCadence.maxMilliseconds, 1))/"
+            + "\(ms(presentationCadence.maxMilliseconds, 1))"
             + " loss=\(ms(lossPercent, 2))%"
             + " queue=\(queueDepth)"
             + " agent_fps=\(agentFps)"

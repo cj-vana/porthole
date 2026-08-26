@@ -196,6 +196,14 @@ final class SurfaceHostView: NSScrollView {
         let isFullscreen = window.styleMask.contains(.fullScreen)
         if isFullscreen == wantsFullscreen {
             fullscreenRetryCount = 0
+            // Window restoration can attach us to an already-fullscreen
+            // Space without posting didEnterFullScreen. In that path AppKit
+            // has still replaced the layer's drawable pool, so repair the
+            // renderer binding once before reporting the restored state.
+            if reportedFullscreen != isFullscreen {
+                surface.reapplyPresentationMode()
+                renderer.resumePresentation(view: surface)
+            }
             reportFullscreen(isFullscreen)
         } else {
             fullscreenTogglePending = true
@@ -295,6 +303,7 @@ final class SurfaceHostView: NSScrollView {
             $0.logger.info("fullscreen did enter")
             $0.fullscreenTogglePending = false
             $0.fullscreenTransitionActive = false
+            $0.surface.reapplyPresentationMode()
             $0.renderer.resumePresentation(view: $0.surface)
             // Track the completed window state locally before SwiftUI
             // propagates the callback. Otherwise applyFullscreen can see the
@@ -308,6 +317,7 @@ final class SurfaceHostView: NSScrollView {
             $0.logger.info("fullscreen did exit")
             $0.fullscreenTogglePending = false
             $0.fullscreenTransitionActive = false
+            $0.surface.reapplyPresentationMode()
             $0.renderer.resumePresentation(view: $0.surface)
             $0.wantsFullscreen = false
             $0.hasFullscreenIntent = true

@@ -204,6 +204,7 @@ final class StreamSession: ObservableObject {
             self?.decodeQueue.async {
                 guard let self else { return }
                 self.stats.presented += 1
+                self.stats.presentationCadence.observe(timing.presentedMicros)
                 if let captureClientMicros = timing.captureClientMicros {
                     self.stats.captureToPresented.add(
                         Int64(timing.presentedMicros) - Int64(captureClientMicros)
@@ -224,6 +225,7 @@ final class StreamSession: ObservableObject {
             self?.decodeQueue.async {
                 guard let self else { return }
                 self.stats.rendered += 1
+                self.stats.renderCadence.observe(timing.completedMicros)
                 if let captureClientMicros = timing.captureClientMicros {
                     self.stats.captureToRendered.add(
                         Int64(timing.completedMicros) - Int64(captureClientMicros)
@@ -281,6 +283,8 @@ final class StreamSession: ObservableObject {
     /// (stamped on the receive thread, before any queueing).
     private func handleArrival(_ accessUnit: Reassembler.AccessUnit, arrivedMicros: UInt64) {
         stats.completed += 1
+        stats.captureCadence.observe(accessUnit.timestampMicros)
+        stats.arrivalCadence.observe(arrivedMicros)
         if let captureClient = clockOffset.clientMicros(forAgentMicros: accessUnit.timestampMicros) {
             stats.captureToArrival.add(Int64(arrivedMicros) - captureClient)
         }
@@ -320,9 +324,11 @@ final class StreamSession: ObservableObject {
         stats.decoded += 1
         stats.decodeMilliseconds += decoder.lastDecodeMilliseconds
         stats.prepareMilliseconds += decoder.lastPrepareMilliseconds
+        let decodedMicros = ClientClock.nowMicros()
+        stats.decodeCadence.observe(decodedMicros)
         let captureClient = clockOffset.clientMicros(forAgentMicros: timestampMicros)
         if let captureClient {
-            stats.captureToDecoded.add(Int64(ClientClock.nowMicros()) - captureClient)
+            stats.captureToDecoded.add(Int64(decodedMicros) - captureClient)
         }
         renderer.display(pixelBuffer, captureClientMicros: captureClient.map { UInt64(max(0, $0)) })
         if case .waitingForKeyframe = state, let hello {

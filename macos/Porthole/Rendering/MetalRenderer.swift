@@ -429,18 +429,26 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         let fills = fillsDrawable
         frameLock.unlock()
 
+        let drawableSize = CGSize(width: drawable.texture.width, height: drawable.texture.height)
+        let coversDrawable = Self.videoCoversDrawable(frame: frame,
+                                                      fills: fills,
+                                                      drawableSize: drawableSize)
         let renderPass = MTLRenderPassDescriptor()
         renderPass.colorAttachments[0].texture = drawable.texture
-        renderPass.colorAttachments[0].loadAction = .clear
+        renderPass.colorAttachments[0].loadAction = coversDrawable ? .dontCare : .clear
         renderPass.colorAttachments[0].storeAction = .store
-        renderPass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        if !coversDrawable {
+            renderPass.colorAttachments[0].clearColor = MTLClearColor(red: 0,
+                                                                      green: 0,
+                                                                      blue: 0,
+                                                                      alpha: 1)
+        }
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPass) else {
             releaseRenderSlot(token: token, after: nil)
             return
         }
 
         let drawStartedMicros = ClientClock.nowMicros()
-        let drawableSize = CGSize(width: drawable.texture.width, height: drawable.texture.height)
         guard drawVideo(frame: frame,
                         colors: colors,
                         fills: fills,
@@ -541,6 +549,20 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     }
 
     // MARK: Stream video (US-005)
+
+    /// Avoid loading/clearing a drawable that the video fully overwrites.
+    private static func videoCoversDrawable(frame: StreamFrame, fills: Bool,
+                                            drawableSize: CGSize) -> Bool {
+        if fills { return true }
+        guard frame.width > 0, frame.height > 0, drawableSize.width > 0,
+              drawableSize.height > 0 else { return false }
+        let widthAtDrawableHeight = CGFloat(frame.width) * drawableSize.height
+            / CGFloat(frame.height)
+        let heightAtDrawableWidth = CGFloat(frame.height) * drawableSize.width
+            / CGFloat(frame.width)
+        return abs(widthAtDrawableHeight - drawableSize.width) < 0.5
+            && abs(heightAtDrawableWidth - drawableSize.height) < 0.5
+    }
 
     /// Returns false when textures could not be produced; the caller falls
     /// back to the test pattern for this draw.
