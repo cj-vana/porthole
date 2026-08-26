@@ -1,5 +1,6 @@
 import AppKit
 import MetalKit
+import os
 
 /// The Metal surface, with input capture (US-006). First responder while
 /// clicked into; NSEvents forward to InputController. Input flows only while
@@ -8,6 +9,42 @@ import MetalKit
 final class SessionSurfaceView: MTKView {
     var inputHandler: InputController?
 
+    /// Display link target; 0 means auto, the screen's maximum. Re-resolved
+    /// when the view lands in a window and when that window changes screen,
+    /// because a 60 Hz panel and a 144 Hz panel can be one drag apart.
+    var targetFrameRate = 0 {
+        didSet {
+            if oldValue != targetFrameRate {
+                applyFrameRate()
+            }
+        }
+    }
+
+    /// Mirrors InputController's lock state so its transitions refresh the
+    /// cursor rects; the rects themselves read the controller.
+    var pointerLocked = false {
+        didSet {
+            if oldValue != pointerLocked {
+                refreshCursor()
+            }
+        }
+    }
+
+    private var screenObserver: NSObjectProtocol?
+    private let logger = Logger(subsystem: "com.porthole.mac", category: "surface")
+
+    /// Shown over the surface while input is captured and pointer lock is
+    /// off. The remote cursor is composited into the stream (headless
+    /// outputs have no hardware cursor plane), so with the local arrow also
+    /// visible there are two cursors on screen and any latency looks worse
+    /// than it is. Cursor rects are window-scoped and stateless, unlike
+    /// NSCursor.hide/unhide, so leaving the surface brings the arrow back
+    /// with no bookkeeping.
+    private static let transparentCursor: NSCursor = {
+        let image = NSImage(size: NSSize(width: 1, height: 1), flipped: false) { _ in true }
+        return NSCursor(image: image, hotSpot: .zero)
+    }()
+
     /// Top-left origin, matching remote output pixels and the letterbox math.
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -15,6 +52,12 @@ final class SessionSurfaceView: MTKView {
     /// Let the window-activating click land on the view (and thus the remote
     /// desktop) instead of being eaten by activation.
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    deinit {
+        if let screenObserver {
+            NotificationCenter.default.removeObserver(screenObserver)
+        }
+    }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -27,15 +70,60 @@ final class SessionSurfaceView: MTKView {
                                        userInfo: nil))
     }
 
+    // MARK: Display link rate
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if screenObserver == nil {
+            screenObserver = NotificationCenter.default.addObserver(forName: NSWindow.didChangeScreenNotification,
+                                                                    object: nil,
+                                                                    queue: .main) { [weak self] notification in
+                guard let self, let window = self.window,
+                      (notification.object as? NSWindow) === window else { return }
+                self.applyFrameRate()
+            }
+        }
+        applyFrameRate()
+    }
+
+    private func applyFrameRate() {
+        let resolved: Int
+        if targetFrameRate > 0 {
+            resolved = targetFrameRate
+        } else {
+            let maximum = (window?.screen ?? NSScreen.main)?.maximumFramesPerSecond ?? 0
+            resolved = maximum > 0 ? maximum : 60
+        }
+        if preferredFramesPerSecond != resolved {
+            preferredFramesPerSecond = resolved
+            let screenMax = (window?.screen ?? NSScreen.main)?.maximumFramesPerSecond ?? 0
+            logger.info("display link \(resolved) Hz (target \(self.targetFrameRate), screen max \(screenMax))")
+        }
+    }
+
+    // MARK: Cursor
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        guard let inputHandler, inputHandler.isCaptured, !inputHandler.isPointerLocked else { return }
+        addCursorRect(bounds, cursor: Self.transparentCursor)
+    }
+
+    private func refreshCursor() {
+        window?.invalidateCursorRects(for: self)
+    }
+
     // MARK: Focus
 
     override func becomeFirstResponder() -> Bool {
         inputHandler?.setCaptured(true)
+        refreshCursor()
         return true
     }
 
     override func resignFirstResponder() -> Bool {
         inputHandler?.setCaptured(false)
+        refreshCursor()
         return true
     }
 

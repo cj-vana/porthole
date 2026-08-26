@@ -9,10 +9,11 @@ import SwiftUI
 /// Seam (PRD US-013): the header will become the real auto-hiding session
 /// toolbar with display-mode and gaming-mode toggles.
 struct SessionView: View {
-    /// Target frame rate for the render surface (60/120/144), persisted across
-    /// launches. Previews the per-machine streaming-rate setting the session
-    /// toolbar will own (PRD US-013 gaming mode offers 60/120/144 fps).
-    @AppStorage("targetFrameRate") private var targetFrameRate = 60
+    /// Target frame rate for the render surface, persisted across launches:
+    /// 0 is Auto (the screen's maximum refresh rate), else 60/120/144.
+    /// Previews the per-machine streaming-rate setting the session toolbar
+    /// will own (PRD US-013 gaming mode offers 60/120/144 fps).
+    @AppStorage("targetFrameRate") private var targetFrameRate = 0
     /// When off, Cmd chords stay with macOS; when on, they forward to the
     /// remote machine best effort (Cmd+Tab and Spotlight's Cmd+Space are
     /// intercepted by macOS before the app sees them regardless).
@@ -33,6 +34,7 @@ struct SessionView: View {
     var body: some View {
         ZStack(alignment: .top) {
             MetalSurfaceView(frameRate: targetFrameRate,
+                             pointerLocked: session.pointerLockActive,
                              renderer: session.renderer,
                              input: session.input)
 
@@ -89,14 +91,21 @@ struct SessionView: View {
             Text(statusText)
                 .font(.callout)
                 .foregroundStyle(.secondary)
+            if case .live = session.state {
+                Text(session.latency.summary)
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .help("Capture to pixels on screen, and control round trip; n/a until the agent answers a ping")
+            }
             Picker("Frame rate", selection: $targetFrameRate) {
+                Text("Auto").tag(0)
                 Text("60").tag(60)
                 Text("120").tag(120)
                 Text("144").tag(144)
             }
             .pickerStyle(.segmented)
             .fixedSize()
-            .help("Target frame rate (above 60 fps requires a ProMotion / high-refresh display)")
+            .help("Display link rate; Auto follows the screen the window is on")
             Toggle("Shortcuts", isOn: $sendSystemShortcuts)
                 .toggleStyle(.switch)
                 .controlSize(.small)

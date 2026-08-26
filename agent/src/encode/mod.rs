@@ -107,6 +107,10 @@ pub struct EncodedFrame {
     pub data: Vec<u8>,
     /// Whether this access unit contains an IDR (decoder can resync from it).
     pub is_keyframe: bool,
+    /// When the access unit was cut from the encoder's output. The pipeline
+    /// drains once per captured frame, so measuring encode latency at drain
+    /// time would report the capture cadence rather than the encoder.
+    pub ready_at: std::time::Instant,
 }
 
 /// A hardware encoder instance (NVENC on the dGPU, or VAAPI on the iGPU).

@@ -213,6 +213,9 @@ impl WaylandInput {
 
     fn apply(&self, event: InputEvent) {
         let time = self.time_ms();
+        // Every pointer request ends with frame(): the compositor delivers
+        // pointer events to clients per frame, and toolkits hold a motion or
+        // button without one until the next frame arrives.
         match event {
             InputEvent::PointerMotionAbs { x, y } => {
                 self.pointer.motion_absolute(
@@ -222,10 +225,12 @@ impl WaylandInput {
                     self.output_width,
                     self.output_height,
                 );
+                self.pointer.frame();
             }
             InputEvent::PointerMotionRel { dx256, dy256 } => {
                 self.pointer
                     .motion(time, dx256 as f64 / 256.0, dy256 as f64 / 256.0);
+                self.pointer.frame();
             }
             InputEvent::PointerButton { button, pressed } => {
                 let state = if pressed {
@@ -234,6 +239,7 @@ impl WaylandInput {
                     wl_pointer::ButtonState::Released
                 };
                 self.pointer.button(time, u32::from(button), state);
+                self.pointer.frame();
             }
             InputEvent::PointerAxis {
                 axis,

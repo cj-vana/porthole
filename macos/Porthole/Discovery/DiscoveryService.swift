@@ -91,7 +91,10 @@ extension DiscoveryService: NetServiceDelegate {
             logger.warning("\(service.name, privacy: .public) has an unsupported TXT record")
             return
         }
-        logger.info("resolved \(machine.name, privacy: .public) at \(machine.host, privacy: .public):\(machine.controlPort) candidates \(machine.addressCandidates, privacy: .public)")
+        logger.info("""
+            resolved \(machine.name, privacy: .public) at \(machine.host, privacy: .public):\(machine.controlPort) \
+            candidates \(machine.addressCandidates, privacy: .public)
+            """)
         emit(.online(machine))
     }
 

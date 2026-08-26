@@ -18,6 +18,14 @@ enum ControlMessageType: UInt8 {
     case hello = 0x01
     /// client -> agent, empty payload. Ask for a fresh IDR.
     case keyframeRequest = 0x02
+    /// client -> agent latency probe: 8-byte client monotonic timestamp (us).
+    case ping = 0x03
+    /// agent -> client answer to ping: echoed client timestamp + agent
+    /// pipeline timestamp (the video datagram clock), 16 bytes.
+    case pong = 0x04
+    /// agent -> client once per second: capture/encode fps, encode latency,
+    /// transmit rate, keyframes. 14 bytes.
+    case agentStats = 0x05
     // Input messages (client -> agent, US-006). Layouts in docs/protocol.md.
     case pointerMotionAbs = 0x10
     case pointerMotionRel = 0x11
@@ -70,7 +78,63 @@ struct Hello: Equatable {
     }
 }
 
+/// Parsed `pong` (agent -> client).
+///
+/// ```
+/// offset  size  field
+/// 0       8     echoed client timestamp (BE u64, microseconds)
+/// 8       8     agent timestamp (BE u64, microseconds since pipeline start)
+/// ```
+struct Pong: Equatable {
+    static let payloadLength = 16
+
+    let clientTimestampMicros: UInt64
+    let agentTimestampMicros: UInt64
+
+    init?(payload: Data) {
+        guard payload.count == Self.payloadLength else { return nil }
+        clientTimestampMicros = payload.readUInt64BE(at: 0)
+        agentTimestampMicros = payload.readUInt64BE(at: 8)
+    }
+}
+
+/// Parsed `agent_stats` (agent -> client, once per second).
+///
+/// ```
+/// offset  size  field
+/// 0       2     capture fps (BE u16)
+/// 2       2     encoded fps (BE u16)
+/// 4       4     encode latency, microseconds (BE u32), mean over the second
+/// 8       4     transmit rate, kbit/s (BE u32)
+/// 12      2     keyframes encoded in the second (BE u16)
+/// ```
+struct AgentStats: Equatable {
+    static let payloadLength = 14
+
+    let captureFps: UInt16
+    let encodeFps: UInt16
+    let encodeLatencyMicros: UInt32
+    let txKbps: UInt32
+    let keyframes: UInt16
+
+    init?(payload: Data) {
+        guard payload.count == Self.payloadLength else { return nil }
+        captureFps = payload.readUInt16BE(at: 0)
+        encodeFps = payload.readUInt16BE(at: 2)
+        encodeLatencyMicros = payload.readUInt32BE(at: 4)
+        txKbps = payload.readUInt32BE(at: 8)
+        keyframes = payload.readUInt16BE(at: 12)
+    }
+}
+
 extension WireProtocol {
+    /// Encode a `ping` control frame carrying the client's monotonic clock.
+    static func encodePing(clientTimestampMicros: UInt64) -> Data {
+        var payload = Data(capacity: 8)
+        payload.appendUInt64BE(clientTimestampMicros)
+        return encodeControlMessage(.ping, payload: payload)
+    }
+
     /// Header of one video datagram fragment (25 bytes, fixed):
     ///
     /// ```
@@ -170,5 +234,10 @@ extension Data {
         append(UInt8(truncatingIfNeeded: value >> 16))
         append(UInt8(truncatingIfNeeded: value >> 8))
         append(UInt8(truncatingIfNeeded: value))
+    }
+
+    mutating func appendUInt64BE(_ value: UInt64) {
+        appendUInt32BE(UInt32(truncatingIfNeeded: value >> 32))
+        appendUInt32BE(UInt32(truncatingIfNeeded: value))
     }
 }

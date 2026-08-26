@@ -7,10 +7,11 @@
 //! format on GPU; no CPU swscale runs.
 
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
 
@@ -19,9 +20,77 @@ use super::{Codec, EncodedFrame, Encoder, EncoderBackend};
 use crate::capture::{CaptureFormat, RawFrame};
 use crate::config::Config;
 
-/// AMD iGPU render node for VAAPI, resolved by PCI path so the renderD
-/// number does not matter.
-const VAAPI_DEVICE: &str = "/dev/dri/by-path/pci-0000:0b:00.0-render";
+/// A DRM render node and the kernel driver bound to its device.
+type RenderNode = (PathBuf, String);
+
+/// Kernel drivers with a VAAPI backend, in preference order. The AMD iGPU
+/// comes first because that is the whole point of the VAAPI path: leave the
+/// dGPU free for games.
+const VAAPI_PREFERRED_DRIVERS: [&str; 3] = ["amdgpu", "i915", "xe"];
+
+/// Every /dev/dri/renderD* node with its driver name, read from the
+/// /sys/class/drm/<node>/device/driver symlink. Sorted by path so the
+/// "first usable" fallback is stable across runs.
+fn list_render_nodes() -> anyhow::Result<Vec<RenderNode>> {
+    let mut nodes = Vec::new();
+    for entry in std::fs::read_dir("/dev/dri").context("cannot list /dev/dri")? {
+        let entry = entry.context("cannot read /dev/dri entry")?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str().filter(|n| n.starts_with("renderD")) else {
+            continue;
+        };
+        let driver_link = Path::new("/sys/class/drm").join(name).join("device/driver");
+        let driver = match std::fs::read_link(&driver_link) {
+            Ok(target) => target
+                .file_name()
+                .map(|d| d.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            Err(err) => {
+                tracing::debug!(node = name, %err, "no driver symlink for render node, skipping");
+                continue;
+            }
+        };
+        nodes.push((entry.path(), driver));
+    }
+    nodes.sort();
+    Ok(nodes)
+}
+
+/// Pick the render node for VAAPI: never nvidia (its driver has no VAAPI
+/// backend), one of [`VAAPI_PREFERRED_DRIVERS`] when present, otherwise the
+/// first remaining node.
+fn pick_vaapi_node(nodes: &[RenderNode]) -> Option<&RenderNode> {
+    let usable = || nodes.iter().filter(|(_, driver)| driver != "nvidia");
+    VAAPI_PREFERRED_DRIVERS
+        .iter()
+        .find_map(|preferred| usable().find(|(_, driver)| driver == preferred))
+        .or_else(|| usable().next())
+}
+
+/// The configured VAAPI device, or the auto-detected one.
+fn resolve_vaapi_device(cfg: &Config) -> anyhow::Result<PathBuf> {
+    if let Some(path) = &cfg.vaapi_device {
+        tracing::info!(device = %path.display(), "vaapi device from configuration");
+        return Ok(path.clone());
+    }
+    let nodes = list_render_nodes()?;
+    let (path, driver) = pick_vaapi_node(&nodes).with_context(|| {
+        let seen: Vec<String> = nodes
+            .iter()
+            .map(|(p, d)| format!("{} ({d})", p.display()))
+            .collect();
+        format!(
+            "no usable VAAPI render node in /dev/dri (found: {}); set --vaapi-device",
+            if seen.is_empty() {
+                "none".to_string()
+            } else {
+                seen.join(", ")
+            }
+        )
+    })?;
+    tracing::info!(device = %path.display(), driver, "vaapi device auto-detected");
+    Ok(path.clone())
+}
 
 fn ffmpeg_encoder_name(codec: Codec, backend: EncoderBackend) -> &'static str {
     match (backend, codec) {
@@ -78,24 +147,49 @@ impl FfmpegEncoder {
                 // conversion ignores setparams for the matrix and tags
                 // bt470bg with bgra input, so we convert to nv12 in the
                 // filter chain (CPU swscale, measured cheap at 1440p60).
-                // `ll` tune: zero-latency mode, no B-frame reordering.
                 cmd.args([
                     "-vf",
                     "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,format=nv12",
                     "-preset",
                     "p3",
+                    // ll: low-latency tune, single pass, no lookahead.
                     "-tune",
                     "ll",
+                    // delay 0: emit each access unit as soon as it is encoded;
+                    // the default INT_MAX holds several frames in ffmpeg.
+                    "-delay",
+                    "0",
+                    // zerolatency: no reordering delay inside NVENC itself.
+                    "-zerolatency",
+                    "1",
+                    // bf 0: no B-frames, so no frame waits on a later one.
+                    "-bf",
+                    "0",
+                    // rc cbr: constant bitrate keeps per-frame size, and so
+                    // transmit time, predictable.
+                    "-rc",
+                    "cbr",
                 ]);
             }
             EncoderBackend::Vaapi => {
                 // Tag BT.709, upload, then convert to nv12 on the iGPU.
-                cmd.args([
-                    "-vaapi_device",
-                    VAAPI_DEVICE,
-                    "-vf",
-                    "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,hwupload,scale_vaapi=format=nv12",
-                ]);
+                cmd.arg("-vaapi_device")
+                    .arg(resolve_vaapi_device(cfg)?)
+                    .args([
+                        "-vf",
+                        "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,hwupload,scale_vaapi=format=nv12",
+                        // bf 0: no B-frames, so no frame waits on a later one.
+                        "-bf",
+                        "0",
+                        // async_depth 1: one frame in flight; the default 2
+                        // pipelines a frame of extra delay for throughput.
+                        "-async_depth",
+                        "1",
+                        // rc_mode CBR: constant bitrate keeps per-frame size,
+                        // and so transmit time, predictable.
+                        "-rc_mode",
+                        "CBR",
+                    ]);
             }
         }
         cmd.args([
@@ -155,6 +249,7 @@ fn read_access_units(stdout: &mut impl Read, codec: Codec, tx: mpsc::Sender<Enco
             sequence,
             data: au,
             is_keyframe,
+            ready_at: Instant::now(),
         };
         sequence += 1;
         if tx.send(frame).is_err() {
@@ -234,5 +329,71 @@ impl Drop for FfmpegEncoder {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nodes(pairs: &[(&str, &str)]) -> Vec<RenderNode> {
+        pairs
+            .iter()
+            .map(|(p, d)| (PathBuf::from(p), d.to_string()))
+            .collect()
+    }
+
+    fn pick(pairs: &[(&str, &str)]) -> Option<String> {
+        pick_vaapi_node(&nodes(pairs)).map(|(p, _)| p.display().to_string())
+    }
+
+    #[test]
+    fn vaapi_node_prefers_amdgpu_and_skips_nvidia() {
+        // The target box: dGPU on renderD128, iGPU on renderD129.
+        assert_eq!(
+            pick(&[
+                ("/dev/dri/renderD128", "nvidia"),
+                ("/dev/dri/renderD129", "amdgpu")
+            ])
+            .as_deref(),
+            Some("/dev/dri/renderD129")
+        );
+        // Preference order holds regardless of node order.
+        assert_eq!(
+            pick(&[
+                ("/dev/dri/renderD128", "xe"),
+                ("/dev/dri/renderD129", "i915"),
+                ("/dev/dri/renderD130", "amdgpu")
+            ])
+            .as_deref(),
+            Some("/dev/dri/renderD130")
+        );
+        assert_eq!(
+            pick(&[
+                ("/dev/dri/renderD128", "xe"),
+                ("/dev/dri/renderD129", "i915")
+            ])
+            .as_deref(),
+            Some("/dev/dri/renderD129")
+        );
+    }
+
+    #[test]
+    fn vaapi_node_falls_back_to_first_non_nvidia() {
+        assert_eq!(
+            pick(&[
+                ("/dev/dri/renderD128", "nvidia"),
+                ("/dev/dri/renderD129", "virtio_gpu"),
+                ("/dev/dri/renderD130", "nouveau")
+            ])
+            .as_deref(),
+            Some("/dev/dri/renderD129")
+        );
+    }
+
+    #[test]
+    fn vaapi_node_none_when_only_nvidia() {
+        assert_eq!(pick(&[("/dev/dri/renderD128", "nvidia")]), None);
+        assert_eq!(pick(&[]), None);
     }
 }

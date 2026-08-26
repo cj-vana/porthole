@@ -20,8 +20,10 @@ struct H264SPS {
     /// unrecognized. Callers should fall back to BT.709 for HD content.
     let colorMatrix: ColorMatrix?
 
-    /// Parse an SPS NAL unit including its 1-byte NAL header (0x67).
-    init?(nal: Data) {
+    /// Parse an SPS NAL unit including its 1-byte NAL header (0x67). One
+    /// pass in the spec's field order, hence the lint exemption: splitting
+    /// it means threading the bit reader through helpers for no gain.
+    init?(nal: Data) { // swiftlint:disable:this cyclomatic_complexity function_body_length
         guard nal.count > 1, nal[0] & 0x1F == AnnexB.NALType.sps.rawValue else { return nil }
         var reader = BitReader(H264SPS.rbsp(from: nal))
 

@@ -20,6 +20,13 @@ pub const DEFAULT_PORT_THUMBNAIL: u16 = 52803;
 pub const DEFAULT_BITRATE_MBPS: u32 = 40;
 pub const DEFAULT_FPS: u16 = 60;
 pub const DEFAULT_KEYFRAME_INTERVAL_SECS: u32 = 2;
+/// Path MTU the video datagrams are sized for. 1280 fits the IPv6 minimum
+/// and WireGuard/Tailscale tunnels; 1500 is plain Ethernet.
+pub const DEFAULT_MTU: u16 = 1280;
+/// IPv4's minimum reassembly size, the smallest MTU worth streaming over.
+pub const MIN_MTU: u16 = 576;
+/// Jumbo Ethernet; the protocol clamps datagrams to its own ceiling anyway.
+pub const MAX_MTU: u16 = 9000;
 
 /// Default machine name for discovery (FR-8): the system hostname, short
 /// form (no domain).
@@ -103,6 +110,62 @@ impl Serialize for Fps {
 }
 
 impl<'de> Deserialize<'de> for Fps {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = u16::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A validated path MTU in bytes, 576..=9000, from both the CLI (via
+/// `FromStr`) and the TOML file (via `Deserialize`). The transport sizes
+/// video datagrams from it so they never get IP-fragmented in transit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mtu(u16);
+
+impl Mtu {
+    pub fn new(value: u16) -> anyhow::Result<Self> {
+        if (MIN_MTU..=MAX_MTU).contains(&value) {
+            Ok(Self(value))
+        } else {
+            bail!("invalid mtu {value} (expected {MIN_MTU}..={MAX_MTU})");
+        }
+    }
+
+    pub fn get(self) -> u16 {
+        self.0
+    }
+}
+
+impl Default for Mtu {
+    fn default() -> Self {
+        Self(DEFAULT_MTU)
+    }
+}
+
+impl fmt::Display for Mtu {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for Mtu {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let value: u16 = s
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid mtu {s:?} (expected {MIN_MTU}..={MAX_MTU})"))?;
+        Self::new(value)
+    }
+}
+
+impl Serialize for Mtu {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u16(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Mtu {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = u16::deserialize(deserializer)?;
         Self::new(value).map_err(serde::de::Error::custom)
@@ -195,6 +258,14 @@ pub struct Config {
     /// US-015). When set and no physical output is attached, a Hyprland
     /// headless output at this geometry is created and captured.
     pub virtual_display: Option<VirtualDisplay>,
+    /// Path MTU the video datagrams are sized for (default 1280: fits the
+    /// IPv6 minimum and WireGuard/Tailscale tunnels; 1500 for plain
+    /// Ethernet).
+    pub mtu: Mtu,
+    /// DRM render node for the VAAPI encoder (default unset: auto-detected
+    /// at encoder start from /dev/dri, preferring amdgpu, i915, then xe,
+    /// never nvidia).
+    pub vaapi_device: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -211,6 +282,8 @@ impl Default for Config {
             encoder: EncoderBackend::default(),
             fps: Fps::default(),
             virtual_display: None,
+            mtu: Mtu::default(),
+            vaapi_device: None,
         }
     }
 }
@@ -248,6 +321,8 @@ pub struct FileConfig {
     pub encoder: Option<EncoderBackend>,
     pub fps: Option<Fps>,
     pub virtual_display: Option<VirtualDisplay>,
+    pub mtu: Option<Mtu>,
+    pub vaapi_device: Option<PathBuf>,
     // TODO(FR-11): display index/output name, file-transfer folder (US-011,
     // default ~/Downloads), mDNS service name (US-007).
 }
@@ -286,6 +361,12 @@ impl FileConfig {
         }
         if let Some(v) = self.virtual_display {
             cfg.virtual_display = Some(v);
+        }
+        if let Some(v) = self.mtu {
+            cfg.mtu = v;
+        }
+        if let Some(v) = self.vaapi_device {
+            cfg.vaapi_device = Some(v);
         }
     }
 }
@@ -337,6 +418,34 @@ mod tests {
         assert_eq!(cfg.encoder, EncoderBackend::Nvenc);
         assert_eq!(cfg.fps.get(), 60);
         assert_eq!(cfg.virtual_display, None);
+        assert_eq!(cfg.mtu.get(), 1280);
+        assert_eq!(cfg.vaapi_device, None);
+    }
+
+    #[test]
+    fn mtu_bounds() {
+        assert_eq!("1280".parse::<Mtu>().unwrap().get(), 1280);
+        assert_eq!("576".parse::<Mtu>().unwrap().get(), 576);
+        assert_eq!("9000".parse::<Mtu>().unwrap().get(), 9000);
+        assert!("575".parse::<Mtu>().is_err());
+        assert!("9001".parse::<Mtu>().is_err());
+        assert!("jumbo".parse::<Mtu>().is_err());
+        // Same validation from the TOML side.
+        assert!(toml::from_str::<FileConfig>("mtu = 100").is_err());
+        let file_cfg: FileConfig = toml::from_str("mtu = 1500").unwrap();
+        assert_eq!(file_cfg.mtu.unwrap().get(), 1500);
+    }
+
+    #[test]
+    fn vaapi_device_toml_parse() {
+        let file_cfg: FileConfig =
+            toml::from_str(r#"vaapi_device = "/dev/dri/renderD129""#).unwrap();
+        let mut cfg = Config::default();
+        file_cfg.merge_into(&mut cfg);
+        assert_eq!(
+            cfg.vaapi_device.as_deref(),
+            Some(Path::new("/dev/dri/renderD129"))
+        );
     }
 
     #[test]

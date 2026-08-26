@@ -14,15 +14,127 @@ pub const VIDEO_MAGIC: [u8; 3] = *b"PHV";
 pub const PROTOCOL_VERSION: u8 = 1;
 /// Video datagram header length in bytes.
 pub const VIDEO_HEADER_LEN: usize = 25;
-/// Maximum UDP payload (datagram) size; safe under a 1500-byte MTU.
+/// Datagram size ceiling; safe under a 1500-byte MTU. Receivers accept
+/// anything up to this.
 pub const MAX_DATAGRAM_SIZE: usize = 1400;
-/// Maximum access-unit payload per datagram.
+/// Largest access-unit payload per datagram at the ceiling.
 pub const MAX_FRAGMENT_PAYLOAD: usize = MAX_DATAGRAM_SIZE - VIDEO_HEADER_LEN;
+/// Smallest datagram size worth fragmenting at (header plus some payload).
+pub const MIN_DATAGRAM_SIZE: usize = 200;
+/// IPv4 header (20) plus UDP header (8): the bytes an MTU spends before
+/// the datagram payload starts.
+pub const IP_UDP_OVERHEAD: usize = 28;
+
+/// Datagram size for a path MTU, clamped to the protocol's bounds. The
+/// default agent MTU of 1280 (IPv6 minimum, WireGuard/Tailscale tunnel
+/// MTU) gives 1252-byte datagrams.
+pub fn datagram_size_for_mtu(mtu: usize) -> usize {
+    mtu.saturating_sub(IP_UDP_OVERHEAD)
+        .clamp(MIN_DATAGRAM_SIZE, MAX_DATAGRAM_SIZE)
+}
 
 /// Control message type: server -> client stream parameters.
 pub const CONTROL_MSG_HELLO: u8 = 1;
 /// Control message type: client -> server, please send a fresh IDR.
 pub const CONTROL_MSG_KEYFRAME_REQUEST: u8 = 2;
+/// Control message type: client -> agent latency probe.
+pub const CONTROL_MSG_PING: u8 = 3;
+/// Control message type: agent -> client answer to a ping.
+pub const CONTROL_MSG_PONG: u8 = 4;
+/// Control message type: agent -> client per-second pipeline stats.
+pub const CONTROL_MSG_AGENT_STATS: u8 = 5;
+
+/// ping payload: the client's own monotonic timestamp in microseconds.
+pub const PING_PAYLOAD_LEN: usize = 8;
+/// pong payload: echoed client timestamp + agent pipeline timestamp.
+pub const PONG_PAYLOAD_LEN: usize = 16;
+/// agent_stats payload length.
+pub const AGENT_STATS_PAYLOAD_LEN: usize = 14;
+
+/// Client latency probe (docs/protocol.md "ping").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ping {
+    pub client_timestamp_us: u64,
+}
+
+impl Ping {
+    pub fn encode(&self) -> Vec<u8> {
+        self.client_timestamp_us.to_be_bytes().to_vec()
+    }
+
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        if payload.len() != PING_PAYLOAD_LEN {
+            return None;
+        }
+        Some(Self {
+            client_timestamp_us: u64::from_be_bytes(payload[0..8].try_into().ok()?),
+        })
+    }
+}
+
+/// Agent answer to a ping: the client's timestamp back, plus the agent's
+/// pipeline clock (same clock as the video datagram timestamps).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pong {
+    pub client_timestamp_us: u64,
+    pub agent_timestamp_us: u64,
+}
+
+impl Pong {
+    pub fn encode(&self) -> Vec<u8> {
+        [
+            self.client_timestamp_us.to_be_bytes(),
+            self.agent_timestamp_us.to_be_bytes(),
+        ]
+        .concat()
+    }
+
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        if payload.len() != PONG_PAYLOAD_LEN {
+            return None;
+        }
+        Some(Self {
+            client_timestamp_us: u64::from_be_bytes(payload[0..8].try_into().ok()?),
+            agent_timestamp_us: u64::from_be_bytes(payload[8..16].try_into().ok()?),
+        })
+    }
+}
+
+/// Per-second agent pipeline stats (docs/protocol.md "agent_stats").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AgentStats {
+    pub capture_fps: u16,
+    pub encode_fps: u16,
+    /// Mean submit-to-access-unit latency over the last second.
+    pub encode_latency_us: u32,
+    pub tx_kbps: u32,
+    pub keyframes: u16,
+}
+
+impl AgentStats {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(AGENT_STATS_PAYLOAD_LEN);
+        out.extend_from_slice(&self.capture_fps.to_be_bytes());
+        out.extend_from_slice(&self.encode_fps.to_be_bytes());
+        out.extend_from_slice(&self.encode_latency_us.to_be_bytes());
+        out.extend_from_slice(&self.tx_kbps.to_be_bytes());
+        out.extend_from_slice(&self.keyframes.to_be_bytes());
+        out
+    }
+
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        if payload.len() != AGENT_STATS_PAYLOAD_LEN {
+            return None;
+        }
+        Some(Self {
+            capture_fps: u16::from_be_bytes(payload[0..2].try_into().ok()?),
+            encode_fps: u16::from_be_bytes(payload[2..4].try_into().ok()?),
+            encode_latency_us: u32::from_be_bytes(payload[4..8].try_into().ok()?),
+            tx_kbps: u32::from_be_bytes(payload[8..12].try_into().ok()?),
+            keyframes: u16::from_be_bytes(payload[12..14].try_into().ok()?),
+        })
+    }
+}
 
 // Input messages (client -> agent, US-006). All are fixed-size.
 /// Pointer moved to absolute output pixel coordinates.
@@ -95,11 +207,7 @@ impl InputEvent {
                 value256,
             } => (
                 CONTROL_MSG_POINTER_AXIS,
-                [
-                    &[axis, source][..],
-                    value256.to_be_bytes().as_slice(),
-                ]
-                .concat(),
+                [&[axis, source][..], value256.to_be_bytes().as_slice()].concat(),
             ),
             Self::Key { code, pressed } => (
                 CONTROL_MSG_KEY,
@@ -174,7 +282,6 @@ pub fn write_input_event(stream: &mut impl Write, event: &InputEvent) -> std::io
     write_control_message(stream, msg_type, &payload)
 }
 
-
 /// Codec tag on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecTag {
@@ -205,11 +312,20 @@ pub struct VideoHeader {
     pub is_keyframe: bool,
 }
 
-/// Fragment one access unit into MTU-safe datagrams (header + payload each).
-pub fn fragment(au: &[u8], frame_seq: u64, timestamp_us: u64, is_keyframe: bool) -> Vec<Vec<u8>> {
-    let frag_count = au.len().div_ceil(MAX_FRAGMENT_PAYLOAD).max(1) as u16;
+/// Fragment one access unit into datagrams of at most `datagram_size`
+/// bytes (header + payload each). Sizes outside the protocol bounds are
+/// clamped; see [`datagram_size_for_mtu`].
+pub fn fragment(
+    au: &[u8],
+    frame_seq: u64,
+    timestamp_us: u64,
+    is_keyframe: bool,
+    datagram_size: usize,
+) -> Vec<Vec<u8>> {
+    let payload_size = datagram_size.clamp(MIN_DATAGRAM_SIZE, MAX_DATAGRAM_SIZE) - VIDEO_HEADER_LEN;
+    let frag_count = au.len().div_ceil(payload_size).max(1) as u16;
     let mut out = Vec::with_capacity(frag_count as usize);
-    for (index, chunk) in au.chunks(MAX_FRAGMENT_PAYLOAD).enumerate() {
+    for (index, chunk) in au.chunks(payload_size).enumerate() {
         let mut dgram = Vec::with_capacity(VIDEO_HEADER_LEN + chunk.len());
         dgram.extend_from_slice(&VIDEO_MAGIC);
         dgram.push(PROTOCOL_VERSION);
@@ -416,7 +532,11 @@ pub fn encode_control_message(msg_type: u8, payload: &[u8]) -> Vec<u8> {
 }
 
 /// Write one framed control message to a stream.
-pub fn write_control_message(stream: &mut impl Write, msg_type: u8, payload: &[u8]) -> std::io::Result<()> {
+pub fn write_control_message(
+    stream: &mut impl Write,
+    msg_type: u8,
+    payload: &[u8],
+) -> std::io::Result<()> {
     stream.write_all(&encode_control_message(msg_type, payload))
 }
 
@@ -452,7 +572,7 @@ mod tests {
     #[test]
     fn fragment_reassemble_round_trip() {
         let au = sample_au(MAX_FRAGMENT_PAYLOAD * 3 + 17);
-        let datagrams = fragment(&au, 42, 123_456_789, true);
+        let datagrams = fragment(&au, 42, 123_456_789, true, MAX_DATAGRAM_SIZE);
         assert_eq!(datagrams.len(), 4);
 
         let mut re = Reassembler::default();
@@ -476,12 +596,15 @@ mod tests {
     #[test]
     fn dropped_fragment_loses_frame() {
         let au = sample_au(MAX_FRAGMENT_PAYLOAD * 2);
-        let datagrams = fragment(&au, 7, 1000, false);
+        let datagrams = fragment(&au, 7, 1000, false, MAX_DATAGRAM_SIZE);
         assert_eq!(datagrams.len(), 2);
 
         let mut re = Reassembler::default();
         let (header, payload) = parse_datagram(&datagrams[0]).unwrap();
-        assert!(re.push(header, payload).is_none(), "incomplete without fragment 1");
+        assert!(
+            re.push(header, payload).is_none(),
+            "incomplete without fragment 1"
+        );
 
         // Frame goes stale and is swept as lost.
         re.frames.get_mut(&7).unwrap().first_seen = Instant::now() - Duration::from_secs(1);
@@ -492,7 +615,7 @@ mod tests {
     #[test]
     fn out_of_order_and_duplicate_fragments() {
         let au = sample_au(MAX_FRAGMENT_PAYLOAD + 5);
-        let datagrams = fragment(&au, 9, 0, false);
+        let datagrams = fragment(&au, 9, 0, false, MAX_DATAGRAM_SIZE);
         let mut re = Reassembler::default();
         let (h1, p1) = parse_datagram(&datagrams[1]).unwrap();
         let (h0, p0) = parse_datagram(&datagrams[0]).unwrap();
@@ -506,12 +629,83 @@ mod tests {
     fn rejects_malformed_datagrams() {
         assert!(parse_datagram(b"short").is_none());
         let au = sample_au(10);
-        let mut dgram = fragment(&au, 1, 0, false).remove(0);
+        let mut dgram = fragment(&au, 1, 0, false, MAX_DATAGRAM_SIZE).remove(0);
         dgram[0] = b'X'; // bad magic
         assert!(parse_datagram(&dgram).is_none());
-        let mut dgram = fragment(&au, 1, 0, false).remove(0);
+        let mut dgram = fragment(&au, 1, 0, false, MAX_DATAGRAM_SIZE).remove(0);
         dgram[3] = 99; // bad version
         assert!(parse_datagram(&dgram).is_none());
+    }
+
+    #[test]
+    fn fragment_honors_datagram_size() {
+        let au = sample_au(5000);
+        let small = fragment(&au, 1, 0, false, 500);
+        assert!(small.iter().all(|d| d.len() <= 500));
+        assert_eq!(small.len(), 5000_usize.div_ceil(500 - VIDEO_HEADER_LEN));
+        // Below the floor and above the ceiling both clamp.
+        assert!(fragment(&au, 1, 0, false, 10)
+            .iter()
+            .all(|d| d.len() <= MIN_DATAGRAM_SIZE));
+        assert!(fragment(&au, 1, 0, false, 9000)
+            .iter()
+            .all(|d| d.len() <= MAX_DATAGRAM_SIZE));
+        let mut re = Reassembler::default();
+        let mut assembled = None;
+        for dgram in &small {
+            let (header, payload) = parse_datagram(dgram).unwrap();
+            if let Some(frame) = re.push(header, payload) {
+                assembled = Some(frame);
+            }
+        }
+        assert_eq!(assembled.unwrap().data, au);
+    }
+
+    #[test]
+    fn datagram_size_tracks_mtu() {
+        assert_eq!(datagram_size_for_mtu(1280), 1252);
+        assert_eq!(datagram_size_for_mtu(1500), 1400, "ceiling wins over 1472");
+        assert_eq!(datagram_size_for_mtu(9000), MAX_DATAGRAM_SIZE);
+        assert_eq!(datagram_size_for_mtu(100), MIN_DATAGRAM_SIZE);
+        assert_eq!(datagram_size_for_mtu(0), MIN_DATAGRAM_SIZE);
+    }
+
+    #[test]
+    fn ping_pong_stats_round_trip() {
+        let ping = Ping {
+            client_timestamp_us: 0x0102_0304_0506_0708,
+        };
+        assert_eq!(ping.encode().len(), PING_PAYLOAD_LEN);
+        assert_eq!(Ping::decode(&ping.encode()), Some(ping));
+        assert!(Ping::decode(&[0; 7]).is_none());
+
+        let pong = Pong {
+            client_timestamp_us: 42,
+            agent_timestamp_us: u64::MAX,
+        };
+        assert_eq!(pong.encode().len(), PONG_PAYLOAD_LEN);
+        assert_eq!(Pong::decode(&pong.encode()), Some(pong));
+        assert!(Pong::decode(&[0; 17]).is_none());
+
+        let stats = AgentStats {
+            capture_fps: 144,
+            encode_fps: 60,
+            encode_latency_us: 4_321,
+            tx_kbps: 41_000,
+            keyframes: 1,
+        };
+        let payload = stats.encode();
+        assert_eq!(payload.len(), AGENT_STATS_PAYLOAD_LEN);
+        assert_eq!(&payload[0..2], &[0, 144]);
+        assert_eq!(AgentStats::decode(&payload), Some(stats));
+        assert!(AgentStats::decode(&[0; 13]).is_none());
+
+        // Framed through the control channel like the real thing.
+        let framed = encode_control_message(CONTROL_MSG_PONG, &pong.encode());
+        let mut cursor = std::io::Cursor::new(framed);
+        let (t, p) = read_control_message(&mut cursor).unwrap().expect("message");
+        assert_eq!(t, CONTROL_MSG_PONG);
+        assert_eq!(Pong::decode(&p), Some(pong));
     }
 
     #[test]
@@ -546,15 +740,48 @@ mod tests {
         let events = [
             InputEvent::PointerMotionAbs { x: 500, y: 400 },
             InputEvent::PointerMotionAbs { x: -1, y: 0 },
-            InputEvent::PointerMotionRel { dx256: 256, dy256: -128 },
-            InputEvent::PointerButton { button: 0x110, pressed: true },
-            InputEvent::PointerButton { button: 0x111, pressed: false },
-            InputEvent::PointerAxis { axis: AXIS_VERTICAL, source: AXIS_SOURCE_CONTINUOUS, value256: 4250 },
-            InputEvent::PointerAxis { axis: AXIS_HORIZONTAL, source: AXIS_SOURCE_WHEEL, value256: -2560 },
-            InputEvent::Key { code: 35, pressed: true },  // KEY_H
-            InputEvent::Key { code: 28, pressed: false }, // KEY_ENTER
-            InputEvent::KeyModifiers { depressed: 1, latched: 0, locked: 0, group: 0 }, // shift
-            InputEvent::KeyModifiers { depressed: 0, latched: 0, locked: 2, group: 1 }, // caps lock, group 1
+            InputEvent::PointerMotionRel {
+                dx256: 256,
+                dy256: -128,
+            },
+            InputEvent::PointerButton {
+                button: 0x110,
+                pressed: true,
+            },
+            InputEvent::PointerButton {
+                button: 0x111,
+                pressed: false,
+            },
+            InputEvent::PointerAxis {
+                axis: AXIS_VERTICAL,
+                source: AXIS_SOURCE_CONTINUOUS,
+                value256: 4250,
+            },
+            InputEvent::PointerAxis {
+                axis: AXIS_HORIZONTAL,
+                source: AXIS_SOURCE_WHEEL,
+                value256: -2560,
+            },
+            InputEvent::Key {
+                code: 35,
+                pressed: true,
+            }, // KEY_H
+            InputEvent::Key {
+                code: 28,
+                pressed: false,
+            }, // KEY_ENTER
+            InputEvent::KeyModifiers {
+                depressed: 1,
+                latched: 0,
+                locked: 0,
+                group: 0,
+            }, // shift
+            InputEvent::KeyModifiers {
+                depressed: 0,
+                latched: 0,
+                locked: 2,
+                group: 1,
+            }, // caps lock, group 1
         ];
         for event in events {
             let (msg_type, payload) = event.encode();

@@ -9,9 +9,10 @@ import os
 /// the Metal renderer. One instance lives for the app's lifetime; connect
 /// and disconnect drive its lifecycle.
 ///
-/// Threading: NW callbacks arrive on the control/video queues; everything
-/// session-stateful (reassembly, decode, stats counters) runs on the serial
-/// decode queue. Published properties are set on the main queue.
+/// Threading: control callbacks arrive on the control queue and datagrams
+/// on the receive thread; everything session-stateful (reassembly, decode,
+/// stats counters, the clock offset) runs on the serial decode queue.
+/// Published properties are set on the main queue.
 final class StreamSession: ObservableObject {
     enum State: Equatable {
         case disconnected
@@ -26,6 +27,8 @@ final class StreamSession: ObservableObject {
     @Published private(set) var inputCaptured = false
     /// True while pointer lock (relative mouse mode) is engaged.
     @Published private(set) var pointerLockActive = false
+    /// Latest per-second latency figures for the session chrome.
+    @Published private(set) var latency = LatencyStats.empty
 
     /// The surface's renderer; decoded frames replace the test pattern.
     let renderer = MetalRenderer()
@@ -33,11 +36,16 @@ final class StreamSession: ObservableObject {
     let input = InputController()
 
     private let control = ControlChannel()
-    private let video = VideoReceiver()
+    private let video: VideoIngest
     private let decoder = H264Decoder()
-    private var reassembler = Reassembler()
-    private let decodeQueue = DispatchQueue(label: "porthole.decode")
+    private let decodeQueue: DispatchQueue
     private let logger = Logger(subsystem: "com.porthole.mac", category: "session")
+    /// Candidate walk for connect(machine:): the host that last answered a
+    /// thumbnail poll, then the mDNS LAN addresses, then the bare host name
+    /// (MagicDNS/Tailscale), with one second per attempt. Walks on main
+    /// because each try drives the published state through connect(host:).
+    private let dialer: DialWalker
+    private let statsLog = StatsLog()
 
     private var hello: Hello?
     private var needsKeyframe = true
@@ -47,70 +55,36 @@ final class StreamSession: ObservableObject {
     private var highestSubmittedSequence: UInt64?
     private var consecutiveEmptySeconds = 0
 
-    /// Access units received but not yet decoded; bounded to apply
-    /// backpressure (a full queue means we are falling behind, which is
-    /// decode-fatal for predictive video: drop and resync on a keyframe).
-    private var pendingDecodes = 0
-    private let pendingLock = NSLock()
-    private let maxPendingDecodes = 8
-
-    // Per-second stats counters, mutated only on the decode queue.
-    private var decodedThisSecond = 0
-    private var decodeMillisecondsThisSecond = 0.0
-    private var completedThisSecond = 0
-    private var lostThisSecond: UInt64 = 0
-
+    // Per-second counters and the agent clock estimate, decode queue only.
+    private var stats = StatsWindow()
+    private var clockOffset = ClockOffset()
+    private var latestAgentStats: AgentStats?
     private var statsTimer: DispatchSourceTimer?
-    private var statsLogHandle: FileHandle?
-    private let statsLogURL = URL(fileURLWithPath: "/tmp/porthole-mac-stats.log")
-
-    var isConnected: Bool {
-        state != .disconnected
-    }
-
-    // MARK: Lifecycle
 
     /// Set at connect() so the first decoded frame can report the
     /// click-to-first-frame latency (US-007 target: under 3 s on LAN).
     private var connectStartedAt: Date?
 
-    /// Remaining address candidates for the in-flight dial (US-007): mDNS
-    /// LAN addresses are tried first, then the bare host name fallback
-    /// (MagicDNS/Tailscale). Each candidate gets dialTimeoutSeconds before
-    /// the next is tried.
-    private var dialCandidates: [(host: String, port: UInt16)] = []
-    private var dialTimeout: DispatchWorkItem?
-    private let dialTimeoutSeconds: Double = 1.0
+    var isConnected: Bool {
+        state != .disconnected
+    }
+
+    init() {
+        let queue = DispatchQueue(label: "porthole.decode")
+        decodeQueue = queue
+        video = VideoIngest(decodeQueue: queue)
+        dialer = DialWalker(queue: .main)
+        wireDialer()
+        wireStream()
+        wireInput()
+    }
+
+    // MARK: Lifecycle
 
     /// Connect to a picker machine, walking its address candidates.
     func connect(machine: Machine) {
         connectStartedAt = Date() // the fallback re-dial must not reset this
-        let candidates = machine.addressCandidates.isEmpty ? [machine.host] : machine.addressCandidates
-        dialCandidates = candidates.map { ($0, machine.controlPort) }
-        guard let first = dialCandidates.first else { return }
-        dialCandidates.removeFirst()
-        connect(host: first.host, controlPort: first.port)
-        armDialTimeout()
-    }
-
-    /// Give up on the in-flight dial after dialTimeoutSeconds and try the
-    /// next candidate; only fails the connect when none remain.
-    private func armDialTimeout() {
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, self.state == .connecting else { return }
-            guard let next = self.dialCandidates.first else {
-                self.fail("no address for this machine is reachable")
-                return
-            }
-            self.dialCandidates.removeFirst()
-            self.logger.info("dial timed out; trying \(next.host, privacy: .public)")
-            self.control.disconnect()
-            self.state = .disconnected // connect(host:) requires the idle state
-            self.connect(host: next.host, controlPort: next.port)
-            self.armDialTimeout()
-        }
-        dialTimeout = work
-        decodeQueue.asyncAfter(deadline: .now() + dialTimeoutSeconds, execute: work)
+        dialer.start(hosts: machine.dialOrder, port: machine.controlPort)
     }
 
     func connect(host: String, controlPort: UInt16 = WireProtocol.controlPort) {
@@ -123,26 +97,89 @@ final class StreamSession: ObservableObject {
         if connectStartedAt == nil {
             connectStartedAt = Date()
         }
-        openStatsLog()
+        statsLog.open()
+        logger.info("connecting to \(host, privacy: .public):\(controlPort)")
+        control.connect(host: host, port: controlPort)
+        startStatsTimer()
+    }
 
+    func disconnect() {
+        guard state != .disconnected else { return }
+        dialer.cancel()
+        control.disconnect()
+        video.stop()
+        decodeQueue.sync {
+            decoder.invalidate()
+            clockOffset.reset()
+            latestAgentStats = nil
+            stats.reset()
+        }
+        statsTimer?.cancel()
+        statsTimer = nil
+        statsLog.close()
+        renderer.clearStream()
+        input.reset()
+        hello = nil
+        latency = .empty
+        state = .disconnected
+    }
+
+    private func wireDialer() {
+        dialer.onTry = { [weak self] host, port in
+            guard let self else { return }
+            if self.state == .connecting {
+                // The previous candidate timed out; drop that dial first.
+                self.logger.info("dial timed out; trying \(host, privacy: .public)")
+                self.control.disconnect()
+                self.state = .disconnected // connect(host:) requires the idle state
+            }
+            self.connect(host: host, controlPort: port)
+        }
+        dialer.onExhausted = { [weak self] in
+            guard let self, self.state == .connecting else { return }
+            self.fail("no address for this machine is reachable")
+        }
+    }
+
+    private func wireStream() {
         control.onEvent = { [weak self] event in
-            self?.decodeQueue.async { self?.handleControlEvent(event) }
+            // Stamp the arrival before the hop: decode is synchronous on the
+            // decode queue and would add its own milliseconds to every RTT.
+            let receivedMicros = ClientClock.nowMicros()
+            self?.decodeQueue.async { self?.handleControlEvent(event, receivedMicros: receivedMicros) }
         }
-        video.onEvent = { [weak self] event in
-            self?.handleVideoEvent(event)
+        video.onAccessUnit = { [weak self] accessUnit, arrivedMicros in
+            self?.handleArrival(accessUnit, arrivedMicros: arrivedMicros)
         }
-        decoder.onFrameDecoded = { [weak self] pixelBuffer, _ in
-            self?.handleDecodedFrame(pixelBuffer)
+        video.onLoss = { [weak self] frameCount, reason in
+            self?.handleLoss(frameCount: frameCount, reason: reason)
+        }
+        video.onFailure = { [weak self] message in
+            self?.fail(message)
+        }
+        decoder.onFrameDecoded = { [weak self] pixelBuffer, timestampMicros in
+            self?.handleDecodedFrame(pixelBuffer, timestampMicros: timestampMicros)
         }
         decoder.onFailure = { [weak self] message in
             self?.handleDecodeFailure(message)
         }
         decoder.onSessionRebuilt = { [weak self] colorState, width, height in
-            self?.logger.info("decode session rebuilt: \(width)x\(height), matrix \(String(describing: colorState.matrix)), fullRange \(colorState.fullRange)")
+            self?.logger.info("""
+                decode session rebuilt: \(width)x\(height), \
+                matrix \(String(describing: colorState.matrix)), fullRange \(colorState.fullRange)
+                """)
             self?.renderer.setColorState(matrix: colorState.matrix, fullRange: colorState.fullRange)
         }
+        renderer.onFramePresented = { [weak self] captureClientMicros, presentedMicros in
+            guard let captureClientMicros else { return }
+            self?.decodeQueue.async {
+                self?.stats.captureToPresented.add(Int64(presentedMicros) - Int64(captureClientMicros))
+            }
+        }
+    }
 
-        // Input flows to the control channel on the same connection (US-006).
+    /// Input flows to the control channel on the same connection (US-006).
+    private func wireInput() {
         input.onSend = { [weak self] frame in
             self?.control.sendInput(frame)
         }
@@ -158,42 +195,15 @@ final class StreamSession: ObservableObject {
                 }
             }
         }
-
-        logger.info("connecting to \(host, privacy: .public):\(controlPort)")
-        control.connect(host: host, port: controlPort)
-        startStatsTimer()
-    }
-
-    func disconnect() {
-        guard state != .disconnected else { return }
-        dialTimeout?.cancel()
-        dialTimeout = nil
-        dialCandidates = []
-        control.disconnect()
-        video.stop()
-        decodeQueue.sync {
-            decoder.invalidate()
-            reassembler.reset()
-        }
-        statsTimer?.cancel()
-        statsTimer = nil
-        try? statsLogHandle?.close()
-        statsLogHandle = nil
-        renderer.clearStream()
-        input.reset()
-        hello = nil
-        state = .disconnected
     }
 
     // MARK: Control channel
 
-    private func handleControlEvent(_ event: ControlChannel.Event) {
+    private func handleControlEvent(_ event: ControlChannel.Event, receivedMicros: UInt64) {
         switch event {
         case .ready:
             // Connected to a candidate; stop the fallback walk.
-            dialTimeout?.cancel()
-            dialTimeout = nil
-            dialCandidates = []
+            dialer.cancel()
         case .hello(let hello):
             guard hello.codec == .h264 else {
                 fail("agent streams codec \(hello.codec.rawValue); US-005 supports h264 only")
@@ -204,14 +214,24 @@ final class StreamSession: ObservableObject {
             DispatchQueue.main.async { [weak self] in
                 self?.input.videoSize = CGSize(width: Int(hello.width), height: Int(hello.height))
             }
-            logger.info("hello: \(hello.width)x\(hello.height)@\(hello.fps), keyframe every \(hello.keyframeIntervalSecs)s, video port \(hello.videoPort)")
+            logger.info("""
+                hello: \(hello.width)x\(hello.height)@\(hello.fps), \
+                keyframe every \(hello.keyframeIntervalSecs)s, video port \(hello.videoPort)
+                """)
             setState(.waitingForKeyframe)
             guard video.start(port: hello.videoPort) != nil else {
                 fail("could not bind UDP video port \(hello.videoPort)")
                 return
             }
-            // Joining mid-GOP: ask for an IDR to start decoding.
+            // Joining mid-GOP: ask for an IDR to start decoding, and probe
+            // the clock offset early; the stats timer pings once per second
+            // after this burst.
             control.requestKeyframe(force: true)
+            control.sendPingBurst(count: 5, interval: 0.1)
+        case .pong(let pong):
+            clockOffset.addPong(pong, receivedMicros: receivedMicros)
+        case .agentStats(let agentStats):
+            latestAgentStats = agentStats
         case .disconnected(let reason):
             fail(reason)
         }
@@ -219,43 +239,14 @@ final class StreamSession: ObservableObject {
 
     // MARK: Video channel
 
-    /// Called on the video queue; hops to the decode queue with bounded
-    /// backlog.
-    private func handleVideoEvent(_ event: VideoReceiver.Event) {
-        switch event {
-        case .failed(let message):
-            decodeQueue.async { [weak self] in self?.fail(message) }
-        case .datagram(let header, let payload):
-            pendingLock.lock()
-            let depth = pendingDecodes
-            if depth < maxPendingDecodes {
-                pendingDecodes += 1
-            }
-            pendingLock.unlock()
-            guard depth < maxPendingDecodes else {
-                decodeQueue.async { [weak self] in self?.handleLoss(frameCount: 1, reason: "decode queue full") }
-                return
-            }
-            decodeQueue.async { [weak self] in
-                guard let self else { return }
-                self.pendingLock.lock()
-                self.pendingDecodes -= 1
-                self.pendingLock.unlock()
-                self.ingest(header: header, payload: payload)
-            }
+    /// Decode queue: a complete access unit that arrived at `arrivedMicros`
+    /// (stamped on the receive thread, before any queueing).
+    private func handleArrival(_ accessUnit: Reassembler.AccessUnit, arrivedMicros: UInt64) {
+        stats.completed += 1
+        if let captureClient = clockOffset.clientMicros(forAgentMicros: accessUnit.timestampMicros) {
+            stats.captureToArrival.add(Int64(arrivedMicros) - captureClient)
         }
-    }
-
-    private func ingest(header: WireProtocol.DatagramHeader, payload: Data) {
-        for event in reassembler.ingest(header: header, payload: payload) {
-            switch event {
-            case .completed(let accessUnit):
-                completedThisSecond += 1
-                handleAccessUnit(accessUnit)
-            case .loss(let frameCount):
-                handleLoss(frameCount: frameCount, reason: "reassembly")
-            }
-        }
+        handleAccessUnit(accessUnit)
     }
 
     private func handleAccessUnit(_ accessUnit: Reassembler.AccessUnit) {
@@ -286,10 +277,14 @@ final class StreamSession: ObservableObject {
         needsKeyframe = false
     }
 
-    private func handleDecodedFrame(_ pixelBuffer: CVPixelBuffer) {
-        decodedThisSecond += 1
-        decodeMillisecondsThisSecond += decoder.lastDecodeMilliseconds
-        renderer.display(pixelBuffer)
+    private func handleDecodedFrame(_ pixelBuffer: CVPixelBuffer, timestampMicros: UInt64) {
+        stats.decoded += 1
+        stats.decodeMilliseconds += decoder.lastDecodeMilliseconds
+        let captureClient = clockOffset.clientMicros(forAgentMicros: timestampMicros)
+        if let captureClient {
+            stats.captureToDecoded.add(Int64(ClientClock.nowMicros()) - captureClient)
+        }
+        renderer.display(pixelBuffer, captureClientMicros: captureClient.map { UInt64(max(0, $0)) })
         if case .waitingForKeyframe = state, let hello {
             if let started = connectStartedAt {
                 let milliseconds = Int(Date().timeIntervalSince(started) * 1000)
@@ -302,7 +297,7 @@ final class StreamSession: ObservableObject {
 
     /// Any loss is decode-fatal until the next IDR (protocol.md).
     private func handleLoss(frameCount: UInt64, reason: String) {
-        lostThisSecond += frameCount
+        stats.lost += frameCount
         if !needsKeyframe {
             logger.info("loss (\(frameCount) frame(s), \(reason, privacy: .public)); requesting keyframe")
         }
@@ -312,7 +307,7 @@ final class StreamSession: ObservableObject {
 
     private func handleDecodeFailure(_ message: String) {
         logger.warning("decoder: \(message, privacy: .public)")
-        lostThisSecond += 1
+        stats.lost += 1
         needsKeyframe = true
         control.requestKeyframe()
     }
@@ -328,22 +323,18 @@ final class StreamSession: ObservableObject {
     }
 
     private func emitStats() {
-        let fps = decodedThisSecond
-        let averageDecodeMs = fps > 0 ? decodeMillisecondsThisSecond / Double(fps) : 0
-        let totalFrames = UInt64(completedThisSecond) + lostThisSecond
-        let lossPercent = totalFrames > 0 ? Double(lostThisSecond) / Double(totalFrames) * 100 : 0
-        pendingLock.lock()
-        let depth = pendingDecodes
-        pendingLock.unlock()
-
-        let line = String(format: "stats fps=%d decode_ms=%.2f loss=%.2f%% queue=%d",
-                          fps, averageDecodeMs, lossPercent, depth)
+        let rttMicros = clockOffset.latestRttMicros
+        let line = stats.line(rttMicros: rttMicros, agentStats: latestAgentStats, queueDepth: video.backlogDepth)
         logger.info("\(line, privacy: .public)")
-        appendStatsLog(line)
+        statsLog.append(line)
+
+        let latency = LatencyStats(capturePresentMs: stats.captureToPresented.milliseconds,
+                                   rttMs: rttMicros.map { Double($0) / 1000 })
+        DispatchQueue.main.async { [weak self] in self?.latency = latency }
 
         // Stall recovery: nothing decoded for a while means the stream died
         // silently (agent restart, black hole); keep asking for keyframes.
-        if fps == 0, state != .disconnected {
+        if stats.decoded == 0, state != .disconnected {
             consecutiveEmptySeconds += 1
             if consecutiveEmptySeconds >= 3 {
                 control.requestKeyframe()
@@ -351,22 +342,11 @@ final class StreamSession: ObservableObject {
         } else {
             consecutiveEmptySeconds = 0
         }
+        stats.reset()
 
-        decodedThisSecond = 0
-        decodeMillisecondsThisSecond = 0
-        completedThisSecond = 0
-        lostThisSecond = 0
-    }
-
-    private func openStatsLog() {
-        FileManager.default.createFile(atPath: statsLogURL.path, contents: nil)
-        statsLogHandle = try? FileHandle(forWritingTo: statsLogURL)
-    }
-
-    private func appendStatsLog(_ line: String) {
-        let stamped = "\(ISO8601DateFormatter().string(from: Date())) \(line)\n"
-        if let data = stamped.data(using: .utf8) {
-            try? statsLogHandle?.write(contentsOf: data)
+        // Steady-state probe; before hello there is no peer to answer.
+        if hello != nil {
+            control.sendPing()
         }
     }
 

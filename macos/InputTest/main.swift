@@ -94,6 +94,9 @@ func pixelScrollEvent(deltaY: Int32) -> NSEvent {
 
 // MARK: Local byte-exact tests
 
+// One test per protocol layout, each with its expected bytes inline; a
+// table-driven split would hide the byte comparisons the gate exists for.
+// swiftlint:disable:next function_body_length
 func runLocalTests() {
     let controller = InputController()
     var wire = [UInt8]()
@@ -106,7 +109,7 @@ func runLocalTests() {
     controller.handleKeyUp(keyEvent(.keyUp, keyCode: 0x00, characters: "a"))
     checkBytes("plain key a down+up", wire, [
         0, 0, 0, 4, 0x14, 0, 30, 1, // key 30 down
-        0, 0, 0, 4, 0x14, 0, 30, 0, // key 30 up
+        0, 0, 0, 4, 0x14, 0, 30, 0 // key 30 up
     ])
     wire.removeAll()
 
@@ -122,7 +125,7 @@ func runLocalTests() {
         0, 0, 0, 4, 0x14, 0, 30, 1, // KEY_A down (shifted)
         0, 0, 0, 4, 0x14, 0, 30, 0, // KEY_A up
         0, 0, 0, 4, 0x14, 0, 42, 0, // KEY_LEFTSHIFT up
-        0, 0, 0, 17, 0x15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // modifiers depressed=0
+        0, 0, 0, 17, 0x15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 // modifiers depressed=0
     ])
     wire.removeAll()
 
@@ -130,7 +133,7 @@ func runLocalTests() {
     //    source continuous (no touch phase info on a converted CGEvent).
     controller.handleScroll(pixelScrollEvent(deltaY: 12))
     checkBytes("precise scroll 12px", wire, [
-        0, 0, 0, 7, 0x13, 0, 2, 0xFF, 0xFF, 0xF4, 0x00, // value -3072
+        0, 0, 0, 7, 0x13, 0, 2, 0xFF, 0xFF, 0xF4, 0x00 // value -3072
     ])
     wire.removeAll()
 
@@ -145,7 +148,7 @@ func runLocalTests() {
     }
     checkBytes("left button down+up", wire, [
         0, 0, 0, 4, 0x12, 0x01, 0x10, 1,
-        0, 0, 0, 4, 0x12, 0x01, 0x10, 0,
+        0, 0, 0, 4, 0x12, 0x01, 0x10, 0
     ])
     wire.removeAll()
 
@@ -155,12 +158,12 @@ func runLocalTests() {
     let viewSize = CGSize(width: 1280, height: 800)
     controller.handleMouseMotion(point: CGPoint(x: 128, y: 120), deltaX: 0, deltaY: 0, viewSize: viewSize)
     checkBytes("letterbox map (128,120) -> (256,160)", wire, [
-        0, 0, 0, 9, 0x10, 0, 0, 1, 0, 0, 0, 0, 0xA0,
+        0, 0, 0, 9, 0x10, 0, 0, 1, 0, 0, 0, 0, 0xA0
     ])
     wire.removeAll()
     controller.handleMouseMotion(point: CGPoint(x: 640, y: 400), deltaX: 0, deltaY: 0, viewSize: viewSize)
     checkBytes("letterbox map center -> (1280,720)", wire, [
-        0, 0, 0, 9, 0x10, 0, 0, 5, 0, 0, 0, 2, 0xD0,
+        0, 0, 0, 9, 0x10, 0, 0, 5, 0, 0, 0, 2, 0xD0
     ])
     wire.removeAll()
     controller.handleMouseMotion(point: CGPoint(x: 640, y: 10), deltaX: 0, deltaY: 0, viewSize: viewSize)
@@ -223,6 +226,8 @@ func runLive(host: String, command: [String]) -> Never {
         case .hello(let hello):
             print("hello: \(hello.width)x\(hello.height)@\(hello.fps) from \(host)")
             helloReceived.signal()
+        case .pong, .agentStats:
+            break // latency probes are the app's concern, not this gate's
         case .disconnected(let reason):
             print("FAIL: \(reason)")
             exit(1)

@@ -36,3 +36,13 @@
 # and no physical monitor is attached, the agent creates a headless output at
 # this geometry and captures it. Unset by default.
 # virtual_display = "2560x1440@144"
+
+# Path MTU the video datagrams are sized for (576 to 9000). The default fits
+# the IPv6 minimum and WireGuard/Tailscale tunnels; use 1500 on plain
+# Ethernet. A datagram larger than the path MTU gets IP-fragmented, and one
+# lost piece loses the whole datagram.
+# mtu = 1280
+
+# DRM render node for the VAAPI encoder. Unset by default: the agent picks
+# one at encoder start (amdgpu, then i915, then xe, never nvidia).
+# vaapi_device = "/dev/dri/renderD129"

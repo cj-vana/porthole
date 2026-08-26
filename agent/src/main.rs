@@ -1,12 +1,16 @@
 //! porthole-agent: Linux agent for Porthole.
 //!
 //! Captures the desktop (US-001, wlr-screencopy on Wayland), hardware-encodes
-//! it (US-002), and streams it to a Mac client over LAN (US-003). Input
-//! (US-006) and audio (US-009) are still trait stubs.
+//! it (US-002), streams it to a Mac client over LAN (US-003), injects the
+//! client's pointer and keyboard input (US-006), and announces itself via
+//! mDNS with a thumbnail endpoint for the picker (US-007a). The pipeline
+//! reports its own encode latency once per second, on the log line and as
+//! an `agent_stats` control message, so the client can split its
+//! glass-to-glass number into encode and transport. Audio (US-009) is still
+//! a trait stub.
 
-// These modules hold trait stubs for later stories (US-006, US-009) that are
-// not wired into the runtime yet. Remove each allow as the corresponding
-// story lands.
+// Trait stub for a later story (US-009), not wired into the runtime yet.
+// Remove the allow when it lands.
 #[allow(dead_code)]
 mod audio;
 mod capture;
@@ -86,6 +90,17 @@ struct Cli {
     /// output at this geometry is created and captured (US-015).
     #[arg(long, value_name = "WxH@HZ")]
     virtual_display: Option<config::VirtualDisplay>,
+
+    /// Path MTU the video datagrams are sized for (576 to 9000). The default
+    /// fits the IPv6 minimum and WireGuard/Tailscale tunnels; use 1500 on
+    /// plain Ethernet [default: 1280]
+    #[arg(long, value_name = "BYTES")]
+    mtu: Option<config::Mtu>,
+
+    /// DRM render node for the VAAPI encoder, e.g. /dev/dri/renderD129
+    /// [default: auto-detect, preferring amdgpu, i915, xe; never nvidia]
+    #[arg(long, value_name = "PATH")]
+    vaapi_device: Option<PathBuf>,
 }
 
 impl Cli {
@@ -124,6 +139,12 @@ impl Cli {
         if let Some(v) = self.virtual_display {
             cfg.virtual_display = Some(v);
         }
+        if let Some(v) = self.mtu {
+            cfg.mtu = v;
+        }
+        if let Some(v) = &self.vaapi_device {
+            cfg.vaapi_device = Some(v.clone());
+        }
     }
 }
 
@@ -141,7 +162,8 @@ fn init_tracing() {
 /// send them to the connected client. Handles control events: client
 /// connect/disconnect and keyframe requests (answered by restarting the
 /// encoder session, which yields a fresh IDR, FR-4). Logs a once-per-second
-/// stats line for capture, encode, and transmit together.
+/// stats line for capture, encode, and transmit together, and sends the
+/// same numbers to the client as `agent_stats` while one is connected.
 #[allow(clippy::too_many_arguments)]
 fn capture_loop(
     mut backend: Box<dyn capture::CaptureBackend>,
@@ -150,6 +172,7 @@ fn capture_loop(
     capture_format: capture::CaptureFormat,
     mut sender: transport::VideoSender,
     events: std::sync::mpsc::Receiver<transport::ControlEvent>,
+    control: transport::ControlSender,
     latest_frame: discovery::LatestFrame,
     pipeline_start: Instant,
     shutdown: Arc<AtomicBool>,
@@ -185,19 +208,40 @@ fn capture_loop(
     let mut encoded_bytes = 0u64;
     let mut keyframes = 0u64;
     let mut submit_ms_total = 0.0f64;
+    // Capture-to-access-unit latency, summed over the AUs whose capture
+    // time is known (an encoder restart clears the FIFO, so the first few
+    // AUs afterwards have none and are left out of the mean). The capture
+    // stamp is taken before the frame is written to the encoder, so the
+    // pipe write counts as encode time; the client subtracts the same stamp
+    // from its arrival and present times, so nothing falls between the two.
+    let mut enc_latency_us_total = 0u64;
+    let mut enc_latency_samples = 0u64;
+    // Generation of the client video goes to. A replaced connection's
+    // reader reports its disconnect after the new client connected; the
+    // generation tells that stale event apart from a real disconnect.
+    let mut client_generation: Option<u64> = None;
     let mut window_start = Instant::now();
     while !shutdown.load(Ordering::Relaxed) {
         // Control channel events (client connect/disconnect, keyframe
         // requests) are handled between frames.
         for event in events.try_iter() {
             match event {
-                transport::ControlEvent::ClientConnected(ip) => {
+                transport::ControlEvent::ClientConnected { generation, ip } => {
                     sender.set_client(Some(ip));
-                    tracing::info!(client = %sender.client().expect("just set"), "streaming video to client");
+                    client_generation = Some(generation);
+                    tracing::info!(client = %sender.client().expect("just set"), generation, "streaming video to client");
                 }
-                transport::ControlEvent::ClientDisconnected => {
+                transport::ControlEvent::ClientDisconnected { generation } => {
+                    if client_generation.is_some_and(|current| generation < current) {
+                        tracing::debug!(
+                            generation,
+                            "stale disconnect for a replaced client, ignored"
+                        );
+                        continue;
+                    }
                     sender.set_client(None);
-                    tracing::info!("client gone, video paused");
+                    client_generation = None;
+                    tracing::info!(generation, "client gone, video paused");
                 }
                 transport::ControlEvent::KeyframeRequest => {
                     // FR-4: a subprocess ffmpeg cannot force an IDR
@@ -222,6 +266,7 @@ fn capture_loop(
             }
         };
         frames += 1;
+        let captured_us = pipeline_start.elapsed().as_micros() as u64;
 
         // FR-10: share a recent frame with the thumbnail endpoint. Every
         // 30th frame is plenty fresh for a picker thumbnail.
@@ -246,7 +291,7 @@ fn capture_loop(
             }
             submit_ms_total += submit_start.elapsed().as_secs_f64() * 1000.0;
             submitted += 1;
-            submitted_at.push_back(pipeline_start.elapsed().as_micros() as u64);
+            submitted_at.push_back(captured_us);
         }
 
         for au in encoder.drain() {
@@ -254,9 +299,18 @@ fn capture_loop(
                 use std::io::Write;
                 let _ = f.write_all(&au.data);
             }
-            let timestamp_us = submitted_at
-                .pop_front()
-                .unwrap_or_else(|| pipeline_start.elapsed().as_micros() as u64);
+            let ready_us = au
+                .ready_at
+                .saturating_duration_since(pipeline_start)
+                .as_micros() as u64;
+            let timestamp_us = match submitted_at.pop_front() {
+                Some(captured_us) => {
+                    enc_latency_us_total += ready_us.saturating_sub(captured_us);
+                    enc_latency_samples += 1;
+                    captured_us
+                }
+                None => ready_us,
+            };
             if let Err(err) = sender.send(&au, timestamp_us) {
                 tracing::error!("{err:#}: video send failed");
             }
@@ -274,6 +328,7 @@ fn capture_loop(
             let format = backend.format();
             let tx_kbps = sender.bytes_sent as f64 * 8.0 / secs / 1000.0;
             let tx_datagrams = sender.datagrams_sent as f64 / secs;
+            let enc_latency_us = enc_latency_us_total / enc_latency_samples.max(1);
             sender.bytes_sent = 0;
             sender.datagrams_sent = 0;
             tracing::info!(
@@ -290,17 +345,33 @@ fn capture_loop(
                 enc_kbps = format!("{:.0}", encoded_bytes as f64 * 8.0 / secs / 1000.0),
                 enc_keyframes = keyframes,
                 enc_submit_ms = format!("{:.2}", submit_ms_total / submitted.max(1) as f64),
+                enc_latency_ms = format!("{:.2}", enc_latency_us as f64 / 1000.0),
                 client = sender.client().map(|a| a.to_string()).unwrap_or_else(|| "none".into()),
                 tx_kbps = format!("{tx_kbps:.0}"),
                 tx_dgrams = format!("{tx_datagrams:.0}"),
                 "capture"
             );
+            if sender.client().is_some() {
+                let stats = porthole_agent::protocol::AgentStats {
+                    capture_fps: (frames as f64 / secs).round() as u16,
+                    encode_fps: (encoded as f64 / secs).round() as u16,
+                    encode_latency_us: enc_latency_us.min(u64::from(u32::MAX)) as u32,
+                    tx_kbps: tx_kbps.round() as u32,
+                    keyframes: keyframes.min(u64::from(u16::MAX)) as u16,
+                };
+                control.try_send(
+                    porthole_agent::protocol::CONTROL_MSG_AGENT_STATS,
+                    &stats.encode(),
+                );
+            }
             frames = 0;
             submitted = 0;
             encoded = 0;
             encoded_bytes = 0;
             keyframes = 0;
             submit_ms_total = 0.0;
+            enc_latency_us_total = 0;
+            enc_latency_samples = 0;
             window_start = Instant::now();
         }
     }
@@ -341,6 +412,8 @@ async fn main() -> anyhow::Result<()> {
         fps = cfg.fps.get(),
         keyframe_interval_secs = cfg.keyframe_interval_secs,
         virtual_display = %cfg.virtual_display.map(|v| v.to_string()).unwrap_or_else(|| "off".into()),
+        mtu = cfg.mtu.get(),
+        vaapi_device = %cfg.vaapi_device.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "auto".into()),
         capture_backend = backend.name(),
         "effective configuration"
     );
@@ -372,9 +445,13 @@ async fn main() -> anyhow::Result<()> {
             keyframe_interval_secs: cfg.keyframe_interval_secs,
             video_port: cfg.port_video,
         };
+        // The pipeline clock: video datagram timestamps and pong answers
+        // both count microseconds from here.
+        let pipeline_start = Instant::now();
         let input_tx = input::spawn(capture_format.width, capture_format.height);
-        let events = transport::spawn_control_listener(&cfg, hello, input_tx)
-            .context("transport control channel startup failed")?;
+        let (events, control) =
+            transport::spawn_control_listener(&cfg, hello, input_tx, pipeline_start)
+                .context("transport control channel startup failed")?;
         let sender = transport::VideoSender::new(&cfg).context("transport video socket failed")?;
         // US-007a: discovery. The thumbnail endpoint shares the latest frame
         // through a slot; mDNS announces name/ports/caps.
@@ -383,7 +460,6 @@ async fn main() -> anyhow::Result<()> {
             .context("thumbnail endpoint startup failed")?;
         let announcement = discovery::announce(&cfg);
         let encoder = encode::create(&cfg, &capture_format);
-        let pipeline_start = Instant::now();
         let shutdown = Arc::new(AtomicBool::new(false));
         let handle = tokio::task::spawn_blocking({
             let shutdown = shutdown.clone();
@@ -397,6 +473,7 @@ async fn main() -> anyhow::Result<()> {
                     capture_format,
                     sender,
                     events,
+                    control,
                     latest_frame,
                     pipeline_start,
                     shutdown,
@@ -408,8 +485,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // TODO: audio task (US-009), input injection (US-006), and mDNS
-    // announcement (US-007). Each joins the ctrl-c shutdown path.
+    // TODO: audio task (US-009) joins the ctrl-c shutdown path.
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 

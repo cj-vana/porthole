@@ -24,6 +24,18 @@ struct Machine: Codable, Hashable, Identifiable {
     /// but the machine is on Tailscale with MagicDNS (the mDNS name and the
     /// Tailscale host name are the same), without typing an IP.
     var addressCandidates: [String]
+    /// The candidate that last answered a thumbnail poll, dialed first so a
+    /// session does not spend a timeout on a filtered LAN address. Optional
+    /// so machines.json written before it existed still decodes.
+    var preferredHost: String?
+
+    /// Dial order for the session and the thumbnail poll: preferred host,
+    /// then the remaining candidates in their usual order.
+    var dialOrder: [String] {
+        let candidates = addressCandidates.isEmpty ? [host] : addressCandidates
+        guard let preferredHost else { return candidates }
+        return [preferredHost] + candidates.filter { $0 != preferredHost }
+    }
 
     /// Build from a resolved `_porthole._tcp` service. Returns nil when the
     /// TXT record is missing or has an unsupported protocol version.
@@ -51,6 +63,7 @@ struct Machine: Codable, Hashable, Identifiable {
             candidates.append(fallback)
         }
         addressCandidates = candidates
+        preferredHost = nil
     }
 
     /// Manual entry (Tailscale-only path, or when mDNS is unavailable).
@@ -64,6 +77,7 @@ struct Machine: Codable, Hashable, Identifiable {
         caps = []
         isManual = true
         addressCandidates = [host]
+        preferredHost = nil
     }
 
     /// Short badge labels for the picker card, in wire order.

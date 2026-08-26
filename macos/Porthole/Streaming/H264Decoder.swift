@@ -131,27 +131,7 @@ final class H264Decoder {
             return
         }
 
-        var description: CMVideoFormatDescription?
-        let status: OSStatus = sps.withUnsafeBytes { spsRaw in
-            pps.withUnsafeBytes { ppsRaw in
-                guard let spsBase = spsRaw.baseAddress, let ppsBase = ppsRaw.baseAddress else {
-                    return errSecParam
-                }
-                var pointers: [UnsafePointer<UInt8>] = [
-                    spsBase.assumingMemoryBound(to: UInt8.self),
-                    ppsBase.assumingMemoryBound(to: UInt8.self)
-                ]
-                var sizes: [Int] = [sps.count, pps.count]
-                return CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                    allocator: kCFAllocatorDefault,
-                    parameterSetCount: 2,
-                    parameterSetPointers: &pointers,
-                    parameterSetSizes: &sizes,
-                    nalUnitHeaderLength: 4,
-                    formatDescriptionOut: &description
-                )
-            }
-        }
+        let (description, status) = Self.makeFormatDescription(sps: sps, pps: pps)
         guard status == noErr, let description else {
             onFailure?("CMVideoFormatDescriptionCreateFromH264ParameterSets failed (\(status))")
             return
@@ -196,6 +176,34 @@ final class H264Decoder {
         currentPPS = pps
         isReady = true
         onSessionRebuilt?(colorState, parsed.width, parsed.height)
+    }
+
+    /// Format description from raw parameter sets, declaring the 4-byte NAL
+    /// length prefix the AVCC sample buffers carry.
+    private static func makeFormatDescription(sps: Data,
+                                              pps: Data) -> (CMVideoFormatDescription?, OSStatus) {
+        var description: CMVideoFormatDescription?
+        let status: OSStatus = sps.withUnsafeBytes { spsRaw in
+            pps.withUnsafeBytes { ppsRaw in
+                guard let spsBase = spsRaw.baseAddress, let ppsBase = ppsRaw.baseAddress else {
+                    return errSecParam
+                }
+                var pointers: [UnsafePointer<UInt8>] = [
+                    spsBase.assumingMemoryBound(to: UInt8.self),
+                    ppsBase.assumingMemoryBound(to: UInt8.self)
+                ]
+                var sizes: [Int] = [sps.count, pps.count]
+                return CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                    allocator: kCFAllocatorDefault,
+                    parameterSetCount: 2,
+                    parameterSetPointers: &pointers,
+                    parameterSetSizes: &sizes,
+                    nalUnitHeaderLength: 4,
+                    formatDescriptionOut: &description
+                )
+            }
+        }
+        return (description, status)
     }
 
     /// Assemble a CMSampleBuffer wrapping one access unit in AVCC form.
@@ -247,6 +255,8 @@ final class H264Decoder {
     }
 }
 
+// VTDecompressionOutputCallback's parameter list is fixed by VideoToolbox.
+// swiftlint:disable:next function_parameter_count
 private func h264OutputCallback(refCon: UnsafeMutableRawPointer?,
                                 frameRefCon _: UnsafeMutableRawPointer?,
                                 status: OSStatus,

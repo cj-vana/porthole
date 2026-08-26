@@ -1,30 +1,44 @@
 import Foundation
 import Network
+import os
 
 /// TCP control channel to the agent (docs/protocol.md). The agent is the
-/// server; we connect, receive `hello`, and send `keyframe_request`.
+/// server; we connect, receive `hello`, and send `keyframe_request`, input,
+/// and latency `ping`s. The agent answers pings with `pong` and reports
+/// `agent_stats` once per second.
 final class ControlChannel {
     enum Event {
         /// TCP connection is up; hello follows immediately after.
         case ready
         case hello(Hello)
+        case pong(Pong)
+        case agentStats(AgentStats)
         case disconnected(reason: String)
     }
 
     var onEvent: ((Event) -> Void)?
 
     private let queue = DispatchQueue(label: "porthole.control")
+    private let logger = Logger(subsystem: "com.porthole.mac", category: "control")
     private var connection: NWConnection?
     private var parser = ControlFrameParser()
     /// keyframe_requests are throttled to one per second (per protocol.md),
     /// except an explicit forced request on join.
     private var lastKeyframeRequest = Date.distantPast
+    private var pingBurst: DispatchWorkItem?
 
     func connect(host: String, port: UInt16 = WireProtocol.controlPort) {
         disconnect()
         let endpoint = NWEndpoint.Host(host)
         guard let endpointPort = NWEndpoint.Port(rawValue: port) else { return }
-        let connection = NWConnection(host: endpoint, port: endpointPort, using: .tcp)
+        // Input and probe messages are a few bytes each. With Nagle on, the
+        // kernel holds each one for the peer's delayed ACK, so mouse motion
+        // reaches the agent in 40 ms clumps.
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.noDelay = true
+        let connection = NWConnection(host: endpoint,
+                                      port: endpointPort,
+                                      using: NWParameters(tls: nil, tcp: tcpOptions))
         self.connection = connection
 
         connection.stateUpdateHandler = { [weak self] state in
@@ -47,6 +61,8 @@ final class ControlChannel {
     }
 
     func disconnect() {
+        pingBurst?.cancel()
+        pingBurst = nil
         connection?.stateUpdateHandler = nil
         connection?.cancel()
         connection = nil
@@ -69,24 +85,36 @@ final class ControlChannel {
         connection?.send(content: frame, completion: .contentProcessed { _ in })
     }
 
+    /// Latency probe; the agent echoes the timestamp in a pong.
+    func sendPing() {
+        let frame = WireProtocol.encodePing(clientTimestampMicros: ClientClock.nowMicros())
+        connection?.send(content: frame, completion: .contentProcessed { _ in })
+    }
+
+    /// `count` pings `interval` apart, starting now, so the session's clock
+    /// offset has a low-RTT sample right after hello instead of waiting for
+    /// the once-per-second probe. disconnect() cancels the remainder.
+    func sendPingBurst(count: Int, interval: TimeInterval) {
+        pingBurst?.cancel()
+        pingBurst = nil
+        guard count > 0 else { return }
+        sendPing()
+        let work = DispatchWorkItem { [weak self] in
+            self?.sendPingBurst(count: count - 1, interval: interval)
+        }
+        pingBurst = work
+        queue.asyncAfter(deadline: .now() + interval, execute: work)
+    }
+
     private func receiveLoop(_ connection: NWConnection) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) {
-            [weak self] data, _, isComplete, error in
+        connection.receive(minimumIncompleteLength: 1,
+                           maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
             // Same stale-connection guard: a cancelled dial's in-flight
             // receive fires its completion with an error; ignore it.
             guard let self, self.connection === connection else { return }
             if let data, !data.isEmpty {
                 for frame in self.parser.append(data) {
-                    switch frame.type {
-                    case .hello:
-                        if let hello = Hello(payload: frame.payload) {
-                            self.onEvent?(.hello(hello))
-                        } else {
-                            self.onEvent?(.disconnected(reason: "malformed hello"))
-                        }
-                    default:
-                        break // agent sends only hello; input types are client -> agent
-                    }
+                    self.handleFrame(type: frame.type, payload: frame.payload)
                 }
             }
             if isComplete || error != nil {
@@ -94,6 +122,31 @@ final class ControlChannel {
                 return
             }
             self.receiveLoop(connection)
+        }
+    }
+
+    private func handleFrame(type: ControlMessageType, payload: Data) {
+        switch type {
+        case .hello:
+            if let hello = Hello(payload: payload) {
+                onEvent?(.hello(hello))
+            } else {
+                onEvent?(.disconnected(reason: "malformed hello"))
+            }
+        case .pong:
+            if let pong = Pong(payload: payload) {
+                onEvent?(.pong(pong))
+            } else {
+                logger.warning("ignoring malformed pong (\(payload.count) bytes)")
+            }
+        case .agentStats:
+            if let stats = AgentStats(payload: payload) {
+                onEvent?(.agentStats(stats))
+            } else {
+                logger.warning("ignoring malformed agent_stats (\(payload.count) bytes)")
+            }
+        default:
+            break // the remaining types are client -> agent
         }
     }
 }

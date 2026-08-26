@@ -141,7 +141,7 @@ enum KeyMap {
         0x7B: 105, // Left arrow
         0x7C: 106, // Right arrow
         0x7D: 108, // Down arrow
-        0x7E: 103, // Up arrow
+        0x7E: 103 // Up arrow
     ]
 
     /// Keystroke for one Character on a US layout, for scripted typing
@@ -154,7 +154,7 @@ enum KeyMap {
                 "g": 34, "h": 35, "i": 23, "j": 36, "k": 37, "l": 38,
                 "m": 50, "n": 49, "o": 24, "p": 25, "q": 16, "r": 19,
                 "s": 31, "t": 20, "u": 22, "v": 47, "w": 17, "x": 45,
-                "y": 21, "z": 44,
+                "y": 21, "z": 44
             ]
             return letters[character].map { Keystroke(code: $0, needsShift: false) }
         case "A"..."Z":
@@ -163,7 +163,7 @@ enum KeyMap {
         case "0"..."9":
             let digits: [Character: UInt16] = [
                 "1": 2, "2": 3, "3": 4, "4": 5, "5": 6,
-                "6": 7, "7": 8, "8": 9, "9": 10, "0": 11,
+                "6": 7, "7": 8, "8": 9, "9": 10, "0": 11
             ]
             return digits[character].map { Keystroke(code: $0, needsShift: false) }
         case " ": return Keystroke(code: keySpace, needsShift: false)
@@ -186,7 +186,7 @@ enum KeyMap {
         "\\": Keystroke(code: 43, needsShift: false),
         ",": Keystroke(code: 51, needsShift: false),
         ".": Keystroke(code: 52, needsShift: false),
-        "/": Keystroke(code: 53, needsShift: false),
+        "/": Keystroke(code: 53, needsShift: false)
     ]
 
     private static let shiftedPunctuation: [Character: Keystroke] = [
@@ -210,6 +210,6 @@ enum KeyMap {
         "|": Keystroke(code: 43, needsShift: true),
         "<": Keystroke(code: 51, needsShift: true),
         ">": Keystroke(code: 52, needsShift: true),
-        "?": Keystroke(code: 53, needsShift: true),
+        "?": Keystroke(code: 53, needsShift: true)
     ]
 }

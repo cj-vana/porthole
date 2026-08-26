@@ -24,7 +24,7 @@ targets:
         CODE_SIGN_STYLE: Automatic
         # Ad hoc ("Sign to Run Locally"): no developer cert needed for LAN dev builds.
         CODE_SIGN_IDENTITY: "-"
-        # App sandbox deliberately OFF for now — see README (raw UDP/TCP + GameController).
+        # App sandbox deliberately OFF for now; see README (raw UDP/TCP + GameController).
         ENABLE_APP_SANDBOX: NO
         ENABLE_HARDENED_RUNTIME: NO
   porthole-decode-test:
@@ -55,6 +55,7 @@ targets:
     sources:
       - path: InputTest
       - path: Porthole/Streaming/WireProtocol.swift
+      - path: Porthole/Streaming/ClientClock.swift
       - path: Porthole/Streaming/ControlChannel.swift
       - path: Porthole/Input/KeyMap.swift
       - path: Porthole/Input/InputMessages.swift

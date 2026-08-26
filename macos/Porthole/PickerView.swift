@@ -90,7 +90,8 @@ struct PickerView: View {
                 .foregroundStyle(.secondary)
             Text("No machines found")
                 .font(.title3)
-            Text("Porthole agents announce themselves over mDNS.\nOff-LAN machines (Tailscale) can be added by address above.")
+            Text("Porthole agents announce themselves over mDNS.\n"
+                 + "Off-LAN machines (Tailscale) can be added by address above.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -214,7 +215,7 @@ struct MachineCardView: View {
         if let image = card.thumbnail {
             Image(decorative: image, scale: 1)
                 .resizable()
-                .aspectRatio(contentMode: .fill)
+                .scaledToFill()
         } else {
             ZStack {
                 LinearGradient(colors: [Color(white: 0.16), Color(white: 0.09)],

@@ -51,8 +51,8 @@ final class MachineStore: ObservableObject {
         }
         loadPersisted()
         discovery.start()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) {
-            [weak self] _ in self?.pollThumbnails()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
+            self?.pollThumbnails()
         }
     }
 
@@ -67,9 +67,11 @@ final class MachineStore: ObservableObject {
         switch event {
         case .online(let machine):
             if let index = cards.firstIndex(where: { $0.id == machine.id }) {
-                // Keep a user rename; take the fresh addresses/ports/caps.
+                // Keep a user rename and the learned dial preference; take
+                // the fresh addresses/ports/caps.
                 var updated = machine
                 updated.name = cards[index].machine.name
+                updated.preferredHost = cards[index].machine.preferredHost
                 cards[index].machine = updated
                 cards[index].online = true
                 cards[index].isPinned = isPersisted(machine.id)
@@ -169,20 +171,27 @@ final class MachineStore: ObservableObject {
 
     private func poll(machine: Machine) {
         Task.detached { [weak self] in
-            // Walk the same address candidates as the control dialer: LAN
-            // address first, bare host name (MagicDNS) fallback.
-            let candidates = machine.addressCandidates.isEmpty ? [machine.host] : machine.addressCandidates
-            var fetched: CGImage?
-            for host in candidates {
-                fetched = await ThumbnailFetcher.fetch(host: host, port: machine.thumbPort)
-                if fetched != nil { break }
+            // Walk the same address order as the control dialer, and remember
+            // which candidate answered so the dialer can start there.
+            var fetched: (image: CGImage, host: String)?
+            for host in machine.dialOrder {
+                if let image = await ThumbnailFetcher.fetch(host: host, port: machine.thumbPort) {
+                    fetched = (image, host)
+                    break
+                }
             }
-            let image = fetched
+            let result = fetched
             await MainActor.run { [weak self] in
                 guard let self, let index = self.cards.firstIndex(where: { $0.id == machine.id }) else { return }
-                if let image {
-                    self.cards[index].thumbnail = image
+                if let result {
+                    self.cards[index].thumbnail = result.image
                     self.cards[index].online = true
+                    if self.cards[index].machine.preferredHost != result.host {
+                        self.cards[index].machine.preferredHost = result.host
+                        if self.cards[index].isPinned {
+                            self.persist(self.cards[index].machine)
+                        }
+                    }
                 } else if machine.isManual {
                     // Manual machines have no mDNS presence; a failed poll is
                     // the offline signal.

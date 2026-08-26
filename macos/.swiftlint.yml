@@ -1,16 +1,34 @@
-# Porthole Mac client — light SwiftLint config.
-# Kept deliberately loose for the scaffold; tighten as the codebase grows.
+# Porthole Mac client SwiftLint config. `swiftlint lint --strict` from macos/
+# is a gate, so every rule here is tuned on purpose rather than left loose.
 opt_in_rules:
   - empty_count
   - first_where
 line_length:
   warning: 120
   error: 140
+# Coordinate and color-math names that the domain spells this way: x/y
+# for output pixels, dx/dy for relative motion, kr/kb/kg for the YCbCr
+# matrix coefficients, id for Identifiable. Note that `excluded` replaces
+# SwiftLint's default list, which is why `id` is repeated here.
+identifier_name:
+  excluded:
+    - x
+    - y
+    - kr
+    - kb
+    - kg
+    - id
+    - dx
+    - dy
+# StreamSession coordinates connect, reassembly, decode, latency stats and
+# input for one session; splitting it further would scatter one lifecycle
+# across files. Warning raised from the 250 default to 300, error to 400.
 type_body_length:
-  warning: 250
-  error: 350
+  warning: 300
+  error: 400
 file_length:
   warning: 400
   error: 600
 excluded:
   - Porthole.xcodeproj
+  - build

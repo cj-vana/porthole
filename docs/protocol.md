@@ -2,7 +2,9 @@
 
 Implemented by `porthole-agent` (Rust, `agent/src/protocol.rs` is the
 reference implementation) and the Porthole Mac client. Version 1 covers
-video, control, and input; audio rides its own UDP port later (US-009).
+video, control, input, and latency stats; audio rides its own UDP port
+later (US-009). Both sides ignore control message types they do not know,
+so additions within version 1 stay compatible.
 
 Two channels:
 
@@ -53,6 +55,59 @@ two of gap and a bitrate spike from the IDR; periodic IDRs (every
 
 The video sequence number is NOT reset by an encoder restart; receivers
 should treat it as one continuous stream.
+
+### ping (type 0x03, client -> agent) and pong (type 0x04, agent -> client)
+
+Round-trip and clock-offset probe for the latency stats. The client sends
+ping with its own monotonic timestamp; the agent answers as soon as the
+control reader decodes it (no trip through the video pipeline) with that
+timestamp echoed and its own pipeline clock, the same clock the video
+datagram timestamps use. Both ends set TCP_NODELAY on the control
+connection; without it, Nagle plus delayed ACKs batch the small input and
+probe messages into 40 ms clumps.
+
+ping payload:
+
+```
+offset  size  field
+0       8     client timestamp (BE u64, microseconds, any monotonic clock)
+```
+
+pong payload:
+
+```
+offset  size  field
+0       8     echoed client timestamp (BE u64)
+8       8     agent timestamp (BE u64, microseconds since pipeline start)
+```
+
+Client math: `rtt = now - echoed`; `offset = agent_ts - (echoed + rtt / 2)`
+(agent clock minus client clock). Keep the offset from the lowest-RTT
+sample within a sliding window of recent pongs (the two monotonic clocks
+drift by tens of ppm, so an all-time minimum slowly reports phantom
+latency growth). A frame captured at datagram timestamp `t` then maps to
+client time `t - offset`, so `present_time - (t - offset)` is
+capture-to-present latency. The reference client sends a short burst of
+pings on connect so the estimate converges quickly, then one per second.
+A client talking to an agent that predates this message gets no pong and
+should leave the offset-based fields blank rather than guess.
+
+### agent_stats (type 0x05, agent -> client, once per second)
+
+The agent's side of the per-second stats, so the client can split its
+capture-to-arrival measurement into encode and transport.
+
+```
+offset  size  field
+0       2     capture fps (BE u16)
+2       2     encoded fps (BE u16)
+4       4     encode latency (BE u32, microseconds): mean over the last
+              second from frame submit to access unit ready
+8       4     transmit rate (BE u32, kbit/s)
+12      2     keyframes encoded in the last second (BE u16)
+```
+
+Payload length is 14. Sent only while a client is connected.
 
 ### Input messages (client -> agent, US-006)
 
@@ -132,8 +187,18 @@ Example: holding shift is `depressed=1, latched=0, locked=0, group=0`.
 ## Video channel (UDP)
 
 Each encoded access unit (Annex B h264/hevc) is split into fragments with a
-fixed 25-byte header. Max datagram size is 1400 bytes (safe under a
-1500-byte MTU), so max fragment payload is 1375 bytes.
+fixed 25-byte header. The datagram size ceiling is 1400 bytes (safe under a
+1500-byte MTU), so the largest fragment payload is 1375 bytes. The agent
+sizes datagrams from its `mtu` setting (default 1280, the IPv6 minimum and
+the WireGuard/Tailscale tunnel MTU): datagram size = mtu - 28 (IPv4 + UDP
+headers), so 1252-byte datagrams by default. A datagram that has to be
+IP-fragmented in transit is lost when any piece is lost, which is what
+made keyframe bursts unrecoverable over a 1280-byte tunnel with
+1400-byte datagrams. Receivers accept any size up to the ceiling.
+
+Keyframe access units are several hundred datagrams; the agent paces those
+bursts (see `transport`) so a 1 Gbit link or a userspace tunnel does not
+drop the tail of the burst.
 
 ```
 offset  size  field
@@ -162,7 +227,8 @@ Receiver rules:
 
 Reference receiver: `cargo run --example receiver -- <agent-ip> [--dump
 out.h264]`. Scripted input sender: `cargo run --example input_sender --
-<agent-ip> <move-abs|move-rel|click|scroll|type> ...`.
+<agent-ip> <move-abs|move-rel|click|scroll|type> ...`. Compositor protocol
+listing: `cargo run --example wl_globals` on the Linux machine.
 
 ## Discovery and thumbnails (US-007a)
 
