@@ -17,6 +17,7 @@ pub const DEFAULT_PORT_VIDEO: u16 = 52800;
 pub const DEFAULT_PORT_CONTROL: u16 = 52801;
 pub const DEFAULT_PORT_AUDIO: u16 = 52802;
 pub const DEFAULT_PORT_THUMBNAIL: u16 = 52803;
+pub const DEFAULT_PORT_FILES: u16 = 52804;
 pub const DEFAULT_BITRATE_MBPS: u32 = 40;
 pub const DEFAULT_FPS: u16 = 60;
 pub const DEFAULT_KEYFRAME_INTERVAL_SECS: u32 = 2;
@@ -270,6 +271,10 @@ pub struct Config {
     /// The client flips this at runtime with a settings message; the TOML
     /// and CLI value is the startup default.
     pub low_latency: bool,
+    /// TCP port for the file-transfer endpoint (default 52804, US-011).
+    pub port_files: u16,
+    /// Folder dragged files are written to (default ~/Downloads, US-011).
+    pub transfer_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -289,6 +294,8 @@ impl Default for Config {
             mtu: Mtu::default(),
             vaapi_device: None,
             low_latency: false,
+            port_files: DEFAULT_PORT_FILES,
+            transfer_dir: None,
         }
     }
 }
@@ -308,6 +315,12 @@ impl Config {
 
     pub fn thumbnail_addr(&self) -> SocketAddr {
         SocketAddr::from(([0, 0, 0, 0], self.port_thumbnail))
+    }
+
+    /// Bind address for the file-transfer endpoint (US-011).
+    #[allow(dead_code)] // used once the file-transfer server lands
+    pub fn files_addr(&self) -> SocketAddr {
+        SocketAddr::from(([0, 0, 0, 0], self.port_files))
     }
 }
 
@@ -329,8 +342,9 @@ pub struct FileConfig {
     pub mtu: Option<Mtu>,
     pub vaapi_device: Option<PathBuf>,
     pub low_latency: Option<bool>,
-    // FR-11 later: display index/output name and the file-transfer folder
-    // (US-011, default ~/Downloads).
+    pub port_files: Option<u16>,
+    pub transfer_dir: Option<PathBuf>,
+    // FR-11 later: display index/output name.
 }
 
 impl FileConfig {
@@ -376,6 +390,12 @@ impl FileConfig {
         }
         if let Some(v) = self.low_latency {
             cfg.low_latency = v;
+        }
+        if let Some(v) = self.port_files {
+            cfg.port_files = v;
+        }
+        if let Some(v) = self.transfer_dir {
+            cfg.transfer_dir = Some(v);
         }
     }
 }

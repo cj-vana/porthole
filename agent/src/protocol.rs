@@ -208,6 +208,79 @@ impl AgentStats {
     }
 }
 
+/// Control message type: clipboard text, either direction (US-008).
+pub const CONTROL_MSG_CLIPBOARD: u8 = 7;
+/// Control message type: client -> agent gamepad state (US-014).
+pub const CONTROL_MSG_GAMEPAD: u8 = 8;
+
+/// Clipboard text sync (US-008). Sent by whichever side's clipboard changed;
+/// the payload is UTF-8 text (no trailing NUL). Loop prevention is the
+/// receiver's job: it remembers the text it was handed and does not echo an
+/// identical value back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Clipboard {
+    pub text: String,
+}
+
+impl Clipboard {
+    pub fn encode(&self) -> Vec<u8> {
+        self.text.as_bytes().to_vec()
+    }
+
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        Some(Self {
+            text: String::from_utf8(payload.to_vec()).ok()?,
+        })
+    }
+}
+
+/// gamepad_state payload length: buttons(4) + 6 axes(2 each) + hat(1).
+pub const GAMEPAD_PAYLOAD_LEN: usize = 4 + 12 + 1;
+
+/// Gamepad state (US-014), sent by the client whenever a control changes.
+/// The agent maps it onto a virtual uinput gamepad.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GamepadState {
+    /// Bitmask of pressed buttons; bit order matches the SDL/XInput layout
+    /// documented in docs/protocol.md.
+    pub buttons: u32,
+    /// Left stick x/y, right stick x/y, left trigger, right trigger, each
+    /// -32768..32767 (triggers use 0..32767).
+    pub axes: [i16; 6],
+    /// D-pad hat: 0 centered, 1 up, 2 right, 4 down, 8 left, combined for
+    /// diagonals (matches the common 8-way encoding).
+    pub hat: u8,
+}
+
+impl GamepadState {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(GAMEPAD_PAYLOAD_LEN);
+        out.extend_from_slice(&self.buttons.to_be_bytes());
+        for axis in self.axes {
+            out.extend_from_slice(&axis.to_be_bytes());
+        }
+        out.push(self.hat);
+        out
+    }
+
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        if payload.len() != GAMEPAD_PAYLOAD_LEN {
+            return None;
+        }
+        let buttons = u32::from_be_bytes(payload[0..4].try_into().ok()?);
+        let mut axes = [0i16; 6];
+        for (index, axis) in axes.iter_mut().enumerate() {
+            let start = 4 + index * 2;
+            *axis = i16::from_be_bytes(payload[start..start + 2].try_into().ok()?);
+        }
+        Some(Self {
+            buttons,
+            axes,
+            hat: payload[16],
+        })
+    }
+}
+
 // Input messages (client -> agent, US-006). All are fixed-size.
 /// Pointer moved to absolute output pixel coordinates.
 pub const CONTROL_MSG_POINTER_MOTION_ABS: u8 = 0x10;
@@ -759,6 +832,39 @@ mod tests {
         bad[3] = 9;
         assert!(parse_audio_datagram(&bad).is_none());
         assert!(parse_audio_datagram(&audio_datagram(1, 0, &[])).is_none());
+    }
+
+    #[test]
+    fn clipboard_and_gamepad_round_trip() {
+        let clip = Clipboard {
+            text: "hello \u{1f600} world".to_string(),
+        };
+        assert_eq!(Clipboard::decode(&clip.encode()), Some(clip.clone()));
+        // Empty clipboard is valid (a cleared selection).
+        assert_eq!(
+            Clipboard::decode(&[]),
+            Some(Clipboard {
+                text: String::new()
+            })
+        );
+        // Invalid UTF-8 is rejected.
+        assert!(Clipboard::decode(&[0xff, 0xfe]).is_none());
+
+        let pad = GamepadState {
+            buttons: 0x0000_1234,
+            axes: [-32768, 32767, 0, -1, 100, 200],
+            hat: 6,
+        };
+        let payload = pad.encode();
+        assert_eq!(payload.len(), GAMEPAD_PAYLOAD_LEN);
+        assert_eq!(GamepadState::decode(&payload), Some(pad));
+        assert!(GamepadState::decode(&[0; GAMEPAD_PAYLOAD_LEN - 1]).is_none());
+        // Framed through the control channel.
+        let framed = encode_control_message(CONTROL_MSG_GAMEPAD, &payload);
+        let mut cursor = std::io::Cursor::new(framed);
+        let (t, p) = read_control_message(&mut cursor).unwrap().expect("message");
+        assert_eq!(t, CONTROL_MSG_GAMEPAD);
+        assert_eq!(GamepadState::decode(&p), Some(pad));
     }
 
     #[test]

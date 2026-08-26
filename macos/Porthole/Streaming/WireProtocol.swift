@@ -29,6 +29,10 @@ enum ControlMessageType: UInt8 {
     /// client -> agent (US-013): reconfigure the live stream. 6 bytes; the
     /// agent restarts its encoder and answers with a fresh hello.
     case settings = 0x06
+    /// either direction (US-008): clipboard text, UTF-8 payload.
+    case clipboard = 0x07
+    /// client -> agent (US-014): gamepad state, 17-byte payload.
+    case gamepad = 0x08
     // Input messages (client -> agent, US-006). Layouts in docs/protocol.md.
     case pointerMotionAbs = 0x10
     case pointerMotionRel = 0x11

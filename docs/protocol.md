@@ -204,6 +204,55 @@ Payload length is 16. Masks use the classic X11/xkb bit order: bit 0 Shift,
 bit 1 Lock (Caps Lock), bit 2 Control, bit 3 Mod1 (Alt), bit 6 Mod4 (Super).
 Example: holding shift is `depressed=1, latched=0, locked=0, group=0`.
 
+### clipboard (type 0x07, either direction, US-008)
+
+Clipboard text sync. Either side sends this when its own clipboard changes;
+the payload is the UTF-8 text with no trailing NUL (an empty payload clears
+the selection). To avoid a sync loop, the receiver remembers the text it was
+handed and does not send an identical value back out.
+
+### gamepad_state (type 0x08, client -> agent, US-014)
+
+The client sends the full controller state whenever any control changes; the
+agent maps it onto a virtual uinput gamepad.
+
+```
+offset  size  field
+0       4     buttons (BE u32): bitmask, SDL GameController button order
+              (0 A, 1 B, 2 X, 3 Y, 4 back, 5 guide, 6 start, 7 left stick,
+              8 right stick, 9 left shoulder, 10 right shoulder)
+4       2     left stick x (BE i16, -32768..32767)
+6       2     left stick y (BE i16)
+8       2     right stick x (BE i16)
+10      2     right stick y (BE i16)
+12      2     left trigger (BE i16, 0..32767)
+14      2     right trigger (BE i16, 0..32767)
+16      1     hat: 0 centered, bit 0 up, bit 1 right, bit 2 down, bit 3 left
+```
+
+Payload length is 17.
+
+## File transfer (TCP, US-011)
+
+Files dragged onto the session window are sent over their own TCP connection
+to the file port (default 52804, agent `--port-files`), one connection per
+file, so a large transfer never competes with the video path. The client
+connects and writes:
+
+```
+offset  size  field
+0       2     name length in bytes (BE u16)
+2       n     file name (UTF-8, no path separators; the agent strips any)
+2+n     8     file size in bytes (BE u64)
+10+n    size  file contents
+```
+
+The agent writes the file into its configured transfer folder (default
+`~/Downloads`, agent `--transfer-dir`) under a temporary name and renames it
+into place once the full size has arrived, so a partial transfer never
+leaves a file that looks complete. The connection closes when the agent has
+the whole file. This channel carries no video or control traffic.
+
 ## Video channel (UDP)
 
 Each encoded access unit (Annex B h264/hevc) is split into fragments with a

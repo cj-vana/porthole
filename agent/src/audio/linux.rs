@@ -106,12 +106,8 @@ fn run(port_audio: u16, pipeline_epoch_us: u64, client_rx: mpsc::Receiver<Option
                     pipeline_epoch_us + packet.timestamp_us,
                     &packet.data,
                 );
-                match socket.send_to(&datagram, client_addr) {
-                    Ok(_) if sequence % 250 == 0 => {
-                        tracing::debug!(sequence, bytes = packet.data.len(), "audio streaming")
-                    }
-                    Ok(_) => {}
-                    Err(err) => tracing::debug!(%err, "audio send failed"),
+                if let Err(err) = socket.send_to(&datagram, client_addr) {
+                    tracing::debug!(%err, "audio send failed");
                 }
                 sequence = sequence.wrapping_add(1);
             }

@@ -13,6 +13,12 @@
 # TCP port for the thumbnail endpoint (machine picker).
 # port_thumbnail = 52803
 
+# TCP port for the file-transfer endpoint (drag and drop, US-011).
+# port_files = 52804
+
+# Folder that dragged files are written to (default ~/Downloads).
+# transfer_dir = "/home/you/Downloads"
+
 # Machine name announced via mDNS and shown in the picker (default: hostname).
 # name = "my-linux-box"
 
