@@ -142,6 +142,37 @@ final class MachineStore: ObservableObject {
         }
     }
 
+    /// Change a manual machine's address (US-012). The id stays
+    /// "manual:<old host>": rewriting it to match the new host would strand
+    /// the persisted entry and the lastSessionMachine record, both keyed by
+    /// id, so only the dialing fields move. Manual machines only; discovered
+    /// ones get their address from mDNS.
+    func updateAddress(id: String, host: String) {
+        guard let index = cards.firstIndex(where: { $0.id == id }),
+              cards[index].machine.isManual else { return }
+        var machine = cards[index].machine
+        if machine.name == machine.host {
+            // The name was never customized, so it still mirrors the host.
+            machine.name = host
+        }
+        machine.host = host
+        machine.addressCandidates = [host]
+        machine.preferredHost = nil
+        cards[index].machine = machine
+        if isPersisted(id) {
+            persist(machine)
+        }
+        // Auto-reconnect keeps a full snapshot; refresh it so the next
+        // launch does not dial the old address.
+        if let data = UserDefaults.standard.data(forKey: "lastSessionMachine"),
+           let last = try? JSONDecoder().decode(Machine.self, from: data),
+           last.id == id,
+           let updated = try? JSONEncoder().encode(machine) {
+            UserDefaults.standard.set(updated, forKey: "lastSessionMachine")
+        }
+        poll(machine: machine)
+    }
+
     /// Called when the user opens a session: discovered machines pin on
     /// first connect (US-012), and the machine becomes the auto-reconnect
     /// target.

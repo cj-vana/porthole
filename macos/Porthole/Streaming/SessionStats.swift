@@ -76,8 +76,9 @@ struct StatsWindow {
     /// `rttMicros` and `agentStats` are the latest received rather than this
     /// window's: the agent's once-per-second timer is not phase-locked to
     /// ours, so a window can see zero or two of them. Both print n/a until
-    /// the agent has supplied one.
-    func line(rttMicros: UInt64?, agentStats: AgentStats?, queueDepth: Int) -> String {
+    /// the agent has supplied one. `audio` is the player's own per-second
+    /// window (US-009); all zeros until audio packets flow.
+    func line(rttMicros: UInt64?, agentStats: AgentStats?, queueDepth: Int, audio: AudioPlayer.Stats) -> String {
         func ms(_ value: Double?, _ digits: Int) -> String {
             value.map { String(format: "%.\(digits)f", $0) } ?? "n/a"
         }
@@ -96,6 +97,11 @@ struct StatsWindow {
             + " queue=\(queueDepth)"
             + " agent_fps=\(agentFps)"
             + " tx_kbps=\(txKbps)"
+            + " audio_buf_ms=\(audio.bufferedMs)"
+            + " audio_pkts=\(audio.packets)"
+            + " audio_lost=\(audio.lost)"
+            + " audio_drop_ms=\(audio.droppedMs)"
+            + " audio_underrun=\(audio.underruns)"
     }
 
     /// The published per-second figures (header summary and stats HUD).

@@ -13,6 +13,8 @@ final class ControlChannel {
         case hello(Hello)
         case pong(Pong)
         case agentStats(AgentStats)
+        /// Text the agent's clipboard picked up (US-008).
+        case clipboard(String)
         case disconnected(reason: String)
     }
 
@@ -93,6 +95,20 @@ final class ControlChannel {
         connection?.send(content: frame, completion: .contentProcessed { _ in })
     }
 
+    /// Clipboard text sync (US-008): UTF-8 payload, no trailing NUL. An
+    /// empty string clears the remote selection.
+    func sendClipboard(_ text: String) {
+        let frame = WireProtocol.encodeControlMessage(.clipboard, payload: Data(text.utf8))
+        connection?.send(content: frame, completion: .contentProcessed { _ in })
+    }
+
+    /// Full controller state (US-014), sent whenever a control changes; the
+    /// agent applies it to a virtual uinput gamepad.
+    func sendGamepad(buttons: UInt32, axes: [Int16], hat: UInt8) {
+        let frame = WireProtocol.encodeGamepad(buttons: buttons, axes: axes, hat: hat)
+        connection?.send(content: frame, completion: .contentProcessed { _ in })
+    }
+
     /// Latency probe; the agent echoes the timestamp in a pong.
     func sendPing() {
         let frame = WireProtocol.encodePing(clientTimestampMicros: ClientClock.nowMicros())
@@ -152,6 +168,12 @@ final class ControlChannel {
                 onEvent?(.agentStats(stats))
             } else {
                 logger.warning("ignoring malformed agent_stats (\(payload.count) bytes)")
+            }
+        case .clipboard:
+            if let text = String(data: payload, encoding: .utf8) {
+                onEvent?(.clipboard(text))
+            } else {
+                logger.warning("ignoring non-UTF-8 clipboard (\(payload.count) bytes)")
             }
         default:
             break // the remaining types are client -> agent

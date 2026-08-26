@@ -8,7 +8,13 @@ enum WireProtocol {
     static let controlPort: UInt16 = 52801
     /// Default UDP video port; the authoritative value arrives in `hello`.
     static let defaultVideoPort: UInt16 = 52800
-    /// Protocol version byte in every video datagram.
+    /// UDP audio port (agent `--port-audio`, US-009). `hello` carries no
+    /// audio port, so the default is assumed rather than negotiated.
+    static let audioPort: UInt16 = 52802
+    /// TCP file transfer port (agent `--port-files`, US-011). Each dropped
+    /// file rides its own connection here, off the video path.
+    static let filePort: UInt16 = 52804
+    /// Protocol version byte in every video and audio datagram.
     static let version: UInt8 = 1
 }
 
@@ -161,6 +167,28 @@ extension WireProtocol {
         return encodeControlMessage(.settings, payload: payload)
     }
 
+    /// Encode a `gamepad_state` control frame (US-014):
+    ///
+    /// ```
+    /// offset  size  field
+    /// 0       4     buttons (BE u32, SDL GameController bit order)
+    /// 4       12    six axes (BE i16 each): left stick x/y, right stick
+    ///               x/y, left trigger, right trigger
+    /// 16      1     hat: bit 0 up, 1 right, 2 down, 3 left
+    /// ```
+    ///
+    /// The payload is fixed at 17 bytes, so exactly six axis values are
+    /// framed; a short `axes` array reads as centered for the remainder.
+    static func encodeGamepad(buttons: UInt32, axes: [Int16], hat: UInt8) -> Data {
+        var payload = Data(capacity: 17)
+        payload.appendUInt32BE(buttons)
+        for index in 0..<6 {
+            payload.appendUInt16BE(UInt16(bitPattern: index < axes.count ? axes[index] : 0))
+        }
+        payload.append(hat)
+        return encodeControlMessage(.gamepad, payload: payload)
+    }
+
     /// Header of one video datagram fragment (25 bytes, fixed):
     ///
     /// ```
@@ -206,6 +234,41 @@ extension WireProtocol {
             isKeyframe: data[24] & 0x01 != 0
         )
         return (header, data.subdata(in: DatagramHeader.length..<data.count))
+    }
+
+    /// One audio datagram (US-009): a 16-byte header, then one Opus packet
+    /// (48 kHz stereo, 20 ms frames).
+    ///
+    /// ```
+    /// offset  size  field
+    /// 0       3     magic: "PHA"
+    /// 3       1     protocol version (1)
+    /// 4       4     sequence (BE u32), per packet, from 0
+    /// 8       8     timestamp (BE u64), microseconds on the agent pipeline
+    ///               clock, the same clock as the video timestamps
+    /// 16      n     one Opus packet
+    /// ```
+    struct AudioDatagram {
+        static let headerLength = 16
+
+        let sequence: UInt32
+        let timestampMicros: UInt64
+        let opus: Data
+    }
+
+    /// Parse one audio UDP datagram. Returns nil for malformed datagrams
+    /// (wrong magic, version, or an empty payload).
+    static func parseAudioDatagram(_ data: Data) -> AudioDatagram? {
+        guard data.count > AudioDatagram.headerLength,
+              data[0] == 0x50, data[1] == 0x48, data[2] == 0x41, // "PHA"
+              data[3] == version else {
+            return nil
+        }
+        return AudioDatagram(
+            sequence: data.readUInt32BE(at: 4),
+            timestampMicros: data.readUInt64BE(at: 8),
+            opus: data.subdata(in: AudioDatagram.headerLength..<data.count)
+        )
     }
 
     /// Encode one length-prefixed control frame: 4-byte BE length including

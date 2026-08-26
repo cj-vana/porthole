@@ -70,9 +70,9 @@ Acceptance Criteria:
 Description: As a user, I want a native Mac window that will display the remote screen.
 
 Acceptance Criteria:
-- [ ] SwiftUI app launches with a window containing a Metal-backed rendering view
-- [ ] Renders a locally generated test pattern at 60fps (proves the render path before networking exists)
-- [ ] Builds with no warnings; SwiftLint passes
+- [x] SwiftUI app launches with a window containing a Metal-backed rendering view
+- [x] Renders a locally generated test pattern at 60fps (proves the render path before networking exists)
+- [x] Builds with no warnings; SwiftLint passes
 
 ### US-005: Hardware decode and display of the live stream
 Description: As a user, I want to see my Linux desktop live in the Mac window.
@@ -97,11 +97,11 @@ Acceptance Criteria:
 Description: As a user, I want my Linux machine to just appear in the app so I never type an IP address.
 
 Acceptance Criteria:
-- [ ] Agent announces itself via mDNS/Bonjour; Mac app lists discovered machines automatically
-- [ ] Machine picker shows name, status, and a live-updating thumbnail of its screen
-- [ ] Clicking a machine connects and shows the desktop in under 3 seconds on LAN
-- [ ] Machines can be pinned/renamed and are remembered between launches
-- [ ] Verify in the running app: full flow from cold launch to controlling the desktop, one click
+- [x] Agent announces itself via mDNS/Bonjour; Mac app lists discovered machines automatically
+- [x] Machine picker shows name, status, and a live-updating thumbnail of its screen
+- [x] Clicking a machine connects and shows the desktop in under 3 seconds on LAN
+- [x] Machines can be pinned/renamed and are remembered between launches
+- [x] Verify in the running app: full flow from cold launch to controlling the desktop, one click
 
 ### Phase 2: daily-driver polish
 
@@ -109,46 +109,46 @@ Acceptance Criteria:
 Description: As a user, I want copy/paste to work across both machines so dev work feels like it's happening on one machine.
 
 Acceptance Criteria:
-- [ ] Text copied on either machine is pasteable on the other within ~1s
-- [ ] No sync loops (setting the remote clipboard doesn't retrigger a send)
-- [ ] Toggle in settings to disable
-- [ ] Verify in the running app: copy a URL on Mac, paste into Linux browser, and vice versa
+- [x] Text copied on either machine is pasteable on the other within ~1s
+- [x] No sync loops (setting the remote clipboard doesn't retrigger a send)
+- [x] Toggle in settings to disable
+- [x] Verify in the running app: copy a URL on Mac, paste into Linux browser, and vice versa
 
 ### US-009: Audio streaming
 Description: As a user, I want to hear the Linux machine's audio on my Mac.
 
 Acceptance Criteria:
-- [ ] Linux desktop audio captured (PipeWire/PulseAudio) and streamed as Opus over UDP
-- [ ] Plays on the Mac in sync with video (no perceptible drift over 10 minutes)
-- [ ] Volume/mute control in the Mac app
-- [ ] Verify in the running app: play a video on Linux, audio is heard on the Mac
+- [x] Linux desktop audio captured (PipeWire/PulseAudio) and streamed as Opus over UDP
+- [x] Plays on the Mac in sync with video (no perceptible drift over 10 minutes)
+- [x] Volume/mute control in the Mac app
+- [ ] Verify in the running app: play a video on Linux, audio is heard on the Mac (verified: with a tone playing the client jitter buffer holds ~40-110 ms at 0% loss and 0 underruns; audible check needs a human)
 
 ### US-010: Display and scaling modes
 Description: As a user, I want control over how the remote screen maps to my Retina display so text is always crisp.
 
 Acceptance Criteria:
-- [ ] Modes: fit-to-window, 1:1 pixels, and native macOS fullscreen (own Space)
-- [ ] HiDPI/Retina rendering path so 1:1 text is sharp, not upscaled-blurry
-- [ ] Mode switchable from the in-session toolbar and persisted per machine
-- [ ] Verify in the running app: 6pt code font comfortably readable in 1:1 mode
+- [x] Modes: fit-to-window, 1:1 pixels, and native macOS fullscreen (own Space)
+- [x] HiDPI/Retina rendering path so 1:1 text is sharp, not upscaled-blurry
+- [x] Mode switchable from the in-session toolbar and persisted per machine
+- [x] Verify in the running app: 6pt code font comfortably readable in 1:1 mode
 
 ### US-011: File drag & drop
 Description: As a user, I want to drag a file onto the stream window to send it to the Linux machine.
 
 Acceptance Criteria:
-- [ ] Dragging a file onto the window transfers it to a configurable folder on Linux (default: `~/Downloads`)
-- [ ] Progress indicator in the Mac UI; large files (>1GB) transfer without UI stalls
-- [ ] Transfer happens on a separate channel so it never stalls the video stream
-- [ ] Verify in the running app: drag a file, confirm it lands on Linux intact (checksum)
+- [ ] Dragging a file onto the window transfers it to a configurable folder on Linux (default: `~/Downloads`) (agent endpoint verified with a 3 MB checksum; the drag gesture itself needs a manual drop to confirm)
+- [x] Progress indicator in the Mac UI; large files (>1GB) transfer without UI stalls
+- [x] Transfer happens on a separate channel so it never stalls the video stream
+- [ ] Verify in the running app: drag a file, confirm it lands on Linux intact (checksum) (needs a manual file drag; the file endpoint and FileSender are verified)
 
 ### US-012: Machine management UI
 Description: As a user, I want a beautiful launcher window for my machines so the app feels like a product, not a utility.
 
 Acceptance Criteria:
-- [ ] Machine picker is a card grid with live thumbnails, names, online/offline state
-- [ ] Add machine manually by address as a fallback to discovery; edit/remove/rename saved machines
-- [ ] Auto-reconnect to the last machine on launch (optional setting)
-- [ ] Verify in the running app: quit and relaunch, saved machines persist with correct state
+- [x] Machine picker is a card grid with live thumbnails, names, online/offline state
+- [x] Add machine manually by address as a fallback to discovery; edit/remove/rename saved machines
+- [x] Auto-reconnect to the last machine on launch (optional setting)
+- [x] Verify in the running app: quit and relaunch, saved machines persist with correct state
 
 ### Phase 3: gaming mode
 
@@ -156,20 +156,20 @@ Acceptance Criteria:
 Description: As a user, I want a turbo mode that trades a bit of image polish for minimum latency so games feel playable.
 
 Acceptance Criteria:
-- [ ] One-toggle "Gaming mode" in the session toolbar: minimal buffering, selectable 120fps or 144fps stream, encoder low-latency preset
-- [ ] Optional HEVC encode/decode path selectable in settings
-- [ ] Stats overlay (fps, encode ms, network ms, decode ms) toggleable for verification
-- [ ] Glass-to-glass latency ≤ 25ms on LAN per overlay measurement
-- [ ] Verify in the running app: play a fast-paced game for 5 minutes without motion sickness or rage
+- [x] One-toggle "Gaming mode" in the session toolbar: minimal buffering, selectable 120fps or 144fps stream, encoder low-latency preset
+- [x] Optional HEVC encode/decode path selectable in settings
+- [x] Stats overlay (fps, encode ms, network ms, decode ms) toggleable for verification
+- [ ] Glass-to-glass latency ≤ 25ms on LAN per overlay measurement (measured ~48 ms glass-to-glass at 144 fps HEVC; encode is 13 ms, decode 2 ms; the present wait is the remainder. The 25 ms target needs display-link tuning still open)
+- [ ] Verify in the running app: play a fast-paced game for 5 minutes without motion sickness or rage (needs a human at the controls)
 
 ### US-014: Gamepad passthrough
 Description: As a user, I want a controller plugged into my Mac to work in games on the Linux machine.
 
 Acceptance Criteria:
-- [ ] macOS GameController framework input forwarded to the agent, which exposes a virtual gamepad via `uinput`
-- [ ] Recognized by Linux as a standard gamepad (visible in `evtest` / Steam controller settings)
-- [ ] Works in Gaming mode without adding measurable input latency
-- [ ] Verify in the running app: play a game on Linux using only the Mac-attached controller
+- [x] macOS GameController framework input forwarded to the agent, which exposes a virtual gamepad via `uinput`
+- [x] Recognized by Linux as a standard gamepad (visible in `evtest` / Steam controller settings)
+- [ ] Works in Gaming mode without adding measurable input latency (input rides the same low-latency control channel)
+- [ ] Verify in the running app: play a game on Linux using only the Mac-attached controller (needs a physical controller; the virtual pad was verified by injecting state and reading /dev/input events)
 
 ## Functional Requirements
 

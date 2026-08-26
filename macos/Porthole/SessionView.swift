@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Session screen: the Metal surface plus floating chrome (US-005, US-006,
 /// US-010, US-013). Opened from the picker for a specific machine and
@@ -22,12 +23,20 @@ struct SessionView: View {
     @AppStorage("gamingFps") private var gamingFps = 144
     /// Latency HUD over the stream (US-013).
     @AppStorage("statsOverlay") private var statsOverlay = false
+    /// Remote audio playback level, 0 to 1 (US-009).
+    @AppStorage("audioVolume") private var audioVolume = 0.8
+    /// Mutes remote audio while keeping the slider position.
+    @AppStorage("audioMuted") private var audioMuted = false
+    /// Two-way clipboard text sync (US-008); off pauses without disconnecting.
+    @AppStorage("clipboardSync") private var clipboardSync = true
 
     let machine: Machine
     @State private var host: String
     /// US-010 display mode, persisted per machine.
     @State private var displayMode: DisplayMode
     @StateObject private var session = StreamSession()
+    /// Drag-and-drop file transfers to the connected machine (US-011).
+    @StateObject private var transfers = FileTransferList()
 
     init(machine: Machine) {
         self.machine = machine
@@ -58,6 +67,13 @@ struct SessionView: View {
                     .padding(.trailing, 16)
             }
         }
+        .overlay(alignment: .bottomTrailing) {
+            FileTransferOverlay(transfers: transfers)
+                .padding(16)
+        }
+        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+            handleDrop(providers)
+        }
         .frame(minWidth: 1100, minHeight: 600)
         .background(Color.black)
         .preferredColorScheme(.dark)
@@ -65,9 +81,21 @@ struct SessionView: View {
         .onAppear {
             session.input.sendSystemShortcuts = sendSystemShortcuts
             session.input.wantsPointerLock = pointerLock
+            session.audio.setVolume(Float(audioVolume))
+            session.audio.setMuted(audioMuted)
+            session.setClipboardSync(clipboardSync)
             if !session.isConnected, !host.isEmpty {
                 connect()
             }
+        }
+        .onChange(of: clipboardSync) { _, enabled in
+            session.setClipboardSync(enabled)
+        }
+        .onChange(of: audioVolume) { _, volume in
+            session.audio.setVolume(Float(volume))
+        }
+        .onChange(of: audioMuted) { _, muted in
+            session.audio.setMuted(muted)
         }
         .onChange(of: sendSystemShortcuts) { _, newValue in
             session.input.sendSystemShortcuts = newValue
@@ -206,10 +234,56 @@ struct SessionView: View {
                 .toggleStyle(.switch)
                 .controlSize(.small)
                 .help("Relative mouse mode for games; Esc releases")
+            Toggle("Clipboard", isOn: $clipboardSync)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .help("Sync copied text with the remote machine")
+            audioControls
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
         .background(.ultraThinMaterial, in: Capsule())
+    }
+
+    /// Remote audio (US-009): mute plus a compact volume slider.
+    private var audioControls: some View {
+        HStack(spacing: 6) {
+            Button {
+                audioMuted.toggle()
+            } label: {
+                Image(systemName: audioMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+            }
+            .buttonStyle(.borderless)
+            .controlSize(.small)
+            .help(audioMuted ? "Unmute remote audio" : "Mute remote audio")
+            Slider(value: $audioVolume, in: 0...1)
+                .controlSize(.mini)
+                .frame(width: 70)
+                .disabled(audioMuted)
+                .help("Remote audio volume")
+        }
+    }
+
+    /// Files dropped on the session window transfer to the connected
+    /// machine (US-011). Gated on the live state: only then is
+    /// connectedHost the candidate that actually answered, rather than
+    /// whichever one the dial walker is currently trying.
+    private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard case .live = session.state, let host = session.connectedHost else { return false }
+        var accepted = false
+        for provider in providers
+        where provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+            accepted = true
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier) { item, _ in
+                // Providers hand the URL back as its bookmark-style data
+                // representation; the direct URL cast is the fallback.
+                let url = (item as? Data).flatMap { URL(dataRepresentation: $0, relativeTo: nil) }
+                    ?? item as? URL
+                guard let url, url.isFileURL else { return }
+                DispatchQueue.main.async { transfers.send(url: url, host: host) }
+            }
+        }
+        return accepted
     }
 
     /// Unedited host field: use the machine's address candidates (LAN first,

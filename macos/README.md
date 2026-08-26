@@ -90,7 +90,7 @@ Once per second while connected, one line goes to os_log (subsystem
 `/tmp/porthole-mac-stats.log`:
 
 ```
-stats fps=143 decode_ms=1.84 rtt_ms=0.81 enc_ms=3.20 cap_arrive_ms=9.4 cap_decoded_ms=11.6 cap_present_ms=19.8 loss=0.00% queue=0 agent_fps=144/143 tx_kbps=38210
+stats fps=143 decode_ms=1.84 rtt_ms=0.81 enc_ms=3.20 cap_arrive_ms=9.4 cap_decoded_ms=11.6 cap_present_ms=19.8 loss=0.00% queue=0 agent_fps=144/143 tx_kbps=38210 audio_buf_ms=41 audio_pkts=50 audio_lost=0 audio_drop_ms=0 audio_underrun=0
 ```
 
 - `fps`: frames decoded this second. `decode_ms`: mean VideoToolbox decode
@@ -110,6 +110,10 @@ stats fps=143 decode_ms=1.84 rtt_ms=0.81 enc_ms=3.20 cap_arrive_ms=9.4 cap_decod
   that drift as latency growing over hours).
 - `loss`: lost frames as a percentage of frames seen (reassembly gaps, stale
   partials, backlog drops). `queue`: datagrams waiting for the decode queue.
+- `audio_*`: the audio channel's second (US-009): jitter buffer depth, Opus
+  packets received, packets lost to sequence gaps, milliseconds dropped to
+  keep the buffer under its cap, and playback underruns. All zeros until
+  audio packets flow.
 
 Until the first pong arrives, or against an agent that predates ping, `rtt_ms`
 and the three `cap_*` fields print `n/a` rather than a guess; the agent fields
@@ -181,6 +185,33 @@ above the panel's maximum is clamped by the display link, and the test
 pattern's ticker shows it: cells advance at the selected rate while only 60
 draws happen per second, so the clamp appears as skipped cells.
 
+## Audio (US-009)
+
+Desktop audio arrives as Opus over UDP, 48 kHz stereo in 20 ms packets, on
+port 52802 (the `hello` message does not negotiate an audio port, so the
+default is assumed). The receiver is the same BSD-socket-on-a-thread shape
+as the video receiver, minus the large receive buffer: fifty small
+datagrams per second need no tuning. Each packet decodes through an
+AudioToolbox AudioConverter with input format `kAudioFormatOpus` to
+interleaved float PCM on a dedicated audio queue, never on the video decode
+queue.
+
+Playback is an AVAudioSourceNode pulled by AVAudioEngine into the default
+output device. Between decode and render sits a jitter buffer: playback
+starts once about 40 ms is buffered, an underrun plays silence and re-arms
+that gate so a late burst refills before resuming, and growth past about
+200 ms drops the oldest audio so latency cannot accumulate. A short
+sequence gap is concealed as one packet's worth of silence per lost packet
+(AudioConverter exposes no Opus packet-loss concealment); a long jump reads
+as a stream restart and resyncs the buffer. Sync with video is best effort:
+the buffer smooths arrival jitter, and the fixed capture-to-play delay it
+adds is the price of glitch-free sound.
+
+The session chrome has a speaker button to mute and a small slider for
+volume, both persisted across launches. Mute keeps the slider position and
+drives the mixer to zero. Audio failing to start (port taken, no output
+device) is logged and costs sound only; the session stays up on video.
+
 ## What exists
 
 - `Porthole/PortholeApp.swift` holds the `@main` app: the picker window and
@@ -194,12 +225,13 @@ draws happen per second, so the clamp appears as skipped cells.
   (`ThumbnailFetcher`).
 - `Porthole/SessionView.swift` is the session screen: Metal surface, floating
   chrome with status text and the latency readout, captured/lock indicators,
-  the Auto/60/120/144 frame rate control, the two input toggles, host field,
-  and connect button.
+  the Auto/60/120/144 frame rate control, the two input toggles, the audio
+  mute and volume controls, host field, and connect button.
 - `Porthole/Streaming/WireProtocol.swift` implements the v1 wire format:
   length-prefixed TCP control frames, `hello`, `pong`, and `agent_stats`
   parsing, `ping` encoding, the message type table including the 0x10-0x15
-  input types, and the 25-byte video datagram header.
+  input types, the 25-byte video datagram header, and the 16-byte audio
+  datagram header.
 - `Porthole/Streaming/ControlChannel.swift` is the TCP client
   (Network.framework, TCP_NODELAY). keyframe_request throttled to one per
   second except on join; input frames share the same connection via
@@ -207,6 +239,10 @@ draws happen per second, so the clamp appears as skipped cells.
 - `Porthole/Streaming/VideoReceiver.swift` is the UDP receiver for video
   datagrams: a BSD socket bound to the port from `hello` with an 8 MB receive
   buffer, read by a dedicated thread.
+- `Porthole/Streaming/AudioReceiver.swift`, `OpusDecoder.swift`, and
+  `AudioPlayer.swift` are the audio channel (US-009): the UDP receiver, the
+  AudioConverter Opus decode, and the jitter buffer feeding an
+  AVAudioSourceNode, as described above.
 - `Porthole/Streaming/Reassembler.swift` reassembles fragmented access units
   per the protocol's receiver rules: incomplete frames are dropped after
   500 ms, sequence gaps and stale frames count as loss.
@@ -278,6 +314,5 @@ draws happen per second, so the clamp appears as skipped cells.
 
 ## What's next (PRD phase 1)
 
-- US-009 adds audio (Opus over UDP 52802).
 - US-013 turns the stats line into the gaming-mode overlay and adds the
   display-mode toggles to the session toolbar.

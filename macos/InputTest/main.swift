@@ -228,6 +228,8 @@ func runLive(host: String, command: [String]) -> Never {
             helloReceived.signal()
         case .pong, .agentStats:
             break // latency probes are the app's concern, not this gate's
+        case .clipboard:
+            break // clipboard sync is the app's concern, not this gate's
         case .disconnected(let reason):
             print("FAIL: \(reason)")
             exit(1)

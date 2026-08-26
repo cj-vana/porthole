@@ -122,6 +122,8 @@ struct MachineCardView: View {
     @State private var hovering = false
     @State private var renaming = false
     @State private var renameText = ""
+    @State private var editingAddress = false
+    @State private var addressText = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -193,6 +195,14 @@ struct MachineCardView: View {
                 renameText = card.machine.name
                 renaming = true
             }
+            // Discovered machines get their address from mDNS; only manual
+            // entries have one to edit (US-012).
+            if card.machine.isManual {
+                Button("Edit address...") {
+                    addressText = card.machine.host
+                    editingAddress = true
+                }
+            }
             Divider()
             Button("Remove", role: .destructive) {
                 store.remove(id: card.id)
@@ -203,6 +213,15 @@ struct MachineCardView: View {
             Button("Rename") {
                 if !renameText.isEmpty {
                     store.rename(id: card.id, to: renameText)
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        }
+        .alert("Edit address", isPresented: $editingAddress) {
+            TextField("Host or IP", text: $addressText)
+            Button("Save") {
+                if !addressText.isEmpty {
+                    store.updateAddress(id: card.id, host: addressText)
                 }
             }
             Button("Cancel", role: .cancel) {}

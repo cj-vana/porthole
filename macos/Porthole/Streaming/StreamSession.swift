@@ -34,8 +34,18 @@ final class StreamSession: ObservableObject {
     let renderer = MetalRenderer()
     /// Keyboard/mouse/scroll translation and wire encoding (US-006).
     let input = InputController()
+    /// Opus audio playback (US-009); SessionView drives volume and mute.
+    let audio = AudioPlayer()
+
+    /// Host the control channel last dialed; live file transfers (US-011)
+    /// open their own connections to it. Cleared on disconnect.
+    private(set) var connectedHost: String?
 
     private let control = ControlChannel()
+    private let audioReceiver = AudioReceiver()
+    /// Clipboard sync (US-008) and gamepad passthrough (US-014); started
+    /// on the live transition, stopped on disconnect.
+    private let peripherals: SessionPeripherals
     private let video: VideoIngest
     private let decoder = CodecSwitchingDecoder()
     private let decodeQueue: DispatchQueue
@@ -76,6 +86,7 @@ final class StreamSession: ObservableObject {
         decodeQueue = queue
         video = VideoIngest(decodeQueue: queue)
         dialer = DialWalker(queue: .main)
+        peripherals = SessionPeripherals(control: control)
         wireDialer()
         wireStream()
         wireInput()
@@ -100,6 +111,7 @@ final class StreamSession: ObservableObject {
         if connectStartedAt == nil {
             connectStartedAt = Date()
         }
+        connectedHost = host
         statsLog.open()
         logger.info("connecting to \(host, privacy: .public):\(controlPort)")
         control.connect(host: host, port: controlPort)
@@ -111,6 +123,8 @@ final class StreamSession: ObservableObject {
         dialer.cancel()
         control.disconnect()
         video.stop()
+        audioReceiver.stop()
+        audio.stop()
         decodeQueue.sync {
             decoder.invalidate()
             clockOffset.reset()
@@ -120,11 +134,19 @@ final class StreamSession: ObservableObject {
         statsTimer?.cancel()
         statsTimer = nil
         statsLog.close()
+        peripherals.stop()
         renderer.clearStream()
         input.reset()
         hello = nil
+        connectedHost = nil
         latency = .empty
         state = .disconnected
+    }
+
+    /// Chrome toggle (US-008): pause or resume clipboard sync without
+    /// touching the connection.
+    func setClipboardSync(_ enabled: Bool) {
+        peripherals.clipboardEnabled = enabled
     }
 
     private func wireDialer() {
@@ -145,6 +167,7 @@ final class StreamSession: ObservableObject {
     }
 
     private func wireStream() {
+        audio.attach(to: audioReceiver)
         control.onEvent = { [weak self] event in
             // Stamp the arrival before the hop: decode is synchronous on the
             // decode queue and would add its own milliseconds to every RTT.
@@ -213,6 +236,8 @@ final class StreamSession: ObservableObject {
             clockOffset.addPong(pong, receivedMicros: receivedMicros)
         case .agentStats(let agentStats):
             latestAgentStats = agentStats
+        case .clipboard(let text):
+            peripherals.applyClipboard(fromPeer: text)
         case .disconnected(let reason):
             fail(reason)
         }
@@ -274,6 +299,10 @@ final class StreamSession: ObservableObject {
             }
             setState(.live(width: Int(hello.width), height: Int(hello.height), fps: Int(hello.fps)))
             applyStoredSettingsOnce()
+            peripherals.start { [weak self] in
+                guard let self else { return false }
+                return self.state != .disconnected
+            }
         }
     }
 
@@ -306,7 +335,8 @@ final class StreamSession: ObservableObject {
 
     private func emitStats() {
         let rttMicros = clockOffset.latestRttMicros
-        let line = stats.line(rttMicros: rttMicros, agentStats: latestAgentStats, queueDepth: video.backlogDepth)
+        let line = stats.line(rttMicros: rttMicros, agentStats: latestAgentStats,
+                              queueDepth: video.backlogDepth, audio: audio.perSecond())
         logger.info("\(line, privacy: .public)")
         statsLog.append(line)
 
@@ -374,6 +404,10 @@ extension StreamSession {
         guard let previous else {
             setState(.waitingForKeyframe)
             guard bindVideo(port: hello.videoPort) else { return }
+            // Audio rides its default port (hello does not negotiate one);
+            // a failed bind costs sound only, logged by the player.
+            audio.start()
+            audioReceiver.start(port: WireProtocol.audioPort)
             // Joining mid-GOP: ask for an IDR to start decoding, and probe
             // the clock offset early; the stats timer pings once per second
             // after this burst.
