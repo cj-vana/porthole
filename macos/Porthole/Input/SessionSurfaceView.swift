@@ -31,6 +31,7 @@ final class SessionSurfaceView: MTKView {
     }
 
     private var screenObserver: NSObjectProtocol?
+    private var didTuneDrawablePool = false
     private let logger = Logger(subsystem: "com.porthole.mac", category: "surface")
 
     /// Shown over the surface while input is captured and pointer lock is
@@ -74,6 +75,15 @@ final class SessionSurfaceView: MTKView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        // Draw-on-arrival presents one drawable per decoded frame and waits
+        // on it (the renderer coalesces to newest-wins), so the layer's
+        // default triple buffer only adds up to a frame of worst-case
+        // present latency without deepening throughput. Two is the
+        // low-latency setting and cannot stall a one-frame-deep pipeline.
+        if !didTuneDrawablePool, let metalLayer = layer as? CAMetalLayer {
+            metalLayer.maximumDrawableCount = 2
+            didTuneDrawablePool = true
+        }
         if screenObserver == nil {
             screenObserver = NotificationCenter.default.addObserver(forName: NSWindow.didChangeScreenNotification,
                                                                     object: nil,
