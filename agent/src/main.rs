@@ -6,15 +6,18 @@
 //! mDNS with a thumbnail endpoint for the picker (US-007a). The pipeline
 //! reports its own encode latency once per second, on the log line and as
 //! an `agent_stats` control message, so the client can split its
-//! glass-to-glass number into encode and transport. Audio (US-009) is still
-//! a trait stub.
+//! glass-to-glass number into encode and transport. It also streams desktop
+//! audio (US-009, Opus over UDP) and syncs the clipboard both ways (US-008)
+//! while a client is connected.
 
 mod audio;
 mod capture;
+mod clipboard;
 mod config;
 mod discovery;
 mod encode;
 mod input;
+mod transfer;
 mod transport;
 mod virtual_display;
 
@@ -98,6 +101,14 @@ struct Cli {
     /// [default: auto-detect, preferring amdgpu, i915, xe; never nvidia]
     #[arg(long, value_name = "PATH")]
     vaapi_device: Option<PathBuf>,
+
+    /// TCP port for the file-transfer endpoint [default: 52804]
+    #[arg(long, value_name = "PORT")]
+    port_files: Option<u16>,
+
+    /// Folder dragged files are written to [default: ~/Downloads]
+    #[arg(long, value_name = "PATH")]
+    transfer_dir: Option<PathBuf>,
 }
 
 impl Cli {
@@ -141,6 +152,12 @@ impl Cli {
         }
         if let Some(v) = &self.vaapi_device {
             cfg.vaapi_device = Some(v.clone());
+        }
+        if let Some(v) = self.port_files {
+            cfg.port_files = v;
+        }
+        if let Some(v) = &self.transfer_dir {
+            cfg.transfer_dir = Some(v.clone());
         }
     }
 }
@@ -501,15 +518,30 @@ async fn main() -> anyhow::Result<()> {
         // both count microseconds from here.
         let pipeline_start = Instant::now();
         let input_tx = input::spawn(capture_format.width, capture_format.height);
+        // US-008: clipboard sync. The control reader forwards text the client
+        // copied through clip_tx; the clipboard module applies it and watches
+        // the Linux clipboard, sending changes back over the control channel.
+        let (clip_tx, clip_rx) = std::sync::mpsc::channel::<String>();
         let (events, control) =
-            transport::spawn_control_listener(&cfg, hello, input_tx, pipeline_start)
+            transport::spawn_control_listener(&cfg, hello, input_tx, Some(clip_tx), pipeline_start)
                 .context("transport control channel startup failed")?;
+        let clipboard = {
+            let control = control.clone();
+            clipboard::spawn(clip_rx, move |text| {
+                control.try_send(
+                    porthole_agent::protocol::CONTROL_MSG_CLIPBOARD,
+                    &porthole_agent::protocol::Clipboard { text }.encode(),
+                );
+            })
+        };
         let sender = transport::VideoSender::new(&cfg).context("transport video socket failed")?;
         // US-007a: discovery. The thumbnail endpoint shares the latest frame
         // through a slot; mDNS announces name/ports/caps.
         let latest_frame = discovery::LatestFrame::default();
         discovery::spawn_thumbnail_server(&cfg, latest_frame.clone())
             .context("thumbnail endpoint startup failed")?;
+        // US-011: file drag and drop lands on its own TCP endpoint.
+        transfer::spawn_file_server(&cfg).context("file transfer endpoint startup failed")?;
         let announcement = discovery::announce(&cfg);
         let encoder = encode::create(&cfg, &capture_format);
         // US-009: desktop audio, Opus over UDP. Its packets are stamped on
@@ -537,7 +569,7 @@ async fn main() -> anyhow::Result<()> {
                 )
             }
         });
-        Some((handle, shutdown, announcement))
+        Some((handle, shutdown, announcement, clipboard))
     } else {
         None
     };
@@ -560,7 +592,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    if let Some((handle, shutdown, announcement)) = capture {
+    if let Some((handle, shutdown, announcement, _clipboard)) = capture {
         shutdown.store(true, Ordering::Relaxed);
         // The capture thread finishes the in-flight frame, then exits.
         if tokio::time::timeout(Duration::from_secs(3), handle)
@@ -569,7 +601,9 @@ async fn main() -> anyhow::Result<()> {
         {
             tracing::warn!("capture thread did not stop within 3s, exiting anyway");
         }
-        // Dropping the announcement unregisters the mDNS service.
+        // Dropping the announcement unregisters the mDNS service. The
+        // clipboard handle (_clipboard) drops with this block, ending its
+        // watch and apply threads.
         drop(announcement);
         tracing::debug!("mDNS announcement withdrawn");
     }

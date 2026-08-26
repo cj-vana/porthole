@@ -100,6 +100,7 @@ pub fn spawn_control_listener(
     cfg: &Config,
     hello: Hello,
     input_tx: Option<mpsc::Sender<InputEvent>>,
+    clipboard_tx: Option<mpsc::Sender<String>>,
     pipeline_start: Instant,
 ) -> anyhow::Result<(mpsc::Receiver<ControlEvent>, ControlSender)> {
     let listener = TcpListener::bind(cfg.control_addr()).map_err(|e| {
@@ -115,18 +116,40 @@ pub fn spawn_control_listener(
     };
     thread::Builder::new()
         .name("control-listener".into())
-        .spawn(move || accept_loop(listener, hello_slot, tx, input_tx, slot, pipeline_start))?;
+        .spawn(move || {
+            accept_loop(AcceptArgs {
+                listener,
+                hello_slot,
+                tx,
+                input_tx,
+                clipboard_tx,
+                slot,
+                pipeline_start,
+            })
+        })?;
     Ok((rx, control))
 }
 
-fn accept_loop(
+struct AcceptArgs {
     listener: TcpListener,
     hello_slot: HelloSlot,
     tx: mpsc::Sender<ControlEvent>,
     input_tx: Option<mpsc::Sender<InputEvent>>,
+    clipboard_tx: Option<mpsc::Sender<String>>,
     slot: WriterSlot,
     pipeline_start: Instant,
-) {
+}
+
+fn accept_loop(args: AcceptArgs) {
+    let AcceptArgs {
+        listener,
+        hello_slot,
+        tx,
+        input_tx,
+        clipboard_tx,
+        slot,
+        pipeline_start,
+    } = args;
     let mut current: Option<TcpStream> = None;
     let mut generation = 0u64;
     for stream in listener.incoming() {
@@ -197,6 +220,7 @@ fn accept_loop(
             generation,
             tx: tx.clone(),
             input_tx: input_tx.clone(),
+            clipboard_tx: clipboard_tx.clone(),
             writer_tx,
             slot: slot.clone(),
             pipeline_start,
@@ -241,6 +265,7 @@ struct ReaderArgs {
     generation: u64,
     tx: mpsc::Sender<ControlEvent>,
     input_tx: Option<mpsc::Sender<InputEvent>>,
+    clipboard_tx: Option<mpsc::Sender<String>>,
     writer_tx: mpsc::SyncSender<Vec<u8>>,
     slot: WriterSlot,
     pipeline_start: Instant,
@@ -262,6 +287,7 @@ fn read_loop(args: ReaderArgs) {
         generation,
         tx,
         input_tx,
+        clipboard_tx,
         writer_tx,
         slot,
         pipeline_start,
@@ -303,6 +329,18 @@ fn read_loop(args: ReaderArgs) {
                     None => {
                         tracing::debug!(%peer, len = payload.len(), "malformed settings, ignored")
                     }
+                }
+            }
+            Ok(Some((protocol::CONTROL_MSG_CLIPBOARD, payload))) => {
+                match protocol::Clipboard::decode(&payload) {
+                    Some(clip) => {
+                        if let Some(clipboard_tx) = &clipboard_tx {
+                            if clipboard_tx.send(clip.text).is_err() {
+                                tracing::debug!("clipboard sink gone, dropping clipboard text");
+                            }
+                        }
+                    }
+                    None => tracing::debug!(%peer, "malformed clipboard message, ignored"),
                 }
             }
             Ok(Some((msg_type, payload))) => {

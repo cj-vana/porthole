@@ -152,6 +152,28 @@ up with video (wire format in `../docs/protocol.md`). Audio flows only while
 a client is connected; on a machine without ffmpeg or an audio server the
 agent logs a warning and streams video only. Capture is Linux only.
 
+### File transfer (US-011)
+
+Files dragged onto the Mac window arrive on their own TCP endpoint
+(`--port-files`, default 52804), one connection per file, so a large
+transfer never competes with the video stream. Each file is written to the
+transfer folder (`--transfer-dir`, default `~/Downloads`) under a temporary
+name and renamed into place only once the whole file has arrived, so a
+partial transfer never leaves a file that looks complete. Names are reduced
+to their base name, so a transfer cannot write outside the folder. Wire
+format is in `../docs/protocol.md`.
+
+### Clipboard (US-008)
+
+Text copied on either machine appears on the other. On Linux the backend is
+the `wl-clipboard` tools: the agent runs `wl-paste --watch` to observe the
+Wayland selection and `wl-copy` to set it, so no new library is needed on a
+wlroots desktop. Loop prevention lives in the agent: the text it last set
+from the client is not sent straight back. Install `wl-clipboard`
+(`wl-copy`, `wl-paste`) for this; without it the agent logs a warning and
+runs without clipboard sync. Clipboard rides the control channel (message
+type 0x07, either direction); see `../docs/protocol.md`.
+
 ## Configuration
 
 Single TOML file (PRD FR-11); every field is optional. Precedence:
@@ -167,6 +189,8 @@ Without `--config`, the agent loads
 | `--port-control`    | 52801   | TCP port for the control channel           |
 | `--port-audio`      | 52802   | UDP port for the audio stream              |
 | `--port-thumbnail`  | 52803   | TCP port for the thumbnail endpoint        |
+| `--port-files`      | 52804   | TCP port for the file-transfer endpoint    |
+| `--transfer-dir`    | ~/Downloads | Folder dragged files are written to     |
 | `--name`            | hostname | Machine name for mDNS and the picker      |
 | `--bitrate-mbps`    | 40      | Encoder target bitrate                     |
 | `--codec`           | h264    | `h264` or `hevc`                           |
@@ -213,7 +237,8 @@ Module map: `capture` (wlr-screencopy on Wayland, US-001), `virtual_display`
 (Hyprland headless outputs, US-015), `encode` (ffmpeg subprocess: NVENC or
 VAAPI, H.264/HEVC, US-002), `transport` (TCP control + UDP video, US-003),
 `input` (zwlr_virtual_pointer_v1 + virtual-keyboard-v1, US-006a), `audio`
-(Opus over UDP, US-009). The wire format itself lives in the library target
+(Opus over UDP, US-009), `clipboard` (wl-clipboard subprocess, US-008), `transfer` (file drag and
+drop endpoint, US-011). The wire format itself lives in the library target
 (`src/lib.rs` + `src/protocol.rs`), shared with `examples/receiver.rs`.
 `examples/wl_globals.rs` lists the compositor's advertised protocols, for
 checking what a session offers before pointing the agent at it.

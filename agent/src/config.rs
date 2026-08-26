@@ -318,7 +318,6 @@ impl Config {
     }
 
     /// Bind address for the file-transfer endpoint (US-011).
-    #[allow(dead_code)] // used once the file-transfer server lands
     pub fn files_addr(&self) -> SocketAddr {
         SocketAddr::from(([0, 0, 0, 0], self.port_files))
     }
