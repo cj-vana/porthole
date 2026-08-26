@@ -60,11 +60,16 @@ pub enum ControlEvent {
 /// reader thread exiting late cannot clear a newer connection's slot.
 type WriterSlot = Arc<Mutex<Option<(u64, mpsc::SyncSender<Vec<u8>>)>>>;
 
+/// The hello sent to each new connection. Shared so a settings reconfigure
+/// (US-013) updates what later clients are told, not just the connected one.
+type HelloSlot = Arc<Mutex<Hello>>;
+
 /// Handle for agent -> client messages outside the control listener (the
 /// pipeline's `agent_stats`). Cloneable; sends never block.
 #[derive(Clone)]
 pub struct ControlSender {
     slot: WriterSlot,
+    hello: HelloSlot,
 }
 
 impl ControlSender {
@@ -76,6 +81,13 @@ impl ControlSender {
         if let Some((_, tx)) = slot.as_ref() {
             let _ = tx.try_send(protocol::encode_control_message(msg_type, payload));
         }
+    }
+
+    /// Update the hello future connections receive (US-013 reconfigure), so
+    /// a client that connects after a settings change is told the current
+    /// codec and framerate, not the startup ones.
+    pub fn update_hello(&self, hello: Hello) {
+        *self.hello.lock().expect("hello slot poisoned") = hello;
     }
 }
 
@@ -96,16 +108,20 @@ pub fn spawn_control_listener(
     tracing::info!(addr = %cfg.control_addr(), "control channel listening");
     let (tx, rx) = mpsc::channel();
     let slot: WriterSlot = Arc::default();
-    let control = ControlSender { slot: slot.clone() };
+    let hello_slot: HelloSlot = Arc::new(Mutex::new(hello));
+    let control = ControlSender {
+        slot: slot.clone(),
+        hello: hello_slot.clone(),
+    };
     thread::Builder::new()
         .name("control-listener".into())
-        .spawn(move || accept_loop(listener, hello, tx, input_tx, slot, pipeline_start))?;
+        .spawn(move || accept_loop(listener, hello_slot, tx, input_tx, slot, pipeline_start))?;
     Ok((rx, control))
 }
 
 fn accept_loop(
     listener: TcpListener,
-    hello: Hello,
+    hello_slot: HelloSlot,
     tx: mpsc::Sender<ControlEvent>,
     input_tx: Option<mpsc::Sender<InputEvent>>,
     slot: WriterSlot,
@@ -143,7 +159,9 @@ fn accept_loop(
         generation += 1;
         let (writer_tx, writer_rx) = mpsc::sync_channel::<Vec<u8>>(WRITER_QUEUE_DEPTH);
         // Hello is queued before anything else can reach the writer, so it
-        // is the first frame on the wire.
+        // is the first frame on the wire. Read the live hello so a client
+        // that joins after a settings reconfigure is told the current codec.
+        let hello = *hello_slot.lock().expect("hello slot poisoned");
         let _ = writer_tx.send(protocol::encode_control_message(
             protocol::CONTROL_MSG_HELLO,
             &hello.encode(),

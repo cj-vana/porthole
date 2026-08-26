@@ -306,6 +306,9 @@ fn capture_loop(
                     submitted_at.clear();
                     next_submit = Instant::now();
                     let hello = hello_for(&cfg, &capture_format);
+                    // Update both the connected client and the hello future
+                    // clients receive, so a reconnect is not told the old codec.
+                    control.update_hello(hello);
                     control.try_send(porthole_agent::protocol::CONTROL_MSG_HELLO, &hello.encode());
                     tracing::info!(
                         fps = cfg.fps.get(),
