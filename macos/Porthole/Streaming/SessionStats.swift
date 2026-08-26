@@ -56,12 +56,17 @@ struct StatsWindow {
     }
 
     var decoded = 0
+    var presented = 0
     var decodeMilliseconds = 0.0
+    var prepareMilliseconds = 0.0
     var completed = 0
     var lost: UInt64 = 0
     var captureToArrival = Average()
     var captureToDecoded = Average()
     var captureToPresented = Average()
+    var decodedToDraw = Average()
+    var drawToPresented = Average()
+    var submitToPresented = Average()
 
     var averageDecodeMs: Double {
         decoded > 0 ? decodeMilliseconds / Double(decoded) : 0
@@ -87,12 +92,17 @@ struct StatsWindow {
         let agentFps = agentStats.map { "\($0.captureFps)/\($0.encodeFps)" } ?? "n/a"
         let txKbps = agentStats.map { String($0.txKbps) } ?? "n/a"
         return "stats fps=\(decoded)"
+            + " present_fps=\(presented)"
+            + " prep_ms=\(ms(decoded > 0 ? prepareMilliseconds / Double(decoded) : nil, 2))"
             + " decode_ms=\(ms(averageDecodeMs, 2))"
             + " rtt_ms=\(ms(rttMs, 2))"
             + " enc_ms=\(ms(encodeMs, 2))"
             + " cap_arrive_ms=\(ms(captureToArrival.milliseconds, 1))"
             + " cap_decoded_ms=\(ms(captureToDecoded.milliseconds, 1))"
             + " cap_present_ms=\(ms(captureToPresented.milliseconds, 1))"
+            + " decoded_draw_ms=\(ms(decodedToDraw.milliseconds, 2))"
+            + " draw_present_ms=\(ms(drawToPresented.milliseconds, 2))"
+            + " submit_present_ms=\(ms(submitToPresented.milliseconds, 2))"
             + " loss=\(ms(lossPercent, 2))%"
             + " queue=\(queueDepth)"
             + " agent_fps=\(agentFps)"
@@ -132,6 +142,8 @@ final class StatsLog {
     func open() {
         FileManager.default.createFile(atPath: url.path, contents: nil)
         handle = try? FileHandle(forWritingTo: url)
+        try? handle?.truncate(atOffset: 0)
+        try? handle?.seek(toOffset: 0)
     }
 
     func append(_ line: String) {

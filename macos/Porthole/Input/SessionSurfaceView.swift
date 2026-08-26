@@ -20,6 +20,17 @@ final class SessionSurfaceView: MTKView {
         }
     }
 
+    /// Gaming-mode presentation bypasses the compositor's vsync queue. This
+    /// can tear during motion, but removes multiple refreshes of latency; the
+    /// normal quality path stays synchronized.
+    var lowLatencyPresentation = false {
+        didSet {
+            if oldValue != lowLatencyPresentation {
+                applyPresentationMode()
+            }
+        }
+    }
+
     /// Mirrors InputController's lock state so its transitions refresh the
     /// cursor rects; the rects themselves read the controller.
     var pointerLocked = false {
@@ -31,7 +42,6 @@ final class SessionSurfaceView: MTKView {
     }
 
     private var screenObserver: NSObjectProtocol?
-    private var didTuneDrawablePool = false
     private let logger = Logger(subsystem: "com.porthole.mac", category: "surface")
 
     /// Shown over the surface while input is captured and pointer lock is
@@ -48,6 +58,9 @@ final class SessionSurfaceView: MTKView {
 
     /// Top-left origin, matching remote output pixels and the letterbox math.
     override var isFlipped: Bool { true }
+    /// The stream surface always clears and fills its drawable. Advertising
+    /// that fact lets WindowServer skip blending it with content below.
+    override var isOpaque: Bool { true }
     override var acceptsFirstResponder: Bool { true }
 
     /// Let the window-activating click land on the view (and thus the remote
@@ -80,10 +93,9 @@ final class SessionSurfaceView: MTKView {
         // default triple buffer only adds up to a frame of worst-case
         // present latency without deepening throughput. Two is the
         // low-latency setting and cannot stall a one-frame-deep pipeline.
-        if !didTuneDrawablePool, let metalLayer = layer as? CAMetalLayer {
-            metalLayer.maximumDrawableCount = 2
-            didTuneDrawablePool = true
-        }
+        applyPresentationMode()
+        window?.isOpaque = true
+        window?.backgroundColor = .black
         if screenObserver == nil {
             screenObserver = NotificationCenter.default.addObserver(forName: NSWindow.didChangeScreenNotification,
                                                                     object: nil,
@@ -94,6 +106,16 @@ final class SessionSurfaceView: MTKView {
             }
         }
         applyFrameRate()
+    }
+
+    private func applyPresentationMode() {
+        guard let metalLayer = layer as? CAMetalLayer else { return }
+        metalLayer.maximumDrawableCount = 2
+        metalLayer.isOpaque = true
+        metalLayer.backgroundColor = NSColor.black.cgColor
+        metalLayer.presentsWithTransaction = false
+        metalLayer.displaySyncEnabled = !lowLatencyPresentation
+        logger.info("presentation sync \(self.lowLatencyPresentation ? "off (gaming)" : "on")")
     }
 
     private func applyFrameRate() {

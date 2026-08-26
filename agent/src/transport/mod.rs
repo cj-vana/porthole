@@ -32,6 +32,10 @@ use crate::encode::EncodedFrame;
 /// below what the sender's NIC can push, which is what matters: see
 /// [`VideoSender::send`].
 const PACING_RATE_BPS: f64 = 400e6;
+/// Small inter frames fit comfortably in the client's receive queue. Pacing
+/// them only turns serialization time into latency; reserve pacing for the
+/// large bursts (normally IDRs) that can overflow socket or tunnel queues.
+const UNPACED_BURST_BYTES: usize = 128 * 1024;
 /// Sleeps shorter than this are skipped; the deficit carries into the next
 /// datagram's check, so they accumulate rather than vanish.
 const MIN_PACING_SLEEP: Duration = Duration::from_micros(50);
@@ -446,10 +450,11 @@ impl VideoSender {
         self.client
     }
 
-    /// Fragment and send one access unit, pacing the burst at
-    /// [`PACING_RATE_BPS`]. Returns the assigned sequence number, or None
-    /// when no client is connected (frame dropped; the client requests a
-    /// keyframe on connect, so it can always start decoding).
+    /// Fragment and send one access unit. Ordinary frames below
+    /// [`UNPACED_BURST_BYTES`] go immediately; larger bursts are paced at
+    /// [`PACING_RATE_BPS`]. Returns the assigned sequence number, or None when
+    /// no client is connected (frame dropped; the client requests a keyframe
+    /// on connect, so it can always start decoding).
     ///
     /// A keyframe is several hundred datagrams, and firing them at NIC speed
     /// loses the tail of the burst two ways. macOS charges 2 KB of mbuf per
@@ -469,6 +474,7 @@ impl VideoSender {
         };
         let burst_start = Instant::now();
         let mut burst_bytes = 0u64;
+        let paced = frame.data.len() > UNPACED_BURST_BYTES;
         for dgram in protocol::fragment(
             &frame.data,
             seq,
@@ -479,7 +485,7 @@ impl VideoSender {
             // The schedule is absolute from the first datagram, so a sleep
             // skipped for being too short is not lost: the deficit shows up
             // in the next check and is slept once it is worth the syscall.
-            if burst_bytes > 0 {
+            if paced && burst_bytes > 0 {
                 let due = Duration::from_secs_f64(burst_bytes as f64 * 8.0 / PACING_RATE_BPS);
                 let behind = due.saturating_sub(burst_start.elapsed());
                 if behind >= MIN_PACING_SLEEP {

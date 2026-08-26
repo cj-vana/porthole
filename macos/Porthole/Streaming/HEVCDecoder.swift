@@ -19,6 +19,7 @@ final class HEVCDecoder: VideoDecoder {
     private(set) var colorState = ColorState(matrix: .bt709, fullRange: false)
     private(set) var isReady = false
     private(set) var lastDecodeMilliseconds = 0.0
+    private(set) var lastPrepareMilliseconds = 0.0
 
     private let sink = VTOutputSink()
     private var session: VTDecompressionSession?
@@ -56,17 +57,19 @@ final class HEVCDecoder: VideoDecoder {
 
     @discardableResult
     func decode(accessUnit: Data, timestampMicros: UInt64) -> Bool {
+        let prepareStarted = ContinuousClock.now
+        let nalUnits = AnnexB.locateNALUnits(in: accessUnit, codec: .hevc)
         var vps: Data?
         var sps: Data?
         var pps: Data?
-        for nal in AnnexB.nalPayloads(in: accessUnit, codec: .hevc) {
+        for nal in nalUnits {
             switch nal.type {
             case AnnexB.HEVCNALType.vps.rawValue where vps == nil:
-                vps = nal.payload
+                vps = accessUnit.subdata(in: nal.range)
             case AnnexB.HEVCNALType.sps.rawValue where sps == nil:
-                sps = nal.payload
+                sps = accessUnit.subdata(in: nal.range)
             case AnnexB.HEVCNALType.pps.rawValue where pps == nil:
-                pps = nal.payload
+                pps = accessUnit.subdata(in: nal.range)
             default:
                 break
             }
@@ -83,14 +86,18 @@ final class HEVCDecoder: VideoDecoder {
             return false
         }
 
-        let payload = AnnexB.avccPayload(fromAccessUnit: accessUnit, codec: .hevc)
-        guard !payload.isEmpty,
-              let sampleBuffer = VTDecode.makeSampleBuffer(payload: payload,
+        guard let sampleBuffer = VTDecode.makeSampleBuffer(accessUnit: accessUnit,
+                                                           codec: .hevc,
+                                                           nalUnits: nalUnits,
                                                            formatDescription: formatDescription,
                                                            timestampMicros: timestampMicros) else {
             onFailure?("failed to build sample buffer")
             return false
         }
+
+        let prepareElapsed = ContinuousClock.now - prepareStarted
+        lastPrepareMilliseconds = Double(prepareElapsed.components.seconds) * 1e3
+            + Double(prepareElapsed.components.attoseconds) / 1e15
 
         let result = VTDecode.submit(sampleBuffer, to: session)
         lastDecodeMilliseconds = result.milliseconds

@@ -23,6 +23,7 @@ final class CodecSwitchingDecoder: VideoDecoder {
     var colorState: ColorState { active.colorState }
     var isReady: Bool { active.isReady }
     var lastDecodeMilliseconds: Double { active.lastDecodeMilliseconds }
+    var lastPrepareMilliseconds: Double { active.lastPrepareMilliseconds }
 
     /// Swap decoders when `codec` differs from the active one. Returns true
     /// on a swap; the caller then owes the stream a fresh IDR, because

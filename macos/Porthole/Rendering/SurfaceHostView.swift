@@ -16,6 +16,9 @@ struct MetalSurfaceView: NSViewRepresentable {
     /// Target rate for the view's display link: 60/120/144, or 0 for the
     /// screen's maximum. The system clamps it to what the display supports.
     let frameRate: Int
+    /// Gaming mode may present between display-link ticks to minimize the
+    /// decoded-frame-to-scanout delay. Quality mode remains synchronized.
+    let lowLatency: Bool
     /// Pointer lock state, so the view can refresh its cursor rects on
     /// transitions (the cursor itself is decided in SessionSurfaceView).
     let pointerLocked: Bool
@@ -45,6 +48,7 @@ struct MetalSurfaceView: NSViewRepresentable {
         // Idle: the display link drives the test pattern. Live: the renderer
         // pauses the link and draws as frames arrive (see MetalRenderer.display).
         surface.targetFrameRate = frameRate
+        surface.lowLatencyPresentation = lowLatency
         surface.isPaused = false
         surface.enableSetNeedsDisplay = false
         let host = SurfaceHostView(surface: surface)
@@ -55,6 +59,7 @@ struct MetalSurfaceView: NSViewRepresentable {
     func updateNSView(_ nsView: SurfaceHostView, context: Context) {
         nsView.onFullscreenChanged = onFullscreenChanged
         nsView.surface.targetFrameRate = frameRate
+        nsView.surface.lowLatencyPresentation = lowLatency
         nsView.surface.pointerLocked = pointerLocked
         let oneToOne = displayMode == .oneToOne && videoSize != .zero
         nsView.apply(mode: displayMode, videoSize: videoSize)

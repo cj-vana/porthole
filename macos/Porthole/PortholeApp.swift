@@ -21,8 +21,11 @@ struct PortholeApp: App {
         .defaultSize(width: 920, height: 640)
         .defaultPosition(.center)
 
-        // The one session window; content follows store.activeSessionMachine.
-        WindowGroup(id: "session") {
+        // A singleton Window, not a WindowGroup: auto-reconnect and window
+        // restoration can both ask to open it during launch. WindowGroup
+        // created two StreamSessions, which fought over the same UDP port and
+        // made the agent replace one live client with the other.
+        Window("Porthole Session", id: "session") {
             SessionWindowContent()
                 .environmentObject(store)
         }

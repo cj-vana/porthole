@@ -30,6 +30,8 @@ protocol VideoDecoder: AnyObject {
     var isReady: Bool { get }
     /// Decode wall time of the last submitted access unit, in milliseconds.
     var lastDecodeMilliseconds: Double { get }
+    /// Annex B parsing and sample-buffer construction before decode submit.
+    var lastPrepareMilliseconds: Double { get }
 
     /// Submit one complete Annex B access unit. Returns false when no
     /// decode session exists yet (keep waiting for an IDR that carries
@@ -125,34 +127,76 @@ enum VTDecode {
         return (session, status)
     }
 
-    /// Assemble a CMSampleBuffer wrapping one access unit in AVCC form.
-    static func makeSampleBuffer(payload: Data,
+    /// Assemble a CMSampleBuffer from Annex B without first materializing an
+    /// AVCC `Data`. The CoreMedia block is the only destination allocation:
+    /// NAL lengths and bytes are written into it in one pass, avoiding the
+    /// old Annex B -> Data -> CMBlockBuffer double copy on every frame.
+    static func makeSampleBuffer(accessUnit: Data,
+                                 codec: AnnexB.Codec,
+                                 nalUnits: [AnnexB.NALUnit],
                                  formatDescription: CMVideoFormatDescription,
                                  timestampMicros: UInt64) -> CMSampleBuffer? {
+        let sampleUnits = nalUnits.filter { $0.type != codec.audType }
+        guard !sampleUnits.isEmpty else { return nil }
+
+        var payloadLength = 0
+        for unit in sampleUnits {
+            guard unit.range.count <= Int(UInt32.max),
+                  payloadLength <= Int.max - 4 - unit.range.count else {
+                return nil
+            }
+            payloadLength += 4 + unit.range.count
+        }
+
         var blockBuffer: CMBlockBuffer?
         // memoryBlock nil + default allocator: CoreMedia allocates and owns
-        // the storage; the payload bytes are then copied in.
+        // one contiguous block that we populate directly below.
         guard CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault,
                                                  memoryBlock: nil,
-                                                 blockLength: payload.count,
+                                                 blockLength: payloadLength,
                                                  blockAllocator: kCFAllocatorDefault,
                                                  customBlockSource: nil,
                                                  offsetToData: 0,
-                                                 dataLength: payload.count,
-                                                 flags: 0,
+                                                 dataLength: payloadLength,
+                                                 flags: kCMBlockBufferAssureMemoryNowFlag,
                                                  blockBufferOut: &blockBuffer) == kCMBlockBufferNoErr,
               let blockBuffer else {
             return nil
         }
-        let copyStatus = payload.withUnsafeBytes { raw in
-            raw.baseAddress.map {
-                CMBlockBufferReplaceDataBytes(with: $0,
-                                              blockBuffer: blockBuffer,
-                                              offsetIntoDestination: 0,
-                                              dataLength: raw.count)
-            }
+
+        var contiguousLength = 0
+        var totalLength = 0
+        var dataPointer: UnsafeMutablePointer<Int8>?
+        guard CMBlockBufferGetDataPointer(blockBuffer,
+                                          atOffset: 0,
+                                          lengthAtOffsetOut: &contiguousLength,
+                                          totalLengthOut: &totalLength,
+                                          dataPointerOut: &dataPointer) == kCMBlockBufferNoErr,
+              let dataPointer,
+              contiguousLength >= payloadLength,
+              totalLength == payloadLength else {
+            return nil
         }
-        guard copyStatus == kCMBlockBufferNoErr else { return nil }
+
+        let copied = accessUnit.withUnsafeBytes { source -> Bool in
+            guard let sourceBase = source.baseAddress else { return false }
+            let destination = UnsafeMutableRawPointer(dataPointer)
+            var offset = 0
+            for unit in sampleUnits {
+                var length = UInt32(unit.range.count).bigEndian
+                withUnsafeBytes(of: &length) { bytes in
+                    destination.advanced(by: offset).copyMemory(from: bytes.baseAddress!, byteCount: 4)
+                }
+                offset += 4
+                destination.advanced(by: offset).copyMemory(
+                    from: sourceBase.advanced(by: unit.range.lowerBound),
+                    byteCount: unit.range.count
+                )
+                offset += unit.range.count
+            }
+            return offset == payloadLength
+        }
+        guard copied else { return nil }
 
         var timing = CMSampleTimingInfo(
             duration: .invalid,
@@ -173,8 +217,10 @@ enum VTDecode {
         return sampleBuffer
     }
 
-    /// Decode one sample buffer synchronously, timing the wait: ordered
-    /// output, natural backpressure, and an honest decode_ms.
+    /// Decode one sample buffer synchronously: with both asynchronous and
+    /// temporal-processing flags clear, VideoToolbox guarantees the output
+    /// callback fires before this call returns. That provides ordered output
+    /// and natural backpressure without a redundant global wait.
     static func submit(_ sampleBuffer: CMSampleBuffer,
                        to session: VTDecompressionSession) -> (status: OSStatus, milliseconds: Double) {
         let started = ContinuousClock.now
@@ -184,7 +230,6 @@ enum VTDecode {
                                                        flags: [],
                                                        frameRefcon: nil,
                                                        infoFlagsOut: &flagsOut)
-        VTDecompressionSessionWaitForAsynchronousFrames(session)
         let elapsed = ContinuousClock.now - started
         let milliseconds = Double(elapsed.components.seconds) * 1e3
             + Double(elapsed.components.attoseconds) / 1e15

@@ -20,6 +20,14 @@ import QuartzCore
 final class MetalRenderer: NSObject, MTKViewDelegate {
     static let pixelFormat: MTLPixelFormat = .bgra8Unorm
 
+    struct PresentationTiming {
+        let captureClientMicros: UInt64?
+        let decodedMicros: UInt64
+        let drawStartedMicros: UInt64
+        let submittedMicros: UInt64
+        let presentedMicros: UInt64
+    }
+
     /// A decoded frame waiting for, or being redrawn by, the display link.
     private struct StreamFrame {
         let pixelBuffer: CVPixelBuffer
@@ -28,6 +36,8 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         /// Capture time on the client clock; nil while the clock offset to
         /// the agent is unknown.
         let captureClientMicros: UInt64?
+        /// Decode completion on the same client clock.
+        let decodedMicros: UInt64
         /// Distinguishes a new decoded frame from a redraw of the last one.
         let generation: UInt64
     }
@@ -48,7 +58,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     /// the screen, with the frame's capture time (client clock, nil if
     /// unknown) and the presentation time in microseconds on the same clock.
     /// Arrives on a Metal-owned thread.
-    var onFramePresented: ((_ captureClientMicros: UInt64?, _ presentedMicros: UInt64) -> Void)?
+    var onFramePresented: ((PresentationTiming) -> Void)?
 
     private let commandQueue: MTLCommandQueue
     private let patternPipelineState: MTLRenderPipelineState
@@ -130,6 +140,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
                                   width: CVPixelBufferGetWidth(pixelBuffer),
                                   height: CVPixelBufferGetHeight(pixelBuffer),
                                   captureClientMicros: captureClientMicros,
+                                  decodedMicros: ClientClock.nowMicros(),
                                   generation: nextGeneration)
         nextGeneration += 1
         let alreadyQueued = drawQueued
@@ -146,9 +157,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         let hasFrame = latestFrame != nil
         frameLock.unlock()
         guard hasFrame, let view else { return }
-        if !view.isPaused {
-            view.isPaused = true
-        }
+        if !view.isPaused { view.isPaused = true }
         view.draw()
     }
 
@@ -193,6 +202,10 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         let colors = colorState
         let fills = fillsDrawable
         frameLock.unlock()
+        // Select the latest frame after acquiring a drawable: nextDrawable
+        // can wait, and a frame decoded during that wait should not be charged
+        // a negative main-queue delay or replaced by older pixels.
+        let drawStartedMicros = ClientClock.nowMicros()
 
         var drewVideo = false
         if let frame {
@@ -208,10 +221,16 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         // the first time each decoded frame reaches the screen.
         if drewVideo, let frame, frame.generation != lastPresentedGeneration {
             lastPresentedGeneration = frame.generation
-            let captureClientMicros = frame.captureClientMicros
+            let submittedMicros = ClientClock.nowMicros()
             drawable.addPresentedHandler { [weak self] presented in
                 guard presented.presentedTime > 0 else { return }
-                self?.onFramePresented?(captureClientMicros, UInt64(presented.presentedTime * 1_000_000))
+                self?.onFramePresented?(
+                    PresentationTiming(captureClientMicros: frame.captureClientMicros,
+                                       decodedMicros: frame.decodedMicros,
+                                       drawStartedMicros: drawStartedMicros,
+                                       submittedMicros: submittedMicros,
+                                       presentedMicros: UInt64(presented.presentedTime * 1_000_000))
+                )
             }
         }
         commandBuffer.present(drawable)

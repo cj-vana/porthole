@@ -47,6 +47,7 @@ struct SessionView: View {
     var body: some View {
         ZStack(alignment: .top) {
             MetalSurfaceView(frameRate: targetFrameRate,
+                             lowLatency: gamingMode,
                              pointerLocked: session.pointerLockActive,
                              displayMode: displayMode,
                              videoSize: videoSize,

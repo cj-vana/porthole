@@ -196,10 +196,24 @@ final class StreamSession: ObservableObject {
                 """)
             self?.renderer.setColorState(matrix: colorState.matrix, fullRange: colorState.fullRange)
         }
-        renderer.onFramePresented = { [weak self] captureClientMicros, presentedMicros in
-            guard let captureClientMicros else { return }
+        renderer.onFramePresented = { [weak self] timing in
             self?.decodeQueue.async {
-                self?.stats.captureToPresented.add(Int64(presentedMicros) - Int64(captureClientMicros))
+                guard let self else { return }
+                self.stats.presented += 1
+                if let captureClientMicros = timing.captureClientMicros {
+                    self.stats.captureToPresented.add(
+                        Int64(timing.presentedMicros) - Int64(captureClientMicros)
+                    )
+                }
+                self.stats.decodedToDraw.add(
+                    Int64(timing.drawStartedMicros) - Int64(timing.decodedMicros)
+                )
+                self.stats.drawToPresented.add(
+                    Int64(timing.presentedMicros) - Int64(timing.drawStartedMicros)
+                )
+                self.stats.submitToPresented.add(
+                    Int64(timing.presentedMicros) - Int64(timing.submittedMicros)
+                )
             }
         }
     }
@@ -286,6 +300,7 @@ final class StreamSession: ObservableObject {
     private func handleDecodedFrame(_ pixelBuffer: CVPixelBuffer, timestampMicros: UInt64) {
         stats.decoded += 1
         stats.decodeMilliseconds += decoder.lastDecodeMilliseconds
+        stats.prepareMilliseconds += decoder.lastPrepareMilliseconds
         let captureClient = clockOffset.clientMicros(forAgentMicros: timestampMicros)
         if let captureClient {
             stats.captureToDecoded.add(Int64(ClientClock.nowMicros()) - captureClient)
