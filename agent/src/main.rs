@@ -164,11 +164,32 @@ fn init_tracing() {
 /// encoder session, which yields a fresh IDR, FR-4). Logs a once-per-second
 /// stats line for capture, encode, and transmit together, and sends the
 /// same numbers to the client as `agent_stats` while one is connected.
+/// Build the hello a client receives on connect and after a settings change
+/// (US-013): codec, bitrate, and framerate come from the live config, the
+/// geometry from the captured output.
+fn hello_for(
+    cfg: &config::Config,
+    format: &capture::CaptureFormat,
+) -> porthole_agent::protocol::Hello {
+    porthole_agent::protocol::Hello {
+        codec: match cfg.codec {
+            Codec::H264 => porthole_agent::protocol::CodecTag::H264,
+            Codec::Hevc => porthole_agent::protocol::CodecTag::Hevc,
+        },
+        width: format.width,
+        height: format.height,
+        fps: u32::from(cfg.fps.get()),
+        bitrate_mbps: cfg.bitrate_mbps,
+        keyframe_interval_secs: cfg.keyframe_interval_secs,
+        video_port: cfg.port_video,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn capture_loop(
     mut backend: Box<dyn capture::CaptureBackend>,
     mut encoder: Box<dyn encode::Encoder>,
-    cfg: config::Config,
+    mut cfg: config::Config,
     capture_format: capture::CaptureFormat,
     mut sender: transport::VideoSender,
     events: std::sync::mpsc::Receiver<transport::ControlEvent>,
@@ -177,8 +198,8 @@ fn capture_loop(
     pipeline_start: Instant,
     shutdown: Arc<AtomicBool>,
 ) {
-    let stream_fps = cfg.fps.get();
-    let frame_interval = Duration::from_secs_f64(1.0 / f64::from(stream_fps));
+    // Recomputed whenever a settings message (US-013) changes the framerate.
+    let mut frame_interval = Duration::from_secs_f64(1.0 / f64::from(cfg.fps.get()));
     // Accumulating deadline: captures arrive quantized to the compositor's
     // frame tick (e.g. 6.9ms at 144 Hz), so checking elapsed >= interval
     // would under-feed (45 fps at 60 target). Track the schedule instead.
@@ -253,6 +274,41 @@ fn capture_loop(
                     tracing::info!(
                         restart_ms = restart_start.elapsed().as_millis(),
                         "encoder restarted for keyframe request"
+                    );
+                }
+                transport::ControlEvent::Settings(settings) => {
+                    // US-013 gaming mode: apply the requested framerate, codec,
+                    // bitrate, and latency bias, restart the encoder so the
+                    // next access unit is a fresh IDR in the new codec, and
+                    // send an updated hello. The client applies its own
+                    // request immediately, so a dropped hello does not strand
+                    // it on the old codec.
+                    if let Ok(fps) = config::Fps::new(settings.fps) {
+                        cfg.fps = fps;
+                        frame_interval = Duration::from_secs_f64(1.0 / f64::from(fps.get()));
+                    } else {
+                        tracing::warn!(
+                            fps = settings.fps,
+                            "settings: unsupported fps, keeping current"
+                        );
+                    }
+                    cfg.codec = match settings.codec {
+                        porthole_agent::protocol::CodecTag::H264 => encode::Codec::H264,
+                        porthole_agent::protocol::CodecTag::Hevc => encode::Codec::Hevc,
+                    };
+                    cfg.bitrate_mbps = u32::from(settings.bitrate_mbps).max(1);
+                    cfg.low_latency = settings.low_latency;
+                    encoder = encode::create(&cfg, &capture_format);
+                    submitted_at.clear();
+                    next_submit = Instant::now();
+                    let hello = hello_for(&cfg, &capture_format);
+                    control.try_send(porthole_agent::protocol::CONTROL_MSG_HELLO, &hello.encode());
+                    tracing::info!(
+                        fps = cfg.fps.get(),
+                        codec = %cfg.codec,
+                        bitrate_mbps = cfg.bitrate_mbps,
+                        low_latency = cfg.low_latency,
+                        "stream reconfigured"
                     );
                 }
             }
@@ -433,18 +489,7 @@ async fn main() -> anyhow::Result<()> {
     // synchronous). Only when a real backend was found: the noop backend
     // errors immediately, and there is nothing to capture or stream.
     let capture = if capture_format.width > 0 {
-        let hello = porthole_agent::protocol::Hello {
-            codec: match cfg.codec {
-                Codec::H264 => porthole_agent::protocol::CodecTag::H264,
-                Codec::Hevc => porthole_agent::protocol::CodecTag::Hevc,
-            },
-            width: capture_format.width,
-            height: capture_format.height,
-            fps: u32::from(cfg.fps.get()),
-            bitrate_mbps: cfg.bitrate_mbps,
-            keyframe_interval_secs: cfg.keyframe_interval_secs,
-            video_port: cfg.port_video,
-        };
+        let hello = hello_for(&cfg, &capture_format);
         // The pipeline clock: video datagram timestamps and pong answers
         // both count microseconds from here.
         let pipeline_start = Instant::now();

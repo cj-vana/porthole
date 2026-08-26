@@ -109,6 +109,26 @@ offset  size  field
 
 Payload length is 14. Sent only while a client is connected.
 
+### settings (type 0x06, client -> agent, US-013)
+
+Reconfigure the live stream: gaming mode selects a higher framerate, the
+low-latency encoder bias, and optionally HEVC.
+
+```
+offset  size  field
+0       2     fps (BE u16): 60, 120, or 144
+2       1     codec: 0 = h264, 1 = hevc
+3       2     bitrate in Mbps (BE u16)
+5       1     low_latency: 1 biases the encoder toward latency over quality
+```
+
+Payload length is 6. The agent applies it by restarting its encoder with
+the new parameters and sending a fresh `hello`, so the next access unit is
+an IDR in the requested codec. The client should re-init its decoder for
+the requested codec as soon as it sends this, rather than waiting for the
+hello, because the hello is advisory (a dropped hello must not strand the
+client on the old codec).
+
 ### Input messages (client -> agent, US-006)
 
 One control connection carries hello + keyframe_request + input for one

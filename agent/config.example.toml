@@ -46,3 +46,7 @@
 # DRM render node for the VAAPI encoder. Unset by default: the agent picks
 # one at encoder start (amdgpu, then i915, then xe, never nvidia).
 # vaapi_device = "/dev/dri/renderD129"
+
+# Start in the low-latency encoder bias (gaming mode). The Mac client also
+# toggles this at runtime; this is only the startup default.
+# low_latency = false

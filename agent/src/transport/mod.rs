@@ -52,6 +52,8 @@ pub enum ControlEvent {
     ClientDisconnected { generation: u64 },
     /// The client needs a fresh IDR (decode-fatal loss, FR-4).
     KeyframeRequest,
+    /// The client asked to reconfigure the stream (gaming mode, US-013).
+    Settings(protocol::Settings),
 }
 
 /// The current connection's writer queue, tagged with its generation so a
@@ -270,6 +272,19 @@ fn read_loop(args: ReaderArgs) {
                     ));
                 } else {
                     tracing::debug!(%peer, len = payload.len(), "malformed ping, ignored");
+                }
+            }
+            Ok(Some((protocol::CONTROL_MSG_SETTINGS, payload))) => {
+                match protocol::Settings::decode(&payload) {
+                    Some(settings) => {
+                        tracing::info!(%peer, ?settings, "client requested settings");
+                        if tx.send(ControlEvent::Settings(settings)).is_err() {
+                            break;
+                        }
+                    }
+                    None => {
+                        tracing::debug!(%peer, len = payload.len(), "malformed settings, ignored")
+                    }
                 }
             }
             Ok(Some((msg_type, payload))) => {

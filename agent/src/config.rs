@@ -266,6 +266,10 @@ pub struct Config {
     /// at encoder start from /dev/dri, preferring amdgpu, i915, then xe,
     /// never nvidia).
     pub vaapi_device: Option<PathBuf>,
+    /// Bias the encoder toward latency over quality (gaming mode, US-013).
+    /// The client flips this at runtime with a settings message; the TOML
+    /// and CLI value is the startup default.
+    pub low_latency: bool,
 }
 
 impl Default for Config {
@@ -284,6 +288,7 @@ impl Default for Config {
             virtual_display: None,
             mtu: Mtu::default(),
             vaapi_device: None,
+            low_latency: false,
         }
     }
 }
@@ -323,8 +328,9 @@ pub struct FileConfig {
     pub virtual_display: Option<VirtualDisplay>,
     pub mtu: Option<Mtu>,
     pub vaapi_device: Option<PathBuf>,
-    // TODO(FR-11): display index/output name, file-transfer folder (US-011,
-    // default ~/Downloads), mDNS service name (US-007).
+    pub low_latency: Option<bool>,
+    // FR-11 later: display index/output name and the file-transfer folder
+    // (US-011, default ~/Downloads).
 }
 
 impl FileConfig {
@@ -367,6 +373,9 @@ impl FileConfig {
         }
         if let Some(v) = self.vaapi_device {
             cfg.vaapi_device = Some(v);
+        }
+        if let Some(v) = self.low_latency {
+            cfg.low_latency = v;
         }
     }
 }

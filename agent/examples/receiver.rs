@@ -32,6 +32,29 @@ struct Args {
     /// this file.
     #[arg(long, value_name = "PATH")]
     dump: Option<PathBuf>,
+
+    /// After hello, send a settings message (US-013), e.g. "144,hevc,80,ll"
+    /// (fps, codec h264|hevc, bitrate Mbps, "ll" for low latency).
+    #[arg(long, value_name = "FPS,CODEC,MBPS[,ll]")]
+    settings: Option<String>,
+}
+
+fn parse_settings(spec: &str) -> anyhow::Result<protocol::Settings> {
+    let parts: Vec<&str> = spec.split(',').collect();
+    if parts.len() < 3 {
+        bail!("settings needs at least fps,codec,mbps");
+    }
+    let codec = match parts[1].to_ascii_lowercase().as_str() {
+        "h264" => protocol::CodecTag::H264,
+        "hevc" => protocol::CodecTag::Hevc,
+        other => bail!("unknown codec {other:?}"),
+    };
+    Ok(protocol::Settings {
+        fps: parts[0].parse().context("bad fps")?,
+        codec,
+        bitrate_mbps: parts[2].parse().context("bad bitrate")?,
+        low_latency: parts.get(3).is_some_and(|s| *s == "ll"),
+    })
 }
 
 /// What the control reader thread learned most recently, for the per-second
@@ -73,6 +96,16 @@ fn main() -> anyhow::Result<()> {
     // main loop keeps the only write handle (pings and keyframe requests).
     let agent_side = Arc::new(Mutex::new(AgentSide::default()));
     spawn_control_reader(control.try_clone()?, start, agent_side.clone());
+
+    if let Some(spec) = &args.settings {
+        let settings = parse_settings(spec)?;
+        protocol::write_control_message(
+            &mut control,
+            protocol::CONTROL_MSG_SETTINGS,
+            &settings.encode(),
+        )?;
+        println!("sent settings: {settings:?}");
+    }
 
     // We join mid-GOP and have no reference frames: ask for a fresh IDR.
     protocol::write_control_message(&mut control, protocol::CONTROL_MSG_KEYFRAME_REQUEST, &[])?;
@@ -221,6 +254,15 @@ fn spawn_control_reader(mut stream: TcpStream, start: Instant, agent_side: Arc<M
                     stats.keyframes
                 );
                 agent_side.lock().expect("agent side poisoned").stats = Some(stats);
+            }
+            Ok(Some((protocol::CONTROL_MSG_HELLO, payload))) => {
+                match protocol::Hello::decode(&payload) {
+                    Some(hello) => println!(
+                        "hello (reconfigured): codec={:?} {}x{} @{} fps, {} Mbps",
+                        hello.codec, hello.width, hello.height, hello.fps, hello.bitrate_mbps
+                    ),
+                    None => println!("malformed hello ({} bytes)", payload.len()),
+                }
             }
             Ok(Some((msg_type, payload))) => {
                 println!(

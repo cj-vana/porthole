@@ -147,14 +147,22 @@ impl FfmpegEncoder {
                 // conversion ignores setparams for the matrix and tags
                 // bt470bg with bgra input, so we convert to nv12 in the
                 // filter chain (CPU swscale, measured cheap at 1440p60).
+                // Gaming mode (low_latency) trades a little quality for the
+                // fastest preset and the ultra-low-latency tune; quality mode
+                // keeps p3/ll, which the encode-latency A/B found within a
+                // millisecond of p1/ull at 60 fps while looking better.
+                let (preset, tune) = if cfg.low_latency {
+                    ("p1", "ull")
+                } else {
+                    ("p3", "ll")
+                };
                 cmd.args([
                     "-vf",
                     "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,format=nv12",
                     "-preset",
-                    "p3",
-                    // ll: low-latency tune, single pass, no lookahead.
+                    preset,
                     "-tune",
-                    "ll",
+                    tune,
                     // delay 0: emit each access unit as soon as it is encoded;
                     // the default INT_MAX holds several frames in ffmpeg.
                     "-delay",

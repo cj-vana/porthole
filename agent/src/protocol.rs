@@ -43,6 +43,47 @@ pub const CONTROL_MSG_PING: u8 = 3;
 pub const CONTROL_MSG_PONG: u8 = 4;
 /// Control message type: agent -> client per-second pipeline stats.
 pub const CONTROL_MSG_AGENT_STATS: u8 = 5;
+/// Control message type: client -> agent stream reconfiguration (US-013).
+pub const CONTROL_MSG_SETTINGS: u8 = 6;
+
+/// settings payload length.
+pub const SETTINGS_PAYLOAD_LEN: usize = 6;
+
+/// Stream reconfiguration a client asks for at runtime (gaming mode,
+/// US-013): a different framerate, codec, or bitrate, and whether to bias
+/// the encoder toward latency over quality. The agent applies it by
+/// restarting the encoder and answering with a fresh [`Hello`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Settings {
+    pub fps: u16,
+    pub codec: CodecTag,
+    pub bitrate_mbps: u16,
+    /// Bias the encoder toward latency (gaming) rather than quality.
+    pub low_latency: bool,
+}
+
+impl Settings {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(SETTINGS_PAYLOAD_LEN);
+        out.extend_from_slice(&self.fps.to_be_bytes());
+        out.push(self.codec as u8);
+        out.extend_from_slice(&self.bitrate_mbps.to_be_bytes());
+        out.push(u8::from(self.low_latency));
+        out
+    }
+
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        if payload.len() != SETTINGS_PAYLOAD_LEN {
+            return None;
+        }
+        Some(Self {
+            fps: u16::from_be_bytes(payload[0..2].try_into().ok()?),
+            codec: CodecTag::from_u8(payload[2])?,
+            bitrate_mbps: u16::from_be_bytes(payload[3..5].try_into().ok()?),
+            low_latency: payload[5] != 0,
+        })
+    }
+}
 
 /// ping payload: the client's own monotonic timestamp in microseconds.
 pub const PING_PAYLOAD_LEN: usize = 8;
@@ -668,6 +709,29 @@ mod tests {
         assert_eq!(datagram_size_for_mtu(9000), MAX_DATAGRAM_SIZE);
         assert_eq!(datagram_size_for_mtu(100), MIN_DATAGRAM_SIZE);
         assert_eq!(datagram_size_for_mtu(0), MIN_DATAGRAM_SIZE);
+    }
+
+    #[test]
+    fn settings_round_trip() {
+        let settings = Settings {
+            fps: 144,
+            codec: CodecTag::Hevc,
+            bitrate_mbps: 80,
+            low_latency: true,
+        };
+        let payload = settings.encode();
+        assert_eq!(payload.len(), SETTINGS_PAYLOAD_LEN);
+        assert_eq!(Settings::decode(&payload), Some(settings));
+        assert!(Settings::decode(&[0; 5]).is_none());
+        assert!(Settings::decode(&[0; 7]).is_none());
+        // Unknown codec tag is rejected.
+        assert!(Settings::decode(&[0, 60, 9, 0, 40, 0]).is_none());
+        // Framed through the control channel.
+        let framed = encode_control_message(CONTROL_MSG_SETTINGS, &payload);
+        let mut cursor = std::io::Cursor::new(framed);
+        let (t, p) = read_control_message(&mut cursor).unwrap().expect("message");
+        assert_eq!(t, CONTROL_MSG_SETTINGS);
+        assert_eq!(Settings::decode(&p), Some(settings));
     }
 
     #[test]
