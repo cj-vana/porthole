@@ -433,7 +433,12 @@ extension StreamSession {
         appliedStoredSettings = true
         let stored = StreamSettings.stored()
         if stored != .quality, let hello, !stored.matches(hello) {
-            apply(stored)
+            // This runs inside the frame-decoded callback, which is nested in
+            // a synchronous decode. apply() switches the decoder and
+            // invalidates the current session, so it must not run here: doing
+            // so invalidates a VideoToolbox session from within its own decode
+            // callback and deadlocks the wait. Defer it to the next queue turn.
+            decodeQueue.async { [weak self] in self?.apply(stored) }
         }
     }
 }
