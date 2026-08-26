@@ -3,12 +3,14 @@
 //! The protocol is request/response: we ask the compositor for a frame of
 //! the output, it tells us the shm format it will write (`buffer` event), we
 //! hand it a `wl_buffer` backed by a memfd (`copy` request), and it signals
-//! `ready` once the frame is copied. One memcpy per frame into a Vec; damage
-//! tracking and linux-dmabuf zero-copy are deliberately left for later
+//! `ready` once the frame is copied. The mapped memfd is leased directly to
+//! the encoder and returned to a small pool on drop, avoiding a 14.7 MB memcpy
+//! on every 1440p frame. Damage tracking and linux-dmabuf capture remain later
 //! stories.
 
 use std::fs::File;
-use std::os::fd::{AsFd, FromRawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
+use std::sync::{mpsc, Arc};
 
 use anyhow::{bail, Context};
 use memmap2::MmapMut;
@@ -17,7 +19,7 @@ use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, QueueHandl
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1 as screencopy_frame;
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
 
-use super::{CaptureBackend, CaptureFormat, RawFrame};
+use super::{CaptureBackend, CaptureFormat, FrameData, FrameStorage, RawFrame};
 
 /// Shm format offered by the compositor for the pending frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,7 +32,8 @@ struct PendingFormat {
 
 /// A reusable shm buffer handed to the compositor to copy frames into.
 struct ShmBuffer {
-    mmap: MmapMut,
+    mmap: Option<MmapMut>,
+    file: Arc<File>,
     buffer: wl_buffer::WlBuffer,
     params: PendingFormat,
 }
@@ -70,10 +73,50 @@ impl ShmBuffer {
         );
         pool.destroy();
         Ok(Self {
-            mmap,
+            mmap: Some(mmap),
+            file: Arc::new(file),
             buffer,
             params,
         })
+    }
+}
+
+struct ReturnedMmap {
+    slot: usize,
+    mmap: MmapMut,
+}
+
+/// Exclusive lease of a capture mapping. The Wayland object and memfd stay in
+/// the capture state; the mapping itself crosses threads with the frame and is
+/// returned only after the corresponding encoded access unit is ready.
+struct MappedFrame {
+    slot: usize,
+    mmap: Option<MmapMut>,
+    file: Arc<File>,
+    recycler: mpsc::Sender<ReturnedMmap>,
+}
+
+impl FrameStorage for MappedFrame {
+    fn bytes(&self) -> &[u8] {
+        self.mmap.as_deref().expect("mapped frame already returned")
+    }
+
+    fn splice_fd(&self) -> Option<RawFd> {
+        Some(self.file.as_raw_fd())
+    }
+}
+
+impl Drop for MappedFrame {
+    fn drop(&mut self) {
+        let Some(mmap) = self.mmap.take() else {
+            return;
+        };
+        // A disconnected receiver means the capture backend has already gone
+        // away; dropping the mapping is then the correct cleanup.
+        let _ = self.recycler.send(ReturnedMmap {
+            slot: self.slot,
+            mmap,
+        });
     }
 }
 
@@ -99,13 +142,34 @@ struct WlState {
     output_height: u32,
     output_refresh_millihz: u32,
     pending: Option<PendingFormat>,
-    buffer: Option<ShmBuffer>,
+    buffers: Vec<ShmBuffer>,
+    active_buffer: Option<usize>,
+    recycle_tx: Option<mpsc::Sender<ReturnedMmap>>,
+    recycle_rx: Option<mpsc::Receiver<ReturnedMmap>>,
     frame: Option<RawFrame>,
     frame_failed: bool,
     pixel_format: Option<String>,
 }
 
 impl WlState {
+    fn reclaim_buffers(&mut self) {
+        loop {
+            let returned = self
+                .recycle_rx
+                .as_ref()
+                .and_then(|receiver| receiver.try_recv().ok());
+            let Some(returned) = returned else {
+                break;
+            };
+            let buffer = self
+                .buffers
+                .get_mut(returned.slot)
+                .expect("capture buffer returned to unknown slot");
+            debug_assert!(buffer.mmap.is_none());
+            buffer.mmap = Some(returned.mmap);
+        }
+    }
+
     /// Ensure the shm buffer matches the negotiated format, then copy the
     /// pending frame into it.
     fn copy_frame(
@@ -114,16 +178,28 @@ impl WlState {
         qh: &QueueHandle<WlState>,
     ) -> anyhow::Result<()> {
         let pending = self.pending.context("compositor sent no shm format")?;
-        let reusable = self.buffer.as_ref().is_some_and(|b| b.params == pending);
-        if !reusable {
-            if let Some(old) = self.buffer.take() {
-                old.buffer.destroy();
+        self.reclaim_buffers();
+        let slot = self
+            .buffers
+            .iter()
+            .position(|buffer| buffer.params == pending && buffer.mmap.is_some());
+        let slot = match slot {
+            Some(slot) => slot,
+            None => {
+                let shm = self.shm.as_ref().context("wl_shm not bound")?;
+                self.buffers.push(ShmBuffer::create(shm, pending, qh)?);
+                let slot = self.buffers.len() - 1;
+                tracing::debug!(
+                    slot,
+                    bytes = self.buffers[slot].byte_len(),
+                    "allocated leased capture buffer"
+                );
+                slot
             }
-            let shm = self.shm.as_ref().context("wl_shm not bound")?;
-            self.buffer = Some(ShmBuffer::create(shm, pending, qh)?);
-        }
+        };
         self.pixel_format = Some(format!("{:?}", pending.format));
-        frame.copy(&self.buffer.as_ref().expect("buffer just created").buffer);
+        frame.copy(&self.buffers[slot].buffer);
+        self.active_buffer = Some(slot);
         Ok(())
     }
 }
@@ -227,15 +303,33 @@ impl Dispatch<screencopy_frame::ZwlrScreencopyFrameV1, ()> for WlState {
                 }
             }
             Ev::Ready { .. } => {
-                let buffer = state.buffer.as_ref().expect("ready before buffer_done");
+                let slot = state
+                    .active_buffer
+                    .take()
+                    .expect("ready before buffer_done");
+                let buffer = &mut state.buffers[slot];
+                let mmap = buffer.mmap.take().expect("active buffer has no mapping");
+                let recycler = state
+                    .recycle_tx
+                    .as_ref()
+                    .expect("capture recycler not initialized")
+                    .clone();
                 state.frame = Some(RawFrame {
                     width: buffer.params.width,
                     height: buffer.params.height,
                     stride: buffer.params.stride as usize,
-                    data: buffer.mmap[..buffer.byte_len()].to_vec(),
+                    data: FrameData::from_storage(MappedFrame {
+                        slot,
+                        mmap: Some(mmap),
+                        file: Arc::clone(&buffer.file),
+                        recycler,
+                    }),
                 });
             }
-            Ev::Failed => state.frame_failed = true,
+            Ev::Failed => {
+                state.active_buffer = None;
+                state.frame_failed = true;
+            }
             // Damage (later story), Flags, LinuxDmabuf (zero-copy, later story).
             _ => {}
         }
@@ -293,7 +387,12 @@ impl WlrCapture {
         let mut event_queue = conn.new_event_queue();
         let qh = event_queue.handle();
         let registry = display.get_registry(&qh, ());
-        let mut state = WlState::default();
+        let (recycle_tx, recycle_rx) = mpsc::channel();
+        let mut state = WlState {
+            recycle_tx: Some(recycle_tx),
+            recycle_rx: Some(recycle_rx),
+            ..WlState::default()
+        };
         // First roundtrip binds the globals, the second delivers the
         // wl_output mode/name events for the outputs we just bound.
         event_queue

@@ -5,6 +5,14 @@ import Foundation
 /// and conversion to the length-prefixed (AVCC) form VideoToolbox expects
 /// in sample buffers.
 enum AnnexB {
+    /// Compressed access-unit layout. FFmpeg emits Annex B; the receiver can
+    /// rewrite four-byte start codes to VideoToolbox's length prefixes in
+    /// place once all UDP fragments are assembled.
+    enum SampleFormat {
+        case annexB
+        case lengthPrefixed
+    }
+
     /// Which bitstream convention the NAL header byte follows. H.264 keeps
     /// the type in the low five bits of a one-byte header; HEVC's two-byte
     /// header puts it in bits 6..1 of the first byte.
@@ -90,6 +98,75 @@ enum AnnexB {
                                      range: payloadStart..<payloadEnd))
             }
             return units
+        }
+    }
+
+    /// Locate NAL units in a four-byte length-prefixed AVCC/HVCC sample.
+    /// Unlike Annex B scanning this advances directly from one NAL to the
+    /// next, so the cost scales with NAL count rather than compressed bytes.
+    static func locateLengthPrefixedNALUnits(in data: Data,
+                                             codec: Codec = .h264) -> [NALUnit] {
+        data.withUnsafeBytes { raw -> [NALUnit] in
+            var units: [NALUnit] = []
+            var offset = 0
+            while offset + 4 <= raw.count {
+                let length = Int(UInt32(raw[offset]) << 24
+                    | UInt32(raw[offset + 1]) << 16
+                    | UInt32(raw[offset + 2]) << 8
+                    | UInt32(raw[offset + 3]))
+                let payloadStart = offset + 4
+                guard length > 0, length <= raw.count - payloadStart else { return [] }
+                let payloadEnd = payloadStart + length
+                units.append(NALUnit(type: codec.nalType(fromHeaderByte: raw[payloadStart]),
+                                     range: payloadStart..<payloadEnd))
+                offset = payloadEnd
+            }
+            return offset == raw.count ? units : []
+        }
+    }
+
+    /// Replace Annex B's four-byte start codes with big-endian NAL lengths
+    /// without moving payload bytes. FFmpeg's raw H.264/HEVC muxers use this
+    /// layout. A mixed or three-byte stream is left untouched so callers can
+    /// fall back to the general converter.
+    static func rewriteFourByteStartCodesAsLengths(in data: inout Data) -> Bool {
+        var starts: [Int] = []
+        starts.reserveCapacity(8)
+        let valid = data.withUnsafeBytes { raw -> Bool in
+            var index = 0
+            while index + 3 <= raw.count {
+                if index + 4 <= raw.count,
+                   raw[index] == 0, raw[index + 1] == 0,
+                   raw[index + 2] == 0, raw[index + 3] == 1 {
+                    starts.append(index)
+                    index += 4
+                } else if raw[index] == 0, raw[index + 1] == 0, raw[index + 2] == 1 {
+                    return false
+                } else {
+                    index += 1
+                }
+            }
+            return starts.first == 0 && !starts.isEmpty
+        }
+        guard valid else { return false }
+        for (position, start) in starts.enumerated() {
+            let payloadEnd = position + 1 < starts.count ? starts[position + 1] : data.count
+            let length = payloadEnd - (start + 4)
+            guard length > 0, length <= Int(UInt32.max) else { return false }
+        }
+
+        return data.withUnsafeMutableBytes { raw -> Bool in
+            for (position, start) in starts.enumerated() {
+                let payloadStart = start + 4
+                let payloadEnd = position + 1 < starts.count ? starts[position + 1] : raw.count
+                let length = payloadEnd - payloadStart
+                let value = UInt32(length)
+                raw[start] = UInt8(truncatingIfNeeded: value >> 24)
+                raw[start + 1] = UInt8(truncatingIfNeeded: value >> 16)
+                raw[start + 2] = UInt8(truncatingIfNeeded: value >> 8)
+                raw[start + 3] = UInt8(truncatingIfNeeded: value)
+            }
+            return true
         }
     }
 

@@ -267,6 +267,10 @@ pub struct Config {
     /// at encoder start from /dev/dri, preferring amdgpu, i915, then xe,
     /// never nvidia).
     pub vaapi_device: Option<PathBuf>,
+    /// Portal restore-token file for gpu-screen-recorder. Keeping the token
+    /// outside the repository lets the backend reconnect without displaying
+    /// the system screen-selection dialog on every encoder restart.
+    pub gsr_restore_token: Option<PathBuf>,
     /// Bias the encoder toward latency over quality (gaming mode, US-013).
     /// The client flips this at runtime with a settings message; the TOML
     /// and CLI value is the startup default.
@@ -293,6 +297,7 @@ impl Default for Config {
             virtual_display: None,
             mtu: Mtu::default(),
             vaapi_device: None,
+            gsr_restore_token: None,
             low_latency: false,
             port_files: DEFAULT_PORT_FILES,
             transfer_dir: None,
@@ -340,6 +345,7 @@ pub struct FileConfig {
     pub virtual_display: Option<VirtualDisplay>,
     pub mtu: Option<Mtu>,
     pub vaapi_device: Option<PathBuf>,
+    pub gsr_restore_token: Option<PathBuf>,
     pub low_latency: Option<bool>,
     pub port_files: Option<u16>,
     pub transfer_dir: Option<PathBuf>,
@@ -386,6 +392,9 @@ impl FileConfig {
         }
         if let Some(v) = self.vaapi_device {
             cfg.vaapi_device = Some(v);
+        }
+        if let Some(v) = self.gsr_restore_token {
+            cfg.gsr_restore_token = Some(v);
         }
         if let Some(v) = self.low_latency {
             cfg.low_latency = v;
@@ -448,6 +457,7 @@ mod tests {
         assert_eq!(cfg.virtual_display, None);
         assert_eq!(cfg.mtu.get(), 1280);
         assert_eq!(cfg.vaapi_device, None);
+        assert_eq!(cfg.gsr_restore_token, None);
     }
 
     #[test]
@@ -473,6 +483,18 @@ mod tests {
         assert_eq!(
             cfg.vaapi_device.as_deref(),
             Some(Path::new("/dev/dri/renderD129"))
+        );
+    }
+
+    #[test]
+    fn gsr_restore_token_toml_parse() {
+        let file_cfg: FileConfig =
+            toml::from_str(r#"gsr_restore_token = "/run/user/1000/porthole.token""#).unwrap();
+        let mut cfg = Config::default();
+        file_cfg.merge_into(&mut cfg);
+        assert_eq!(
+            cfg.gsr_restore_token.as_deref(),
+            Some(Path::new("/run/user/1000/porthole.token"))
         );
     }
 

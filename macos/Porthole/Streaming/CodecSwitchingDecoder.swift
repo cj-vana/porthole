@@ -41,8 +41,12 @@ final class CodecSwitchingDecoder: VideoDecoder {
     }
 
     @discardableResult
-    func decode(accessUnit: Data, timestampMicros: UInt64) -> Bool {
-        active.decode(accessUnit: accessUnit, timestampMicros: timestampMicros)
+    func decode(accessUnit: Data,
+                sampleFormat: AnnexB.SampleFormat,
+                timestampMicros: UInt64) -> Bool {
+        active.decode(accessUnit: accessUnit,
+                      sampleFormat: sampleFormat,
+                      timestampMicros: timestampMicros)
     }
 
     func invalidate() {

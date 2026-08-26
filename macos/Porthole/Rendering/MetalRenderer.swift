@@ -13,10 +13,11 @@ import QuartzCore
 /// matrix reported by the SPS VUI (BT.709 default for HD).
 ///
 /// Presentation timing: while a stream is live the view's display link is
-/// paused and each decoded frame triggers one draw on the main thread, so a
-/// frame waits only for the next vsync rather than for the next link tick
-/// on top of it (the cap_present stat is the measurement). The link runs
-/// again for the test pattern when no stream is up.
+/// paused. Quality mode asks MTKView for a draw on arrival. Gaming mode skips
+/// MTKView and the main thread entirely: the decode queue writes a newest-only
+/// mailbox and a user-interactive render queue submits that frame directly to
+/// CAMetalLayer. This removes a main-run-loop hop and prevents stale decoded
+/// frames from filling the drawable FIFO.
 final class MetalRenderer: NSObject, MTKViewDelegate {
     static let pixelFormat: MTLPixelFormat = .bgra8Unorm
 
@@ -50,9 +51,11 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
 
     let device: MTLDevice
 
-    /// The surface this renderer draws into; set by MetalSurfaceView. Main
-    /// thread only.
-    weak var view: MTKView?
+    /// The surface this renderer draws into; attached by MetalSurfaceView on
+    /// the main thread. Gaming draws retain only its CAMetalLayer while the
+    /// normal MTKView path continues to use this weak reference.
+    private weak var view: MTKView?
+    private weak var streamLayer: CAMetalLayer?
 
     /// Called once per decoded frame when the drawable that carried it hit
     /// the screen, with the frame's capture time (client clock, nil if
@@ -61,6 +64,8 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     var onFramePresented: ((PresentationTiming) -> Void)?
 
     private let commandQueue: MTLCommandQueue
+    private let directRenderQueue = DispatchQueue(label: "com.porthole.mac.direct-scanout",
+                                                  qos: .userInteractive)
     private let patternPipelineState: MTLRenderPipelineState
     private let videoPipelineState: MTLRenderPipelineState
     private var textureCache: CVMetalTextureCache?
@@ -71,16 +76,16 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     private let frameLock = NSLock()
     private var latestFrame: StreamFrame?
     private var nextGeneration: UInt64 = 0
-    /// A main-thread draw has been queued and not yet run; frames that land
-    /// meanwhile are drawn by that one draw (the newest wins).
-    private var drawQueued = false
+    /// One decoded frame may be queued, rendering, or awaiting scanout. New
+    /// frames replace `latestFrame` while that slot is busy. A unique token
+    /// makes late Metal callbacks harmless, including the documented case in
+    /// which an occluded CAMetalLayer never calls its presented handler.
+    private var activeRenderToken: UInt64?
+    private var nextRenderToken: UInt64 = 0
+    private var lowLatencyPresentation = false
     private var colorState = ColorState(matrix: .bt709, fullRange: false)
     /// US-010 one-to-one mode draws the quad unscaled; see setFillsDrawable.
     private var fillsDrawable = false
-    /// Generation whose presentation has been registered; display-link
-    /// thread only.
-    private var lastPresentedGeneration: UInt64?
-
     override convenience init() {
         guard let device = MTLCreateSystemDefaultDevice() else {
             preconditionFailure("Porthole requires a Metal-capable GPU")
@@ -131,11 +136,39 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
 
     // MARK: Stream frame handoff (called from the decode queue)
 
+    /// Main-thread attachment performed once when SwiftUI creates the native
+    /// surface. `nextDrawable()` is explicitly designed to be called from a
+    /// rendering thread, so gaming mode keeps the layer and never touches the
+    /// AppKit view off-main.
+    func attach(view: MTKView) {
+        self.view = view
+        frameLock.lock()
+        streamLayer = view.layer as? CAMetalLayer
+        frameLock.unlock()
+    }
+
+    /// Switch between MTKView's synchronized quality path and direct gaming
+    /// scanout. Invalidate any scheduled token so a mode change cannot strand
+    /// the mailbox on the queue it just left.
+    func setLowLatencyPresentation(_ enabled: Bool) {
+        frameLock.lock()
+        guard lowLatencyPresentation != enabled else {
+            frameLock.unlock()
+            return
+        }
+        lowLatencyPresentation = enabled
+        activeRenderToken = nil
+        let token = latestFrame.map { _ in reserveRenderTokenLocked() }
+        frameLock.unlock()
+        if let token { scheduleRender(token: token) }
+    }
+
     /// Present a decoded frame at the next draw. `captureClientMicros` is
     /// the frame's capture time mapped onto the client clock, or nil when
     /// no pong has established the offset yet.
     func display(_ pixelBuffer: CVPixelBuffer, captureClientMicros: UInt64?) {
         frameLock.lock()
+        let firstFrame = latestFrame == nil
         latestFrame = StreamFrame(pixelBuffer: pixelBuffer,
                                   width: CVPixelBufferGetWidth(pixelBuffer),
                                   height: CVPixelBufferGetHeight(pixelBuffer),
@@ -143,28 +176,74 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
                                   decodedMicros: ClientClock.nowMicros(),
                                   generation: nextGeneration)
         nextGeneration += 1
-        let alreadyQueued = drawQueued
-        drawQueued = true
+        let token = activeRenderToken == nil ? reserveRenderTokenLocked() : nil
         frameLock.unlock()
-        guard !alreadyQueued else { return }
-        DispatchQueue.main.async { [weak self] in self?.drawArrivedFrame() }
+        if firstFrame {
+            DispatchQueue.main.async { [weak self] in self?.view?.isPaused = true }
+        }
+        guard let token else { return }
+        scheduleRender(token: token)
     }
 
-    /// Main thread: present the newest decoded frame now.
-    private func drawArrivedFrame() {
+    /// `frameLock` must be held.
+    private func reserveRenderTokenLocked() -> UInt64 {
+        let token = nextRenderToken
+        nextRenderToken &+= 1
+        activeRenderToken = token
+        return token
+    }
+
+    private func scheduleRender(token: UInt64) {
         frameLock.lock()
-        drawQueued = false
-        let hasFrame = latestFrame != nil
+        let direct = lowLatencyPresentation
         frameLock.unlock()
-        guard hasFrame, let view else { return }
+        if direct {
+            directRenderQueue.async { [weak self] in
+                self?.drawDirect(token: token)
+            }
+        } else {
+            DispatchQueue.main.async { [weak self] in self?.drawArrivedFrame(token: token) }
+        }
+    }
+
+    /// Main thread: present the newest decoded frame through MTKView. Gaming
+    /// mode never calls this function.
+    private func drawArrivedFrame(token: UInt64) {
+        frameLock.lock()
+        let valid = activeRenderToken == token && latestFrame != nil && !lowLatencyPresentation
+        frameLock.unlock()
+        guard valid, let view else {
+            releaseRenderSlot(token: token, after: nil)
+            return
+        }
         if !view.isPaused { view.isPaused = true }
         view.draw()
+    }
+
+    /// A drawable reached the display, timed out, or could not be submitted.
+    /// Only the callback for the currently reserved token can open the slot.
+    /// If a newer decoded generation arrived meanwhile, it is scheduled
+    /// immediately and all intermediate frames remain coalesced.
+    private func releaseRenderSlot(token: UInt64, after generation: UInt64?) {
+        frameLock.lock()
+        guard activeRenderToken == token else {
+            frameLock.unlock()
+            return
+        }
+        activeRenderToken = nil
+        let needsDraw = latestFrame.map { frame in
+            generation == nil || frame.generation != generation
+        } ?? false
+        let nextToken = needsDraw ? reserveRenderTokenLocked() : nil
+        frameLock.unlock()
+        if let nextToken { scheduleRender(token: nextToken) }
     }
 
     /// Back to the test pattern (disconnect, stream teardown).
     func clearStream() {
         frameLock.lock()
         latestFrame = nil
+        activeRenderToken = nil
         frameLock.unlock()
         DispatchQueue.main.async { [weak self] in self?.view?.isPaused = false }
     }
@@ -190,15 +269,26 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
     func draw(in view: MTKView) {
+        frameLock.lock()
+        let directOwnsStream = lowLatencyPresentation && latestFrame != nil
+        let failedToken = activeRenderToken
+        frameLock.unlock()
+        // A display-link tick can race the first decoded frame before the
+        // main-thread pause lands. Do not let MTKView compete with direct
+        // scanout for one of the layer's two drawables.
+        guard !directOwnsStream else { return }
+
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
               let renderPass = view.currentRenderPassDescriptor,
               let drawable = view.currentDrawable,
               let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPass) else {
+            if let failedToken { releaseRenderSlot(token: failedToken, after: nil) }
             return
         }
 
         frameLock.lock()
-        let frame = latestFrame
+        let token = activeRenderToken
+        let frame = token == nil ? nil : latestFrame
         let colors = colorState
         let fills = fillsDrawable
         frameLock.unlock()
@@ -209,22 +299,117 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
 
         var drewVideo = false
         if let frame {
-            drewVideo = drawVideo(frame: frame, colors: colors, fills: fills, view: view, encoder: encoder)
+            drewVideo = drawVideo(frame: frame,
+                                  colors: colors,
+                                  fills: fills,
+                                  drawableSize: view.drawableSize,
+                                  encoder: encoder)
         }
         if !drewVideo {
             drawTestPattern(view: view, encoder: encoder)
         }
         encoder.endEncoding()
 
-        // The presented handler has to be registered before present(); a
-        // redraw of the same frame reports nothing, so cap_present measures
-        // the first time each decoded frame reaches the screen.
-        if drewVideo, let frame, frame.generation != lastPresentedGeneration {
-            lastPresentedGeneration = frame.generation
-            let submittedMicros = ClientClock.nowMicros()
-            drawable.addPresentedHandler { [weak self] presented in
-                guard presented.presentedTime > 0 else { return }
-                self?.onFramePresented?(
+        if drewVideo, let frame, let token {
+            armPresentationCallbacks(commandBuffer: commandBuffer,
+                                     drawable: drawable,
+                                     frame: frame,
+                                     token: token,
+                                     drawStartedMicros: drawStartedMicros,
+                                     direct: false)
+        } else if let token {
+            commandBuffer.addCompletedHandler { [weak self] _ in
+                self?.releaseRenderSlot(token: token, after: nil)
+            }
+        }
+        commandBuffer.present(drawable)
+        commandBuffer.commit()
+    }
+
+    // MARK: Direct gaming scanout
+
+    /// Render the newest decoded frame directly into CAMetalLayer. This queue
+    /// never touches NSView/NSWindow and therefore does not wait behind input,
+    /// SwiftUI reconciliation, fullscreen animation, or menu event handling.
+    private func drawDirect(token: UInt64) {
+        frameLock.lock()
+        let valid = activeRenderToken == token && lowLatencyPresentation && latestFrame != nil
+        let layer = streamLayer
+        frameLock.unlock()
+        guard valid, let layer else {
+            releaseRenderSlot(token: token, after: nil)
+            return
+        }
+
+        // Acquire a drawable before selecting the mailbox entry. If the two
+        // drawable slots briefly fill, a frame decoded during that wait wins
+        // over the older frame that originally scheduled this render.
+        guard let drawable = layer.nextDrawable(),
+              let commandBuffer = commandQueue.makeCommandBuffer() else {
+            releaseRenderSlot(token: token, after: nil)
+            return
+        }
+
+        frameLock.lock()
+        guard activeRenderToken == token, lowLatencyPresentation, let frame = latestFrame else {
+            frameLock.unlock()
+            releaseRenderSlot(token: token, after: nil)
+            return
+        }
+        let colors = colorState
+        let fills = fillsDrawable
+        frameLock.unlock()
+
+        let renderPass = MTLRenderPassDescriptor()
+        renderPass.colorAttachments[0].texture = drawable.texture
+        renderPass.colorAttachments[0].loadAction = .clear
+        renderPass.colorAttachments[0].storeAction = .store
+        renderPass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPass) else {
+            releaseRenderSlot(token: token, after: nil)
+            return
+        }
+
+        let drawStartedMicros = ClientClock.nowMicros()
+        let drawableSize = CGSize(width: drawable.texture.width, height: drawable.texture.height)
+        guard drawVideo(frame: frame,
+                        colors: colors,
+                        fills: fills,
+                        drawableSize: drawableSize,
+                        encoder: encoder) else {
+            encoder.endEncoding()
+            releaseRenderSlot(token: token, after: nil)
+            return
+        }
+        encoder.endEncoding()
+
+        armPresentationCallbacks(commandBuffer: commandBuffer,
+                                 drawable: drawable,
+                                 frame: frame,
+                                 token: token,
+                                 drawStartedMicros: drawStartedMicros,
+                                 direct: true)
+        commandBuffer.present(drawable)
+        commandBuffer.commit()
+    }
+
+    /// Register before `present()`. Quality releases on actual scanout (with
+    /// a bounded watchdog for occlusion). Gaming releases on GPU completion;
+    /// CAMetalLayer's two drawables then provide the only queue bound.
+    private func armPresentationCallbacks(commandBuffer: MTLCommandBuffer,
+                                          drawable: CAMetalDrawable,
+                                          frame: StreamFrame,
+                                          token: UInt64,
+                                          drawStartedMicros: UInt64,
+                                          direct: Bool) {
+        let submittedMicros = ClientClock.nowMicros()
+        drawable.addPresentedHandler { [weak self] presented in
+            guard let self else { return }
+            if !direct {
+                self.releaseRenderSlot(token: token, after: frame.generation)
+            }
+            if presented.presentedTime > 0 {
+                self.onFramePresented?(
                     PresentationTiming(captureClientMicros: frame.captureClientMicros,
                                        decodedMicros: frame.decodedMicros,
                                        drawStartedMicros: drawStartedMicros,
@@ -233,8 +418,26 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
                 )
             }
         }
-        commandBuffer.present(drawable)
-        commandBuffer.commit()
+        commandBuffer.addCompletedHandler { [weak self] completed in
+            guard let self else { return }
+            if direct {
+                // Do not wait for addPresentedHandler here. On macOS its
+                // callback can arrive a refresh after the pixels were shown,
+                // which turns a one-in-flight mailbox into a 72 fps pipeline
+                // on a 144 Hz panel. GPU completion opens the producer slot;
+                // CAMetalLayer's two drawables remain the hard queue bound.
+                self.releaseRenderSlot(token: token,
+                                       after: completed.status == .error ? nil : frame.generation)
+                return
+            }
+            if completed.status == .error {
+                self.releaseRenderSlot(token: token, after: nil)
+                return
+            }
+            self.directRenderQueue.asyncAfter(deadline: .now() + .milliseconds(50)) { [weak self] in
+                self?.releaseRenderSlot(token: token, after: frame.generation)
+            }
+        }
     }
 
     // MARK: Test pattern (US-004, disconnected idle state)
@@ -261,7 +464,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     private func drawVideo(frame: StreamFrame,
                            colors: ColorState,
                            fills: Bool,
-                           view: MTKView,
+                           drawableSize: CGSize,
                            encoder: MTLRenderCommandEncoder) -> Bool {
         // NV12: plane 0 is luma (r8), plane 1 is interleaved CbCr (rg8).
         guard let luma = makePlaneTexture(from: frame.pixelBuffer, plane: 0, format: .r8Unorm),
@@ -273,7 +476,8 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         // unless one-to-one mode already sized the drawable to the video.
         var scale = SIMD2<Float>(1, 1)
         if !fills {
-            let drawableAspect = Float(view.drawableSize.width / view.drawableSize.height)
+            guard drawableSize.height > 0 else { return false }
+            let drawableAspect = Float(drawableSize.width / drawableSize.height)
             let videoAspect = Float(frame.width) / Float(frame.height)
             if videoAspect > drawableAspect {
                 scale.y = drawableAspect / videoAspect

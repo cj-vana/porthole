@@ -58,6 +58,7 @@ targets:
       - path: Porthole/Streaming/WireProtocol.swift
       - path: Porthole/Streaming/ClientClock.swift
       - path: Porthole/Streaming/ControlChannel.swift
+      - path: Porthole/Discovery/Machine.swift
       - path: Porthole/Input/KeyMap.swift
       - path: Porthole/Input/InputMessages.swift
       - path: Porthole/Input/InputController.swift

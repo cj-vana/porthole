@@ -8,6 +8,7 @@
 //! waiting for the following frame's AUD.
 
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -39,6 +40,12 @@ const MAX_ENCODED_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// normal gaming frame in one message. FFmpeg splits a larger AVPacket into
 /// full fragments followed by a short final fragment.
 const ENCODER_FRAGMENT_BYTES: usize = 128 * 1024;
+/// Linux creates subprocess pipes at just 64 KiB on the gaming host. A
+/// 2560x1440 BGRA frame is 14.7 MiB, so the default makes `splice` bounce
+/// between the agent and FFmpeg hundreds of times per frame. One MiB is the
+/// largest unprivileged pipe allowed by the stock kernel and still represents
+/// less than a tenth of one 1440p frame.
+const ENCODER_PIPE_BYTES: libc::c_int = 1024 * 1024;
 static ENCODER_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Bound local socket ffmpeg connects to for packet-preserving encoder output.
@@ -175,6 +182,7 @@ fn ffmpeg_encoder_name(codec: Codec, backend: EncoderBackend) -> &'static str {
         (EncoderBackend::Nvenc, Codec::Hevc) => "hevc_nvenc",
         (EncoderBackend::Vaapi, Codec::H264) => "h264_vaapi",
         (EncoderBackend::Vaapi, Codec::Hevc) => "hevc_vaapi",
+        (EncoderBackend::Gsr, _) => unreachable!("GSR does not use the raw-frame FFmpeg path"),
     }
 }
 
@@ -203,6 +211,7 @@ pub struct FfmpegEncoder {
     rx: mpsc::Receiver<EncodedFrame>,
     reader_stop: Arc<AtomicBool>,
     reader_thread: Option<thread::JoinHandle<()>>,
+    splice_enabled: bool,
 }
 
 impl FfmpegEncoder {
@@ -277,6 +286,13 @@ impl FfmpegEncoder {
                     "-rc",
                     "cbr",
                 ]);
+                if cfg.low_latency {
+                    // FFmpeg otherwise lets NVENC auto-size a multi-surface
+                    // queue for throughput. Gaming mode never needs more than
+                    // one encode surface in flight: the capture mailbox is
+                    // newest-wins and there are no B-frames or lookahead.
+                    cmd.args(["-surfaces", "1"]);
+                }
             }
             EncoderBackend::Vaapi => {
                 // Tag BT.709, upload, then convert to nv12 on the iGPU.
@@ -298,6 +314,7 @@ impl FfmpegEncoder {
                         "CBR",
                     ]);
             }
+            EncoderBackend::Gsr => unreachable!("GSR has its own encoder implementation"),
         }
         cmd.args([
             "-c:v",
@@ -329,12 +346,14 @@ impl FfmpegEncoder {
             .stdout(Stdio::null())
             // ffmpeg errors land in the agent's own log stream.
             .stderr(Stdio::inherit());
+        crate::subprocess::die_with_parent(&mut cmd);
 
         tracing::debug!(command = ?cmd, "spawning ffmpeg encoder");
         let mut child = cmd
             .spawn()
             .context("failed to spawn ffmpeg (is it installed?)")?;
         let stdin = child.stdin.take().context("ffmpeg stdin not piped")?;
+        tune_encoder_pipe(&stdin);
 
         let (tx, rx) = mpsc::channel::<EncodedFrame>();
         let codec = cfg.codec;
@@ -364,8 +383,84 @@ impl FfmpegEncoder {
             rx,
             reader_stop,
             reader_thread: Some(reader_thread),
+            splice_enabled: true,
         })
     }
+}
+
+/// Enlarge FFmpeg's stdin pipe so a memfd splice can hand off large chunks per
+/// wakeup. Failure is only a performance loss: the pipe remains usable at its
+/// kernel-selected capacity.
+fn tune_encoder_pipe(stdin: &ChildStdin) {
+    let fd = stdin.as_raw_fd();
+    // Safety: `fd` belongs to the live ChildStdin for the duration of both
+    // fcntl calls, and neither operation consumes or closes it.
+    let previous = unsafe { libc::fcntl(fd, libc::F_GETPIPE_SZ) };
+    // Safety: F_SETPIPE_SZ takes an integer value, not a pointer.
+    let granted = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, ENCODER_PIPE_BYTES) };
+    if granted < 0 {
+        tracing::warn!(
+            requested_bytes = ENCODER_PIPE_BYTES,
+            previous_bytes = previous,
+            error = %std::io::Error::last_os_error(),
+            "could not enlarge encoder input pipe"
+        );
+    } else {
+        tracing::info!(
+            previous_bytes = previous,
+            granted_bytes = granted,
+            "enlarged encoder input pipe"
+        );
+    }
+}
+
+/// Move a memfd-backed capture frame into FFmpeg's stdin pipe without copying
+/// it through a userspace `Vec`. The caller keeps the frame lease alive until
+/// FFmpeg emits the matching access unit, so the compositor cannot overwrite
+/// pages that the pipe still references.
+fn splice_frame(source: RawFd, destination: RawFd, byte_len: usize) -> std::io::Result<bool> {
+    let mut offset: libc::loff_t = 0;
+    let mut remaining = byte_len;
+    while remaining > 0 {
+        // Safety: both descriptors remain owned by their callers for this
+        // blocking call; `offset` points to initialized writable storage.
+        let written = unsafe {
+            libc::splice(
+                source,
+                &mut offset,
+                destination,
+                std::ptr::null_mut(),
+                remaining,
+                libc::SPLICE_F_MORE,
+            )
+        };
+        if written > 0 {
+            remaining -= written as usize;
+            continue;
+        }
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "splice wrote zero bytes to encoder stdin",
+            ));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        // Some kernels/filesystems reject file-to-pipe splice. Falling back is
+        // safe only before any bytes from this frame entered the stream.
+        if remaining == byte_len
+            && matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EXDEV)
+            )
+        {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    Ok(true)
 }
 
 struct AccessUnitAssembler {
@@ -460,6 +555,7 @@ fn read_access_units(
                         is_keyframe: access_unit_is_keyframe(&au, codec),
                         data: au,
                         ready_at: Instant::now(),
+                        captured_at: None,
                     };
                     sequence += 1;
                     if tx.send(frame).is_err() {
@@ -480,7 +576,16 @@ impl Encoder for FfmpegEncoder {
         let stdin = self.stdin.as_mut().context("encoder stdin closed")?;
         let tight_stride = frame.width as usize * 4;
         if frame.stride == tight_stride {
-            stdin.write_all(&frame.data)?;
+            if self.splice_enabled {
+                if let Some(source) = frame.data.splice_fd() {
+                    if splice_frame(source, stdin.as_raw_fd(), frame.data.len())? {
+                        return Ok(());
+                    }
+                    self.splice_enabled = false;
+                    tracing::warn!("capture memfd splice unsupported; using pipe copies");
+                }
+            }
+            stdin.write_all(frame.data.as_ref())?;
         } else {
             // rawvideo input assumes tight packing; repack row by row.
             for row in frame.data.chunks(frame.stride).take(frame.height as usize) {

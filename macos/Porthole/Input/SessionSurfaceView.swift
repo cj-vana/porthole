@@ -44,18 +44,6 @@ final class SessionSurfaceView: MTKView {
     private var screenObserver: NSObjectProtocol?
     private let logger = Logger(subsystem: "com.porthole.mac", category: "surface")
 
-    /// Shown over the surface while input is captured and pointer lock is
-    /// off. The remote cursor is composited into the stream (headless
-    /// outputs have no hardware cursor plane), so with the local arrow also
-    /// visible there are two cursors on screen and any latency looks worse
-    /// than it is. Cursor rects are window-scoped and stateless, unlike
-    /// NSCursor.hide/unhide, so leaving the surface brings the arrow back
-    /// with no bookkeeping.
-    private static let transparentCursor: NSCursor = {
-        let image = NSImage(size: NSSize(width: 1, height: 1), flipped: false) { _ in true }
-        return NSCursor(image: image, hotSpot: .zero)
-    }()
-
     /// Top-left origin, matching remote output pixels and the letterbox math.
     override var isFlipped: Bool { true }
     /// The stream surface always clears and fills its drawable. Advertising
@@ -111,6 +99,10 @@ final class SessionSurfaceView: MTKView {
     private func applyPresentationMode() {
         guard let metalLayer = layer as? CAMetalLayer else { return }
         metalLayer.maximumDrawableCount = 2
+        // Fullscreen Space transitions can temporarily make every drawable
+        // unavailable. A bounded nextDrawable() wait lets the mailbox recover
+        // after occlusion instead of pinning its serial render worker forever.
+        metalLayer.allowsNextDrawableTimeout = true
         metalLayer.isOpaque = true
         metalLayer.backgroundColor = NSColor.black.cgColor
         metalLayer.presentsWithTransaction = false
@@ -137,8 +129,13 @@ final class SessionSurfaceView: MTKView {
 
     override func resetCursorRects() {
         super.resetCursorRects()
-        guard let inputHandler, inputHandler.isCaptured, !inputHandler.isPointerLocked else { return }
-        addCursorRect(bounds, cursor: Self.transparentCursor)
+        // wlr-screencopy is intentionally requested with overlay_cursor=0,
+        // so the video contains no delayed server cursor. Draw the client's
+        // arrow at the input position instead: absolute pointer motion feels
+        // local (sub-millisecond) while the desktop response still follows
+        // the measured video path. Pointer lock hides it through NSCursor.
+        guard inputHandler?.isPointerLocked != true else { return }
+        addCursorRect(bounds, cursor: .arrow)
     }
 
     private func refreshCursor() {
@@ -162,6 +159,15 @@ final class SessionSurfaceView: MTKView {
     // MARK: Keyboard
 
     override func keyDown(with event: NSEvent) {
+        // Native fullscreen has no visible chrome in gaming mode. Keep the
+        // standard Escape route local so the user can always get the controls
+        // back; pointer lock consumes its first Escape in InputController.
+        if event.keyCode == 0x35,
+           inputHandler?.isPointerLocked != true,
+           window?.styleMask.contains(.fullScreen) == true {
+            window?.toggleFullScreen(nil)
+            return
+        }
         if inputHandler?.handleKeyDown(event) != true {
             super.keyDown(with: event)
         }

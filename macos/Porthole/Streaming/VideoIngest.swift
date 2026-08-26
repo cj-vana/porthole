@@ -23,7 +23,13 @@ final class VideoIngest {
 
     private let receiver = VideoReceiver()
     private let reassembler = Reassembler()
-    private let backlog = DecodeBacklog(limit: 6)
+    // Hardware decode takes ~1.5 ms per frame, far below the 6.9 ms frame
+    // period, but a CBR encoder can release several completed frames together
+    // after a large IDR. Six slots falsely classified that short, recoverable
+    // burst as sustained overload and triggered a 270 ms encoder restart every
+    // GOP. This still bounds the worst case while letting VideoToolbox drain a
+    // transient burst faster than new frames arrive.
+    private let backlog = DecodeBacklog(limit: 24)
     private let decodeQueue: DispatchQueue
 
     init(decodeQueue: DispatchQueue) {

@@ -34,6 +34,11 @@ struct SessionView: View {
     @State private var host: String
     /// US-010 display mode, persisted per machine.
     @State private var displayMode: DisplayMode
+    /// The window notification is authoritative. A persisted fullscreen
+    /// preference can exist briefly (or fail to apply) while the window is
+    /// not actually fullscreen; hiding chrome from preference alone would
+    /// leave no local escape hatch.
+    @State private var isNativeFullscreen = false
     @StateObject private var session = StreamSession()
     /// Drag-and-drop file transfers to the connected machine (US-011).
     @StateObject private var transfers = FileTransferList()
@@ -55,22 +60,26 @@ struct SessionView: View {
                              input: session.input,
                              onFullscreenChanged: syncFullscreen)
 
-            VStack(spacing: 8) {
-                statusBar
-                controlBar
+            if !exclusiveGamingSurface {
+                VStack(spacing: 8) {
+                    statusBar
+                    controlBar
+                }
+                .padding(.top, 12)
             }
-            .padding(.top, 12)
         }
         .overlay(alignment: .topTrailing) {
-            if statsOverlay, case .live = session.state {
+            if statsOverlay, case .live = session.state, !exclusiveGamingSurface {
                 StatsHUD(stats: session.latency)
                     .padding(.top, 124)
                     .padding(.trailing, 16)
             }
         }
         .overlay(alignment: .bottomTrailing) {
-            FileTransferOverlay(transfers: transfers)
-                .padding(16)
+            if !exclusiveGamingSurface {
+                FileTransferOverlay(transfers: transfers)
+                    .padding(16)
+            }
         }
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
             handleDrop(providers)
@@ -140,9 +149,19 @@ struct SessionView: View {
         return .zero
     }
 
+    /// A fullscreen gaming frame should be one opaque Metal surface. The
+    /// translucent SwiftUI chrome and HUD force WindowServer composition on
+    /// every frame; Escape exits native fullscreen and brings the controls
+    /// back, so the fastest path can stay visually clean without trapping the
+    /// user.
+    private var exclusiveGamingSurface: Bool {
+        gamingMode && isNativeFullscreen
+    }
+
     /// Fullscreen moves started by the window itself (green button, exit
     /// gesture) keep the mode picker and the per-machine setting true.
     private func syncFullscreen(_ entered: Bool) {
+        isNativeFullscreen = entered
         if entered != (displayMode == .fullscreen) {
             displayMode = entered ? .fullscreen : .fit
         }

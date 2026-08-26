@@ -1,5 +1,6 @@
 import AppKit
 import MetalKit
+import os
 import SwiftUI
 
 /// SwiftUI wrapper around the session surface (US-005/006), hosted in a
@@ -42,7 +43,8 @@ struct MetalSurfaceView: NSViewRepresentable {
         let surface = SessionSurfaceView(frame: .zero, device: context.coordinator.device)
         surface.inputHandler = input
         surface.delegate = context.coordinator
-        context.coordinator.view = surface
+        context.coordinator.attach(view: surface)
+        context.coordinator.setLowLatencyPresentation(lowLatency)
         surface.colorPixelFormat = MetalRenderer.pixelFormat
         surface.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         // Idle: the display link drives the test pattern. Live: the renderer
@@ -60,6 +62,7 @@ struct MetalSurfaceView: NSViewRepresentable {
         nsView.onFullscreenChanged = onFullscreenChanged
         nsView.surface.targetFrameRate = frameRate
         nsView.surface.lowLatencyPresentation = lowLatency
+        renderer.setLowLatencyPresentation(lowLatency)
         nsView.surface.pointerLocked = pointerLocked
         let oneToOne = displayMode == .oneToOne && videoSize != .zero
         nsView.apply(mode: displayMode, videoSize: videoSize)
@@ -81,10 +84,23 @@ final class SurfaceHostView: NSScrollView {
     private var mode: DisplayMode = .fit
     private var videoSize: CGSize = .zero
     private var wantsFullscreen = false
+    /// SwiftUI can attach the represented view to a restored window before
+    /// its first update supplies the persisted display mode. Do not interpret
+    /// the default `false` as an instruction to leave an already-fullscreen
+    /// window during that interval.
+    private var hasFullscreenIntent = false
+    private var reportedFullscreen: Bool?
     /// toggleFullScreen during an animating transition is dropped by
     /// AppKit; requests wait for the did-enter/did-exit notification.
     private var fullscreenTransitionActive = false
+    /// SwiftUI may update this representable several times before AppKit
+    /// posts `willEnterFullScreen`. Reserve the transition synchronously so
+    /// those updates cannot call `toggleFullScreen` twice and cancel the
+    /// first request before its animation begins.
+    private var fullscreenTogglePending = false
+    private var fullscreenRetryCount = 0
     private var observers: [NSObjectProtocol] = []
+    private let logger = Logger(subsystem: "com.porthole.mac", category: "fullscreen")
 
     init(surface: SessionSurfaceView) {
         self.surface = surface
@@ -162,22 +178,81 @@ final class SurfaceHostView: NSScrollView {
     // MARK: Native fullscreen (US-010)
 
     func setWantsFullscreen(_ wants: Bool) {
+        if wantsFullscreen != wants {
+            fullscreenRetryCount = 0
+        }
         wantsFullscreen = wants
+        hasFullscreenIntent = true
         // Window state must not change during a SwiftUI update pass.
         DispatchQueue.main.async { [weak self] in self?.applyFullscreen() }
     }
 
     private func applyFullscreen() {
-        guard let window, !fullscreenTransitionActive else { return }
-        if window.styleMask.contains(.fullScreen) != wantsFullscreen {
+        guard hasFullscreenIntent, let window,
+              !fullscreenTransitionActive, !fullscreenTogglePending else { return }
+        prepareForFullscreen(window)
+        let isFullscreen = window.styleMask.contains(.fullScreen)
+        if isFullscreen == wantsFullscreen {
+            fullscreenRetryCount = 0
+            reportFullscreen(isFullscreen)
+        } else {
+            fullscreenTogglePending = true
+            window.makeKeyAndOrderFront(nil)
             window.toggleFullScreen(nil)
+            // AppKit can ignore a request while SwiftUI is finishing scene
+            // attachment without posting any notification. Retry a bounded
+            // number of times; the pending bit also prevents duplicate
+            // toggles during the normal animation path.
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(750)) { [weak self] in
+                guard let self, self.fullscreenTogglePending else { return }
+                self.fullscreenTogglePending = false
+                if self.fullscreenRetryCount < 3 {
+                    self.fullscreenRetryCount += 1
+                    self.applyFullscreen()
+                } else {
+                    self.reportFullscreen(window.styleMask.contains(.fullScreen))
+                }
+            }
         }
+    }
+
+    /// SwiftUI can rewrite a scene window's collection behavior after the
+    /// represented view first attaches. Reassert the mutually exclusive
+    /// primary roles immediately before every native fullscreen request.
+    private func prepareForFullscreen(_ window: NSWindow) {
+        window.styleMask.insert(.resizable)
+        window.collectionBehavior.remove(.auxiliary)
+        window.collectionBehavior.remove(.canJoinAllApplications)
+        window.collectionBehavior.remove(.fullScreenAuxiliary)
+        window.collectionBehavior.remove(.fullScreenNone)
+        window.collectionBehavior.insert(.primary)
+        window.collectionBehavior.insert(.fullScreenPrimary)
+    }
+
+    private func reportFullscreen(_ entered: Bool) {
+        guard reportedFullscreen != entered else { return }
+        reportedFullscreen = entered
+        onFullscreenChanged?(entered)
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         if observers.isEmpty {
             observeWindow()
+        }
+        // SwiftUI's singleton Window scene did not advertise itself as a
+        // fullscreen-primary window, leaving AppKit's Enter Full Screen menu
+        // command disabled and causing toggleFullScreen to be ignored. Make
+        // the session a real native-fullscreen participant before applying
+        // the persisted intent.
+        if let window {
+            // A secondary SwiftUI `Window` is assigned the newer auxiliary
+            // window-manager role as well as the legacy fullscreen role.
+            // Both groups are mutually exclusive: merely adding
+            // fullScreenPrimary leaves `Enter Full Screen` disabled while
+            // auxiliary/fullScreenNone remain set.
+            prepareForFullscreen(window)
+            logger.info("fullscreen window ready style=\(window.styleMask.rawValue) behavior=\(window.collectionBehavior.rawValue)")
         }
         // A persisted fullscreen mode arrives before the window exists;
         // apply it once there is a window to toggle, and re-derive the
@@ -187,16 +262,31 @@ final class SurfaceHostView: NSScrollView {
     }
 
     private func observeWindow() {
-        observe(NSWindow.willEnterFullScreenNotification) { $0.fullscreenTransitionActive = true }
-        observe(NSWindow.willExitFullScreenNotification) { $0.fullscreenTransitionActive = true }
+        observe(NSWindow.willEnterFullScreenNotification) {
+            $0.fullscreenTogglePending = false
+            $0.fullscreenTransitionActive = true
+        }
+        observe(NSWindow.willExitFullScreenNotification) {
+            $0.fullscreenTogglePending = false
+            $0.fullscreenTransitionActive = true
+        }
         observe(NSWindow.didEnterFullScreenNotification) {
+            $0.fullscreenTogglePending = false
             $0.fullscreenTransitionActive = false
-            $0.onFullscreenChanged?(true)
+            // Track the completed window state locally before SwiftUI
+            // propagates the callback. Otherwise applyFullscreen can see the
+            // stale pre-transition intent and immediately undo a user action.
+            $0.wantsFullscreen = true
+            $0.hasFullscreenIntent = true
+            $0.reportFullscreen(true)
             $0.applyFullscreen()
         }
         observe(NSWindow.didExitFullScreenNotification) {
+            $0.fullscreenTogglePending = false
             $0.fullscreenTransitionActive = false
-            $0.onFullscreenChanged?(false)
+            $0.wantsFullscreen = false
+            $0.hasFullscreenIntent = true
+            $0.reportFullscreen(false)
             $0.applyFullscreen()
         }
         // Dragging the window between a 1x and a 2x display changes what

@@ -199,8 +199,10 @@ extension WireProtocol {
     /// 12      8     timestamp (BE u64), microseconds since pipeline start
     /// 20      2     fragment index (BE u16, 0-based)
     /// 22      2     fragment count (BE u16)
-    /// 24      1     flags: bit 0 = access unit contains an IDR
+    /// 24      1     flags: bit 0 = IDR, bit 1 = XOR repair shard
     /// ```
+    /// A repair shard uses `fragmentIndex == fragmentCount`; data fragments
+    /// remain zero-based and strictly below `fragmentCount`.
     struct DatagramHeader {
         static let length = 25
         static let maxDatagramSize = 1400
@@ -210,30 +212,48 @@ extension WireProtocol {
         let fragmentIndex: UInt16
         let fragmentCount: UInt16
         let isKeyframe: Bool
+        let isRepair: Bool
     }
 
     /// Parse one UDP datagram into header + payload. Returns nil for
     /// malformed datagrams (wrong magic, version, size, or fragment bounds).
     static func parseDatagram(_ data: Data) -> (header: DatagramHeader, payload: Data)? {
-        guard data.count > DatagramHeader.length,
-              data[0] == 0x50, data[1] == 0x48, data[2] == 0x56, // "PHV"
-              data[3] == version else {
-            return nil
-        }
-        let fragmentIndex = data.readUInt16BE(at: 20)
-        let fragmentCount = data.readUInt16BE(at: 22)
-        guard fragmentCount > 0, fragmentIndex < fragmentCount,
-              data.count <= DatagramHeader.maxDatagramSize else {
-            return nil
-        }
-        let header = DatagramHeader(
-            frameSequence: data.readUInt64BE(at: 4),
-            timestampMicros: data.readUInt64BE(at: 12),
-            fragmentIndex: fragmentIndex,
-            fragmentCount: fragmentCount,
-            isKeyframe: data[24] & 0x01 != 0
-        )
+        let header = data.withUnsafeBytes { parseDatagramHeader($0) }
+        guard let header else { return nil }
         return (header, data.subdata(in: DatagramHeader.length..<data.count))
+    }
+
+    /// Pointer-based parser for the receive hot path. The caller owns the
+    /// bytes; no `Data` is created just to validate a 25-byte header.
+    static func parseDatagramHeader(_ bytes: UnsafeRawBufferPointer) -> DatagramHeader? {
+        guard bytes.count > DatagramHeader.length,
+              bytes.count <= DatagramHeader.maxDatagramSize,
+              bytes[0] == 0x50, bytes[1] == 0x48, bytes[2] == 0x56, // "PHV"
+              bytes[3] == version else {
+            return nil
+        }
+        let fragmentIndex = UInt16(bytes[20]) << 8 | UInt16(bytes[21])
+        let fragmentCount = UInt16(bytes[22]) << 8 | UInt16(bytes[23])
+        let isRepair = bytes[24] & 0x02 != 0
+        guard fragmentCount > 0,
+              isRepair ? fragmentIndex == fragmentCount : fragmentIndex < fragmentCount else {
+            return nil
+        }
+
+        var frameSequence: UInt64 = 0
+        var timestampMicros: UInt64 = 0
+        for offset in 4..<12 {
+            frameSequence = frameSequence << 8 | UInt64(bytes[offset])
+        }
+        for offset in 12..<20 {
+            timestampMicros = timestampMicros << 8 | UInt64(bytes[offset])
+        }
+        return DatagramHeader(frameSequence: frameSequence,
+                              timestampMicros: timestampMicros,
+                              fragmentIndex: fragmentIndex,
+                              fragmentCount: fragmentCount,
+                              isKeyframe: bytes[24] & 0x01 != 0,
+                              isRepair: isRepair)
     }
 
     /// One audio datagram (US-009): a 16-byte header, then one Opus packet

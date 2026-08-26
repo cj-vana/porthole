@@ -1,12 +1,16 @@
 //! Video encoding (US-002).
 //!
-//! Frames from [`crate::capture`] are hardware-encoded on the Linux machine
-//! by one of two selectable backends ([`EncoderBackend`]):
+//! Frames are hardware-encoded on the Linux machine by one of three
+//! selectable backends ([`EncoderBackend`]):
 //!
 //! - NVENC on the NVIDIA dGPU: FFmpeg `h264_nvenc` / `hevc_nvenc`. Default.
 //! - VAAPI on the Ryzen iGPU (RDNA2): FFmpeg `h264_vaapi` / `hevc_vaapi` on
 //!   the iGPU's by-path `/dev/dri` render node. Keeps the dGPU fully free
 //!   for gaming.
+//! - gpu-screen-recorder (`gsr`): PipeWire dma-bufs stay on the compositor
+//!   GPU through capture, color conversion, and VAAPI encoding. Encoded access
+//!   units return over loopback RTP, whose marker bit gives an exact frame
+//!   boundary without waiting for the next frame.
 //!
 //! Integration is an ffmpeg subprocess per encoder session (see the
 //! `ffmpeg` module, Linux only): raw bgra frames are piped to stdin, Annex B
@@ -23,6 +27,8 @@
 mod annexb;
 #[cfg(target_os = "linux")]
 mod ffmpeg;
+#[cfg(target_os = "linux")]
+mod gsr;
 
 use std::fmt;
 use std::str::FromStr;
@@ -74,6 +80,7 @@ pub enum EncoderBackend {
     #[default]
     Nvenc,
     Vaapi,
+    Gsr,
 }
 
 impl fmt::Display for EncoderBackend {
@@ -81,6 +88,7 @@ impl fmt::Display for EncoderBackend {
         match self {
             Self::Nvenc => write!(f, "nvenc"),
             Self::Vaapi => write!(f, "vaapi"),
+            Self::Gsr => write!(f, "gsr"),
         }
     }
 }
@@ -92,7 +100,10 @@ impl FromStr for EncoderBackend {
         match s.to_ascii_lowercase().as_str() {
             "nvenc" => Ok(Self::Nvenc),
             "vaapi" => Ok(Self::Vaapi),
-            other => bail!("unknown encoder backend {other:?} (expected \"nvenc\" or \"vaapi\")"),
+            "gsr" => Ok(Self::Gsr),
+            other => bail!(
+                "unknown encoder backend {other:?} (expected \"nvenc\", \"vaapi\", or \"gsr\")"
+            ),
         }
     }
 }
@@ -110,6 +121,10 @@ pub struct EncodedFrame {
     /// drains once per captured frame, so measuring encode latency at drain
     /// time would report the capture cadence rather than the encoder.
     pub ready_at: std::time::Instant,
+    /// Estimated source-capture time when the backend owns capture itself.
+    /// Raw-frame encoders leave this unset and the pipeline pairs output with
+    /// its submitted-frame FIFO instead.
+    pub captured_at: Option<std::time::Instant>,
 }
 
 /// A hardware encoder instance (NVENC on the dGPU, or VAAPI on the iGPU).
@@ -137,6 +152,13 @@ pub trait Encoder: Send {
 
     /// Backend this encoder instance runs on.
     fn backend(&self) -> EncoderBackend;
+
+    /// Whether this backend consumes frames from the wlr-screencopy producer.
+    /// Capture-owning backends return false so the expensive compositor SHM
+    /// readback can be suspended.
+    fn needs_raw_frames(&self) -> bool {
+        true
+    }
 }
 
 /// Linux gets the ffmpeg subprocess encoder; everything else (or an encoder
@@ -147,7 +169,27 @@ pub fn create(
 ) -> Box<dyn Encoder> {
     #[cfg(target_os = "linux")]
     {
-        match ffmpeg::FfmpegEncoder::new(cfg, format) {
+        if cfg.encoder == EncoderBackend::Gsr {
+            match gsr::GsrEncoder::new(cfg) {
+                Ok(enc) => {
+                    tracing::info!(
+                        backend = %enc.backend(),
+                        codec = %enc.codec(),
+                        "GPU-resident portal encoder started"
+                    );
+                    return Box::new(enc);
+                }
+                Err(err) => tracing::error!(
+                    "{err:#}: GPU-resident encoder startup failed; falling back to NVENC"
+                ),
+            }
+        }
+
+        let mut ffmpeg_cfg = cfg.clone();
+        if ffmpeg_cfg.encoder == EncoderBackend::Gsr {
+            ffmpeg_cfg.encoder = EncoderBackend::Nvenc;
+        }
+        match ffmpeg::FfmpegEncoder::new(&ffmpeg_cfg, format) {
             Ok(enc) => {
                 tracing::info!(
                     backend = %enc.backend(),
@@ -218,6 +260,10 @@ mod tests {
         assert_eq!(
             "VAAPI".parse::<EncoderBackend>().unwrap(),
             EncoderBackend::Vaapi
+        );
+        assert_eq!(
+            "gsr".parse::<EncoderBackend>().unwrap(),
+            EncoderBackend::Gsr
         );
         assert!("qsv".parse::<EncoderBackend>().is_err());
     }

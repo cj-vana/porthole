@@ -29,12 +29,59 @@ struct Machine: Codable, Hashable, Identifiable {
     /// so machines.json written before it existed still decodes.
     var preferredHost: String?
 
-    /// Dial order for the session and the thumbnail poll: preferred host,
-    /// then the remaining candidates in their usual order.
+    /// Dial order for the session and thumbnail poll. A directly reachable
+    /// RFC1918/link-local address always outranks an overlay address. The
+    /// learned preference only reorders candidates inside the same path
+    /// class, so a fast thumbnail response over Tailscale cannot silently
+    /// move a 100.64/10 endpoint ahead of the physical LAN forever.
     var dialOrder: [String] {
         let candidates = addressCandidates.isEmpty ? [host] : addressCandidates
-        guard let preferredHost else { return candidates }
-        return [preferredHost] + candidates.filter { $0 != preferredHost }
+        var unique: [String] = []
+        for candidate in ([preferredHost].compactMap { $0 } + candidates)
+            where !unique.contains(candidate) {
+            unique.append(candidate)
+        }
+        return unique.enumerated().sorted { lhs, rhs in
+            let lhsTier = Self.pathTier(lhs.element)
+            let rhsTier = Self.pathTier(rhs.element)
+            if lhsTier != rhsTier { return lhsTier < rhsTier }
+            let lhsPreferred = lhs.element == preferredHost
+            let rhsPreferred = rhs.element == preferredHost
+            if lhsPreferred != rhsPreferred { return lhsPreferred }
+            return lhs.offset < rhs.offset
+        }.map(\.element)
+    }
+
+    /// Lower values are attempted first. Discovery currently emits IPv4
+    /// literals plus hostname fallbacks. RFC1918 and IPv4 link-local are
+    /// physical-LAN candidates; 100.64/10 is explicitly an overlay/CGNAT
+    /// candidate; hostnames stay last because they may resolve to either.
+    private static func pathTier(_ host: String) -> Int {
+        guard let octets = ipv4Octets(host) else { return 3 }
+        if octets[0] == 10
+            || (octets[0] == 172 && (16...31).contains(octets[1]))
+            || (octets[0] == 192 && octets[1] == 168)
+            || (octets[0] == 169 && octets[1] == 254) {
+            return 0
+        }
+        if octets[0] == 100 && (64...127).contains(octets[1]) {
+            return 2
+        }
+        return 1
+    }
+
+    private static func ipv4Octets(_ host: String) -> [UInt8]? {
+        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return nil }
+        var octets: [UInt8] = []
+        octets.reserveCapacity(4)
+        for part in parts {
+            guard !part.isEmpty, part.allSatisfy(\.isNumber), let value = UInt8(part) else {
+                return nil
+            }
+            octets.append(value)
+        }
+        return octets
     }
 
     /// Build from a resolved `_porthole._tcp` service. Returns nil when the

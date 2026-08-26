@@ -208,6 +208,25 @@ func runLocalTests() {
     keyFrame(28, 1); keyFrame(28, 0) // return
     checkBytes("typeText Hello!\\n", wire, expected)
     wire.removeAll()
+
+    // 8. A thumbnail fetched over a Tailscale/CGNAT endpoint must not teach
+    //    the session to bypass a simultaneously advertised physical LAN
+    //    address. The preference still wins among equally ranked paths.
+    let txt = ["v": Data("1".utf8)]
+    guard var routedMachine = Machine(serviceName: "gaming-box",
+                                      hostName: "gaming-box.local.",
+                                      addresses: ["100.126.134.75", "10.0.0.222", "192.168.50.4"],
+                                      txt: txt) else {
+        fatalError("machine test fixture failed")
+    }
+    routedMachine.preferredHost = "100.126.134.75"
+    checkTrue("physical LAN outranks learned overlay",
+              routedMachine.dialOrder == ["10.0.0.222", "192.168.50.4",
+                                          "100.126.134.75", "gaming-box"])
+    routedMachine.preferredHost = "192.168.50.4"
+    checkTrue("learned preference wins inside LAN tier",
+              routedMachine.dialOrder == ["192.168.50.4", "10.0.0.222",
+                                          "100.126.134.75", "gaming-box"])
 }
 
 // MARK: Live mode

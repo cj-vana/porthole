@@ -27,15 +27,14 @@ use porthole_agent::protocol::{self, Hello, InputEvent};
 use crate::config::Config;
 use crate::encode::EncodedFrame;
 
-/// Peak send rate for one access unit's datagram burst. Well above any
-/// configured bitrate (the burst still finishes in a few milliseconds) but
-/// below what the sender's NIC can push, which is what matters: see
-/// [`VideoSender::send`].
-const PACING_RATE_BPS: f64 = 400e6;
-/// Small inter frames fit comfortably in the client's receive queue. Pacing
-/// them only turns serialization time into latency; reserve pacing for the
-/// large bursts (normally IDRs) that can overflow socket or tunnel queues.
-const UNPACED_BURST_BYTES: usize = 128 * 1024;
+/// Normal access units can use a gigabit burst on the tested 2.5 GbE LAN,
+/// cutting their serialization below half a millisecond. Oversized units
+/// (normally IDRs) stay at the proven conservative rate: hundreds of UDP
+/// packets at a gigabit can overflow a NIC or tunnel ring even when the
+/// receiver's socket buffer is large enough.
+const FAST_PACING_RATE_BPS: f64 = 1e9;
+const LARGE_FRAME_PACING_RATE_BPS: f64 = 400e6;
+const FAST_FRAME_MAX_BYTES: usize = 256 * 1024;
 /// Sleeps shorter than this are skipped; the deficit carries into the next
 /// datagram's check, so they accumulate rather than vanish.
 const MIN_PACING_SLEEP: Duration = Duration::from_micros(50);
@@ -450,11 +449,10 @@ impl VideoSender {
         self.client
     }
 
-    /// Fragment and send one access unit. Ordinary frames below
-    /// [`UNPACED_BURST_BYTES`] go immediately; larger bursts are paced at
-    /// [`PACING_RATE_BPS`]. Returns the assigned sequence number, or None when
-    /// no client is connected (frame dropped; the client requests a keyframe
-    /// on connect, so it can always start decoding).
+    /// Fragment and send one access unit with size-adaptive pacing. Returns
+    /// the assigned sequence number, or None when no client is connected
+    /// (frame dropped; the client requests a keyframe on connect, so it can
+    /// always start decoding).
     ///
     /// A keyframe is several hundred datagrams, and firing them at NIC speed
     /// loses the tail of the burst two ways. macOS charges 2 KB of mbuf per
@@ -462,8 +460,10 @@ impl VideoSender {
     /// default 786 KB UDP socket buffer before the client reads any. And a
     /// userspace tunnel (WireGuard, Tailscale) queues datagrams in a small
     /// ring between the kernel and its own thread, which a line-rate burst
-    /// overruns. Spreading the burst over a few milliseconds keeps both
-    /// queues short without adding a frame of delay.
+    /// overruns. Inter frames need pacing too: at gaming bitrates even a 50 KB
+    /// frame is roughly 40 back-to-back datagrams. Spreading that burst over
+    /// a fraction of a millisecond keeps both queues short without adding a
+    /// frame of delay.
     pub fn send(&mut self, frame: &EncodedFrame, timestamp_us: u64) -> io::Result<Option<u64>> {
         // The sequence advances whether or not a client is connected, so it
         // stays monotonic across client reconnects and encoder restarts.
@@ -472,10 +472,14 @@ impl VideoSender {
         let Some(client) = self.client else {
             return Ok(None);
         };
+        let pacing_rate = if frame.is_keyframe || frame.data.len() > FAST_FRAME_MAX_BYTES {
+            LARGE_FRAME_PACING_RATE_BPS
+        } else {
+            FAST_PACING_RATE_BPS
+        };
         let burst_start = Instant::now();
         let mut burst_bytes = 0u64;
-        let paced = frame.data.len() > UNPACED_BURST_BYTES;
-        for dgram in protocol::fragment(
+        for dgram in protocol::fragment_with_repair(
             &frame.data,
             seq,
             timestamp_us,
@@ -485,8 +489,8 @@ impl VideoSender {
             // The schedule is absolute from the first datagram, so a sleep
             // skipped for being too short is not lost: the deficit shows up
             // in the next check and is slept once it is worth the syscall.
-            if paced && burst_bytes > 0 {
-                let due = Duration::from_secs_f64(burst_bytes as f64 * 8.0 / PACING_RATE_BPS);
+            if burst_bytes > 0 {
+                let due = Duration::from_secs_f64(burst_bytes as f64 * 8.0 / pacing_rate);
                 let behind = due.saturating_sub(burst_start.elapsed());
                 if behind >= MIN_PACING_SLEEP {
                     thread::sleep(behind);

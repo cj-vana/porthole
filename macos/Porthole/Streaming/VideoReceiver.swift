@@ -14,7 +14,10 @@ import os
 /// background queue and hop to their own.
 final class VideoReceiver {
     enum Event {
-        case datagram(WireProtocol.DatagramHeader, Data)
+        /// The payload points into the receiver's reusable socket buffer and
+        /// is valid only for the synchronous `onEvent` call. VideoIngest
+        /// copies it directly into its final access-unit storage.
+        case datagram(WireProtocol.DatagramHeader, UnsafeRawBufferPointer)
         case failed(String)
     }
 
@@ -124,8 +127,9 @@ final class VideoReceiver {
 
     /// Runs until stop() raises the flag, checked before every recvfrom so a
     /// steady stream cannot keep the loop alive, with `receiveTimeout`
-    /// bounding the wait when nothing arrives. One Data copy per datagram,
-    /// out of a buffer reused for the life of the thread.
+    /// bounding the wait when nothing arrives. The reusable receive buffer is
+    /// borrowed synchronously by VideoIngest, so the normal path allocates no
+    /// per-datagram `Data`.
     private func receiveLoop(descriptor: Int32) {
         let buffer = UnsafeMutableRawPointer.allocate(byteCount: Self.datagramBufferBytes, alignment: 16)
         defer { buffer.deallocate() }
@@ -139,9 +143,12 @@ final class VideoReceiver {
                 return
             }
             guard received > 0 else { continue }
-            let data = Data(bytes: buffer, count: received)
-            if let datagram = WireProtocol.parseDatagram(data) {
-                onEvent?(.datagram(datagram.header, datagram.payload))
+            let datagram = UnsafeRawBufferPointer(start: buffer, count: received)
+            if let header = WireProtocol.parseDatagramHeader(datagram) {
+                let payload = UnsafeRawBufferPointer(
+                    rebasing: datagram[WireProtocol.DatagramHeader.length...]
+                )
+                onEvent?(.datagram(header, payload))
             }
         }
     }

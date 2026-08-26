@@ -33,17 +33,28 @@ protocol VideoDecoder: AnyObject {
     /// Annex B parsing and sample-buffer construction before decode submit.
     var lastPrepareMilliseconds: Double { get }
 
-    /// Submit one complete Annex B access unit. Returns false when no
+    /// Submit one complete access unit. Returns false when no
     /// decode session exists yet (keep waiting for an IDR that carries
     /// parameter sets, or request another keyframe) or the submit failed.
     @discardableResult
-    func decode(accessUnit: Data, timestampMicros: UInt64) -> Bool
+    func decode(accessUnit: Data,
+                sampleFormat: AnnexB.SampleFormat,
+                timestampMicros: UInt64) -> Bool
     /// Drop the decode session. The next access unit carrying parameter
     /// sets builds a fresh one.
     func invalidate()
 }
 
 extension VideoDecoder {
+    /// Decode-test and file-input compatibility: recorded elementary streams
+    /// are Annex B, while live reassembly supplies the faster in-place layout.
+    @discardableResult
+    func decode(accessUnit: Data, timestampMicros: UInt64) -> Bool {
+        decode(accessUnit: accessUnit,
+               sampleFormat: .annexB,
+               timestampMicros: timestampMicros)
+    }
+
     /// Shared tail of a decode submit: map the VideoToolbox status onto the
     /// decode() convention, invalidating a session that cannot recover so
     /// fresh parameter sets rebuild it.
@@ -215,6 +226,77 @@ enum VTDecode {
                                                sampleBufferOut: &sampleBuffer)
         guard status == noErr else { return nil }
         return sampleBuffer
+    }
+
+    /// Build a sample and use it synchronously. Length-prefixed live buffers
+    /// can be borrowed by CoreMedia without allocating or copying; the body
+    /// runs inside `Data.withUnsafeBytes`, which keeps that pointer valid for
+    /// the entire synchronous VideoToolbox submit. Recorded Annex B streams
+    /// retain the general allocation-and-conversion fallback above.
+    static func withSampleBuffer<Result>(accessUnit: Data,
+                                         sampleFormat: AnnexB.SampleFormat,
+                                         codec: AnnexB.Codec,
+                                         nalUnits: [AnnexB.NALUnit],
+                                         formatDescription: CMVideoFormatDescription,
+                                         timestampMicros: UInt64,
+                                         body: (CMSampleBuffer) -> Result) -> Result? {
+        switch sampleFormat {
+        case .annexB:
+            guard let sampleBuffer = makeSampleBuffer(accessUnit: accessUnit,
+                                                      codec: codec,
+                                                      nalUnits: nalUnits,
+                                                      formatDescription: formatDescription,
+                                                      timestampMicros: timestampMicros) else {
+                return nil
+            }
+            return body(sampleBuffer)
+        case .lengthPrefixed:
+            guard let firstUnit = nalUnits.first(where: { $0.type != codec.audType }) else {
+                return nil
+            }
+            let sampleOffset = firstUnit.range.lowerBound - 4
+            guard sampleOffset >= 0, sampleOffset < accessUnit.count else { return nil }
+
+            return accessUnit.withUnsafeBytes { raw -> Result? in
+                guard let baseAddress = raw.baseAddress else { return nil }
+                var blockBuffer: CMBlockBuffer?
+                // The pointer is borrowed only through `body`. kCFAllocatorNull
+                // tells CoreMedia not to free Data's storage.
+                let blockStatus = CMBlockBufferCreateWithMemoryBlock(
+                    allocator: kCFAllocatorDefault,
+                    memoryBlock: UnsafeMutableRawPointer(mutating: baseAddress),
+                    blockLength: raw.count,
+                    blockAllocator: kCFAllocatorNull,
+                    customBlockSource: nil,
+                    offsetToData: sampleOffset,
+                    dataLength: raw.count - sampleOffset,
+                    flags: 0,
+                    blockBufferOut: &blockBuffer
+                )
+                guard blockStatus == kCMBlockBufferNoErr, let blockBuffer else { return nil }
+
+                var timing = CMSampleTimingInfo(
+                    duration: .invalid,
+                    presentationTimeStamp: CMTime(value: CMTimeValue(timestampMicros),
+                                                  timescale: 1_000_000),
+                    decodeTimeStamp: .invalid
+                )
+                var sampleBuffer: CMSampleBuffer?
+                let sampleStatus = CMSampleBufferCreateReady(
+                    allocator: kCFAllocatorDefault,
+                    dataBuffer: blockBuffer,
+                    formatDescription: formatDescription,
+                    sampleCount: 1,
+                    sampleTimingEntryCount: 1,
+                    sampleTimingArray: &timing,
+                    sampleSizeEntryCount: 0,
+                    sampleSizeArray: nil,
+                    sampleBufferOut: &sampleBuffer
+                )
+                guard sampleStatus == noErr, let sampleBuffer else { return nil }
+                return body(sampleBuffer)
+            }
+        }
     }
 
     /// Decode one sample buffer synchronously: with both asynchronous and

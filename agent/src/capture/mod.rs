@@ -7,8 +7,72 @@
 //! per-frame copies for now. An X11 (XShm/XDamage) fallback for X11 sessions
 //! also remains a TODO.
 
+use std::ops::Deref;
+
+#[cfg(target_os = "linux")]
+use std::os::fd::RawFd;
+
 #[cfg(target_os = "linux")]
 mod wlr;
+
+/// Storage behind one captured frame.
+///
+/// Most tests and fallback backends use an owned `Vec`. The Wayland backend
+/// supplies a leased memfd mapping instead: dropping the last frame owner
+/// returns that mapping to the capture pool, so the compositor never writes a
+/// buffer while FFmpeg is still reading it.
+pub struct FrameData(Box<dyn FrameStorage>);
+
+pub(crate) trait FrameStorage: Send {
+    fn bytes(&self) -> &[u8];
+
+    /// A file descriptor for the exact bytes returned by `bytes()`. Linux
+    /// encoders can splice this directly into a pipe and avoid a userspace
+    /// copy. Owned/fallback storage has no such descriptor.
+    #[cfg(target_os = "linux")]
+    fn splice_fd(&self) -> Option<RawFd> {
+        None
+    }
+}
+
+struct OwnedFrame(Vec<u8>);
+
+impl FrameStorage for OwnedFrame {
+    fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl FrameData {
+    pub(crate) fn from_storage(storage: impl FrameStorage + 'static) -> Self {
+        Self(Box::new(storage))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn splice_fd(&self) -> Option<RawFd> {
+        self.0.splice_fd()
+    }
+}
+
+impl From<Vec<u8>> for FrameData {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::from_storage(OwnedFrame(bytes))
+    }
+}
+
+impl AsRef<[u8]> for FrameData {
+    fn as_ref(&self) -> &[u8] {
+        self.0.bytes()
+    }
+}
+
+impl Deref for FrameData {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
 
 /// A single captured frame, in a pixel format agreed with the encoder.
 pub struct RawFrame {
@@ -21,7 +85,7 @@ pub struct RawFrame {
     /// Pixel data (format reported via [`CaptureFormat::pixel_format`];
     /// typically XRGB8888 from wl_shm, to be converted or handed to the
     /// encoder zero-copy in later stories).
-    pub data: Vec<u8>,
+    pub data: FrameData,
 }
 
 /// Negotiated capture parameters. Resolution and refresh come from the

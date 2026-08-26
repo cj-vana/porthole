@@ -87,6 +87,7 @@ impl FfmpegAudioSource {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        crate::subprocess::die_with_parent(&mut cmd);
         tracing::debug!(command = ?cmd, "spawning ffmpeg audio capture");
         let mut child = cmd
             .spawn()

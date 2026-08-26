@@ -283,6 +283,7 @@ final class StreamSession: ObservableObject {
         highestSubmittedSequence = accessUnit.sequence
         decodingSequence = accessUnit.sequence
         let submitted = decoder.decode(accessUnit: accessUnit.data,
+                                       sampleFormat: accessUnit.sampleFormat,
                                        timestampMicros: accessUnit.timestampMicros)
         decodingSequence = nil
 
@@ -451,7 +452,7 @@ extension StreamSession {
         return true
     }
 
-    /// Gaming mode: 144 (or 120) fps HEVC at 80 Mbps with the encoder
+    /// Gaming mode: 144 (or 120) fps HEVC at 60 Mbps with the encoder
     /// biased toward latency; off restores 60 fps H.264 at 40 Mbps. The
     /// decoder switches codec immediately rather than waiting for the
     /// reconfigured hello, which is advisory (docs/protocol.md "settings").

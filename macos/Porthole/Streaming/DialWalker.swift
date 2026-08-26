@@ -17,7 +17,7 @@ final class DialWalker {
     private var remaining: [(host: String, port: UInt16)] = []
     private var timeout: DispatchWorkItem?
 
-    init(queue: DispatchQueue, timeoutSeconds: Double = 1.0) {
+    init(queue: DispatchQueue, timeoutSeconds: Double = 0.25) {
         self.queue = queue
         self.timeoutSeconds = timeoutSeconds
     }

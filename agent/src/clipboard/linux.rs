@@ -71,12 +71,13 @@ fn spawn_watch(
             // the content on stdin. We run a tiny shell that frames each
             // change with a NUL terminator so the reader can split a stream
             // of changes unambiguously (clipboard text may contain newlines).
-            let mut child = match Command::new("wl-paste")
+            let mut command = Command::new("wl-paste");
+            command
                 .args(["--type", "text/plain", "--watch", "sh", "-c", "cat; printf '\\0'"])
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-            {
+                .stderr(Stdio::null());
+            crate::subprocess::die_with_parent(&mut command);
+            let mut child = match command.spawn() {
                 Ok(child) => child,
                 Err(err) => {
                     tracing::warn!(%err, "failed to start wl-paste --watch, clipboard receive disabled");
@@ -151,12 +152,14 @@ fn spawn_apply(from_client: mpsc::Receiver<String>, last_text: LastText) {
 
 fn wl_copy(text: &str) -> std::io::Result<()> {
     use std::io::Write;
-    let mut child = Command::new("wl-copy")
+    let mut command = Command::new("wl-copy");
+    command
         .args(["--type", "text/plain"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    crate::subprocess::die_with_parent(&mut command);
+    let mut child = command.spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(text.as_bytes())?;
     }

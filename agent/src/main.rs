@@ -18,6 +18,7 @@ mod discovery;
 mod encode;
 mod gamepad;
 mod input;
+mod subprocess;
 mod transfer;
 mod transport;
 mod virtual_display;
@@ -74,8 +75,8 @@ struct Cli {
     #[arg(long, value_enum)]
     codec: Option<Codec>,
 
-    /// Hardware encoder backend: nvenc on the NVIDIA dGPU, or vaapi on the
-    /// Ryzen iGPU (keeps the dGPU free for gaming) [default: nvenc]
+    /// Hardware encoder backend: nvenc, vaapi, or GPU-resident portal capture
+    /// via gpu-screen-recorder (`gsr`) [default: nvenc]
     #[arg(long, value_enum)]
     encoder: Option<encode::EncoderBackend>,
 
@@ -103,6 +104,10 @@ struct Cli {
     /// [default: auto-detect, preferring amdgpu, i915, xe; never nvidia]
     #[arg(long, value_name = "PATH")]
     vaapi_device: Option<PathBuf>,
+
+    /// Portal restore-token file for the `gsr` backend
+    #[arg(long, value_name = "PATH")]
+    gsr_restore_token: Option<PathBuf>,
 
     /// TCP port for the file-transfer endpoint [default: 52804]
     #[arg(long, value_name = "PORT")]
@@ -154,6 +159,9 @@ impl Cli {
         }
         if let Some(v) = &self.vaapi_device {
             cfg.vaapi_device = Some(v.clone());
+        }
+        if let Some(v) = &self.gsr_restore_token {
+            cfg.gsr_restore_token = Some(v.clone());
         }
         if let Some(v) = self.port_files {
             cfg.port_files = v;
@@ -253,6 +261,10 @@ impl CaptureMailbox {
         slot.take()
     }
 
+    fn discard_pending(&self) {
+        self.slot.lock().expect("capture mailbox poisoned").take();
+    }
+
     fn finish(&self) {
         self.done.store(true, Ordering::Release);
         self.ready.notify_all();
@@ -288,13 +300,23 @@ fn spawn_capture_producer(
     mailbox: Arc<CaptureMailbox>,
     latest_frame: discovery::LatestFrame,
     pipeline_start: Instant,
+    raw_capture_enabled: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 ) -> std::io::Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("wayland-capture".into())
         .spawn(move || {
             let mut sequence = 0u64;
+            let mut has_thumbnail = false;
             while !shutdown.load(Ordering::Relaxed) {
+                let publish_video = raw_capture_enabled.load(Ordering::Acquire);
+                // A capture-owning encoder imports compositor dma-bufs itself.
+                // Keep one startup frame for the picker, then avoid every SHM
+                // readback until a raw-frame encoder is selected again.
+                if !publish_video && has_thumbnail {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
                 let frame = match backend.next_frame() {
                     Ok(frame) => frame,
                     Err(err) => {
@@ -311,14 +333,41 @@ fn spawn_capture_producer(
                     mailbox.update_format(backend.format());
                 }
                 // Picker thumbnails need freshness, not every video frame.
-                if sequence % 30 == 1 {
+                if !has_thumbnail || (publish_video && sequence % 30 == 1) {
                     *latest_frame.lock().expect("thumbnail slot poisoned") =
-                        Some((frame.data.clone(), frame.width, frame.height, frame.stride));
+                        Some((frame.data.to_vec(), frame.width, frame.height, frame.stride));
+                    has_thumbnail = true;
                 }
-                mailbox.publish(CapturedFrame { frame, captured_us });
+                if publish_video {
+                    mailbox.publish(CapturedFrame { frame, captured_us });
+                }
             }
             mailbox.finish();
         })
+}
+
+fn rebuild_encoder(
+    encoder: &mut Box<dyn encode::Encoder>,
+    cfg: &config::Config,
+    format: &capture::CaptureFormat,
+    raw_capture_enabled: &AtomicBool,
+    mailbox: &CaptureMailbox,
+) {
+    // Portal restore tokens cannot be opened by two simultaneous GSR
+    // sessions. Drop the old child before constructing its replacement.
+    // Temporarily resume raw capture so the NVENC fallback is ready without
+    // waiting for another compositor tick if GSR startup fails.
+    raw_capture_enabled.store(true, Ordering::Release);
+    let placeholder: Box<dyn encode::Encoder> =
+        Box::new(encode::NullEncoder::new(cfg.codec, cfg.encoder));
+    drop(std::mem::replace(encoder, placeholder));
+    *encoder = encode::create(cfg, format);
+
+    let needs_raw_frames = encoder.needs_raw_frames();
+    raw_capture_enabled.store(needs_raw_frames, Ordering::Release);
+    if !needs_raw_frames {
+        mailbox.discard_pending();
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -337,11 +386,13 @@ fn capture_loop(
 ) {
     let capture_backend = backend.name().to_string();
     let mailbox = Arc::new(CaptureMailbox::new(capture_format.clone()));
+    let raw_capture_enabled = Arc::new(AtomicBool::new(encoder.needs_raw_frames()));
     let capture_thread = match spawn_capture_producer(
         backend,
         mailbox.clone(),
         latest_frame,
         pipeline_start,
+        raw_capture_enabled.clone(),
         shutdown.clone(),
     ) {
         Ok(handle) => handle,
@@ -356,10 +407,13 @@ fn capture_loop(
     // frame tick (e.g. 6.9ms at 144 Hz), so checking elapsed >= interval
     // would under-feed (45 fps at 60 target). Track the schedule instead.
     let mut next_submit = Instant::now();
-    // Capture instants of submitted frames, FIFO: our encoders emit AUs in
-    // submission order (no B-frame reordering at these settings), so the nth
-    // drained AU pairs with the nth submitted frame's capture time.
-    let mut submitted_at: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+    // Submitted frames, FIFO: our encoders emit AUs in submission order (no
+    // B-frame reordering at these settings), so the nth drained AU pairs with
+    // the nth capture. Keeping the frame here also holds a leased Wayland
+    // mapping until FFmpeg has consumed it; this makes memfd-to-pipe splice
+    // safe while still allowing the capture thread to use another pool slot.
+    let mut pending_frames: std::collections::VecDeque<(u64, capture::RawFrame)> =
+        std::collections::VecDeque::new();
     // Debug aid: PORTHOLE_DUMP_VIDEO=<path> writes the encoded Annex B
     // stream to a file (used to ffprobe-verify encoder output).
     let mut dump: Option<std::io::BufWriter<std::fs::File>> = std::env::var_os(
@@ -431,8 +485,14 @@ fn capture_loop(
                     // mid-session, so restart the encoder; the new session
                     // starts with an IDR.
                     let restart_start = Instant::now();
-                    encoder = encode::create(&cfg, &capture_format);
-                    submitted_at.clear();
+                    rebuild_encoder(
+                        &mut encoder,
+                        &cfg,
+                        &capture_format,
+                        &raw_capture_enabled,
+                        &mailbox,
+                    );
+                    pending_frames.clear();
                     tracing::info!(
                         restart_ms = restart_start.elapsed().as_millis(),
                         "encoder restarted for keyframe request"
@@ -460,8 +520,14 @@ fn capture_loop(
                     };
                     cfg.bitrate_mbps = u32::from(settings.bitrate_mbps).max(1);
                     cfg.low_latency = settings.low_latency;
-                    encoder = encode::create(&cfg, &capture_format);
-                    submitted_at.clear();
+                    rebuild_encoder(
+                        &mut encoder,
+                        &cfg,
+                        &capture_format,
+                        &raw_capture_enabled,
+                        &mailbox,
+                    );
+                    pending_frames.clear();
                     next_submit = Instant::now();
                     let hello = hello_for(&cfg, &capture_format);
                     // Update both the connected client and the hello future
@@ -484,28 +550,37 @@ fn capture_loop(
         // 14.7 MB stdin write from getting in front of completed video.
         let mut access_units = encoder.drain();
         if access_units.is_empty() {
-            // Wait at most 100 us for a new capture. Short polling bounds how
-            // long an AU that becomes ready meanwhile can sit before transmit.
-            let captured = mailbox.take_timeout(Duration::from_micros(100));
-            if let Some(captured) = captured {
-                // Pace encoder submissions to the configured stream rate.
-                let now = Instant::now();
-                if now >= next_submit {
-                    next_submit += frame_interval;
-                    if next_submit < now {
-                        // Way behind (stall); restart the schedule instead of
-                        // bursting to catch up.
-                        next_submit = now + frame_interval;
+            if encoder.needs_raw_frames() {
+                // Wait at most 100 us for a new capture. Short polling bounds
+                // how long an AU that becomes ready meanwhile can sit before
+                // transmit.
+                let captured = mailbox.take_timeout(Duration::from_micros(100));
+                if let Some(captured) = captured {
+                    // Pace encoder submissions to the configured stream rate.
+                    let now = Instant::now();
+                    if now >= next_submit {
+                        next_submit += frame_interval;
+                        if next_submit < now {
+                            // Way behind (stall); restart the schedule instead
+                            // of bursting to catch up.
+                            next_submit = now + frame_interval;
+                        }
+                        let submit_start = Instant::now();
+                        if let Err(err) = encoder.encode(&captured.frame) {
+                            tracing::error!(
+                                "{err:#}: encoder submit failed, stopping capture loop"
+                            );
+                            break;
+                        }
+                        submit_ms_total += submit_start.elapsed().as_secs_f64() * 1000.0;
+                        submitted += 1;
+                        pending_frames.push_back((captured.captured_us, captured.frame));
                     }
-                    let submit_start = Instant::now();
-                    if let Err(err) = encoder.encode(&captured.frame) {
-                        tracing::error!("{err:#}: encoder submit failed, stopping capture loop");
-                        break;
-                    }
-                    submit_ms_total += submit_start.elapsed().as_secs_f64() * 1000.0;
-                    submitted += 1;
-                    submitted_at.push_back(captured.captured_us);
                 }
+            } else {
+                // GSR produces independently. Polling below a compositor tick
+                // prevents its completed AU from waiting behind another frame.
+                thread::sleep(Duration::from_micros(100));
             }
             // A previous frame can finish while the pipe write is in flight.
             access_units.extend(encoder.drain());
@@ -520,13 +595,25 @@ fn capture_loop(
                 .ready_at
                 .saturating_duration_since(pipeline_start)
                 .as_micros() as u64;
-            let timestamp_us = match submitted_at.pop_front() {
-                Some(captured_us) => {
-                    enc_latency_us_total += ready_us.saturating_sub(captured_us);
-                    enc_latency_samples += 1;
-                    captured_us
+            let timestamp_us = if let Some(captured_at) = au.captured_at {
+                let captured_us = captured_at
+                    .saturating_duration_since(pipeline_start)
+                    .as_micros() as u64;
+                enc_latency_us_total += au
+                    .ready_at
+                    .saturating_duration_since(captured_at)
+                    .as_micros() as u64;
+                enc_latency_samples += 1;
+                captured_us
+            } else {
+                match pending_frames.pop_front() {
+                    Some((captured_us, _frame_lease)) => {
+                        enc_latency_us_total += ready_us.saturating_sub(captured_us);
+                        enc_latency_samples += 1;
+                        captured_us
+                    }
+                    None => ready_us,
                 }
-                None => ready_us,
             };
             let send_start = Instant::now();
             ready_wait_us_total += send_start
@@ -550,22 +637,34 @@ fn capture_loop(
             let secs = elapsed.as_secs_f64();
             let format = mailbox.format();
             let (frames, capture_replaced) = mailbox.take_window_counts();
+            let capture_owns_frames = !encoder.needs_raw_frames();
+            let capture_frames = if capture_owns_frames { encoded } else { frames };
+            let encoder_inputs = if capture_owns_frames {
+                encoded
+            } else {
+                submitted
+            };
+            let active_capture_backend = if capture_owns_frames {
+                "pipewire-dmabuf"
+            } else {
+                capture_backend.as_str()
+            };
             let tx_kbps = sender.bytes_sent as f64 * 8.0 / secs / 1000.0;
             let tx_datagrams = sender.datagrams_sent as f64 / secs;
             let enc_latency_us = enc_latency_us_total / enc_latency_samples.max(1);
             sender.bytes_sent = 0;
             sender.datagrams_sent = 0;
             tracing::info!(
-                backend = capture_backend,
+                backend = active_capture_backend,
                 resolution = format!("{}x{}", format.width, format.height),
                 stride = format.width as usize * 4,
                 frame_bytes = format.width as usize * format.height as usize * 4,
                 pixel_format = format.pixel_format.as_deref().unwrap_or("unknown"),
-                fps = format!("{:.0}", frames as f64 / secs),
+                fps = format!("{:.0}", capture_frames as f64 / secs),
                 capture_replaced,
                 enc_backend = %encoder.backend(),
                 enc_codec = %encoder.codec(),
-                enc_in = format!("{:.0}", submitted as f64 / secs),
+                enc_in = format!("{:.0}", encoder_inputs as f64 / secs),
                 enc_out = format!("{:.0}", encoded as f64 / secs),
                 enc_kbps = format!("{:.0}", encoded_bytes as f64 * 8.0 / secs / 1000.0),
                 enc_keyframes = keyframes,
@@ -580,7 +679,7 @@ fn capture_loop(
             );
             if sender.client().is_some() {
                 let stats = porthole_agent::protocol::AgentStats {
-                    capture_fps: (frames as f64 / secs).round() as u16,
+                    capture_fps: (capture_frames as f64 / secs).round() as u16,
                     encode_fps: (encoded as f64 / secs).round() as u16,
                     encode_latency_us: enc_latency_us.min(u64::from(u32::MAX)) as u32,
                     tx_kbps: tx_kbps.round() as u32,
@@ -604,7 +703,7 @@ fn capture_loop(
             window_start = Instant::now();
         }
 
-        if mailbox.is_done_and_empty() && submitted_at.is_empty() {
+        if mailbox.is_done_and_empty() && pending_frames.is_empty() {
             break;
         }
     }
@@ -650,6 +749,7 @@ async fn main() -> anyhow::Result<()> {
         virtual_display = %cfg.virtual_display.map(|v| v.to_string()).unwrap_or_else(|| "off".into()),
         mtu = cfg.mtu.get(),
         vaapi_device = %cfg.vaapi_device.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "auto".into()),
+        gsr_restore_token = %cfg.gsr_restore_token.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "unset".into()),
         capture_backend = backend.name(),
         "effective configuration"
     );
@@ -790,7 +890,7 @@ mod pipeline_tests {
                 width: 1,
                 height: 1,
                 stride: 4,
-                data: vec![value; 4],
+                data: vec![value; 4].into(),
             },
             captured_us: u64::from(value),
         }
@@ -806,7 +906,7 @@ mod pipeline_tests {
             .take_timeout(Duration::ZERO)
             .expect("newest frame remains queued");
         assert_eq!(newest.captured_us, 2);
-        assert_eq!(newest.frame.data, vec![2; 4]);
+        assert_eq!(newest.frame.data.as_ref(), &[2; 4]);
         assert_eq!(mailbox.take_window_counts(), (2, 1));
 
         mailbox.finish();

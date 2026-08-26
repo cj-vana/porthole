@@ -14,6 +14,13 @@ pub const VIDEO_MAGIC: [u8; 3] = *b"PHV";
 pub const PROTOCOL_VERSION: u8 = 1;
 /// Video datagram header length in bytes.
 pub const VIDEO_HEADER_LEN: usize = 25;
+/// Video header flag: the access unit is independently decodable.
+pub const VIDEO_FLAG_KEYFRAME: u8 = 1 << 0;
+/// Video header flag: this datagram is the XOR repair shard for the frame.
+/// Its fragment index equals (rather than precedes) `frag_count`.
+pub const VIDEO_FLAG_REPAIR: u8 = 1 << 1;
+/// Repair payload prefix containing the true final-fragment byte count.
+pub const VIDEO_REPAIR_PREFIX_LEN: usize = 2;
 /// Datagram size ceiling; safe under a 1500-byte MTU. Receivers accept
 /// anything up to this.
 pub const MAX_DATAGRAM_SIZE: usize = 1400;
@@ -455,6 +462,7 @@ pub struct VideoHeader {
     pub frag_index: u16,
     pub frag_count: u16,
     pub is_keyframe: bool,
+    pub is_repair: bool,
 }
 
 /// Fragment one access unit into datagrams of at most `datagram_size`
@@ -478,10 +486,71 @@ pub fn fragment(
         dgram.extend_from_slice(&timestamp_us.to_be_bytes());
         dgram.extend_from_slice(&(index as u16).to_be_bytes());
         dgram.extend_from_slice(&frag_count.to_be_bytes());
-        dgram.push(u8::from(is_keyframe));
+        dgram.push(if is_keyframe { VIDEO_FLAG_KEYFRAME } else { 0 });
         dgram.extend_from_slice(chunk);
         out.push(dgram);
     }
+    out
+}
+
+/// Fragment one access unit and append a zero-wait XOR repair shard.
+///
+/// Losing any one data datagram no longer loses the frame: the receiver XORs
+/// the remaining fragments with the repair payload to recreate it locally.
+/// The repair shard is sent after the data, so loss-free frames complete on
+/// the exact same datagram as before and pay no extra receive-side latency.
+/// Two bytes are reserved from each path-sized payload so the repair shard can
+/// carry the true final-fragment length without exceeding the configured MTU.
+/// Old receivers ignore the repair datagram (its index is outside their
+/// accepted data range) and still decode every data fragment normally.
+pub fn fragment_with_repair(
+    au: &[u8],
+    frame_seq: u64,
+    timestamp_us: u64,
+    is_keyframe: bool,
+    datagram_size: usize,
+) -> Vec<Vec<u8>> {
+    let datagram_size = datagram_size.clamp(MIN_DATAGRAM_SIZE, MAX_DATAGRAM_SIZE);
+    let payload_size = datagram_size - VIDEO_HEADER_LEN - VIDEO_REPAIR_PREFIX_LEN;
+    let frag_count = au.len().div_ceil(payload_size).max(1) as u16;
+    let flags = if is_keyframe { VIDEO_FLAG_KEYFRAME } else { 0 };
+    let mut repair = vec![0u8; payload_size];
+    let mut out = Vec::with_capacity(frag_count as usize + 1);
+
+    for index in 0..usize::from(frag_count) {
+        let start = index * payload_size;
+        let end = (start + payload_size).min(au.len());
+        let chunk = &au[start..end];
+        for (parity, byte) in repair.iter_mut().zip(chunk) {
+            *parity ^= *byte;
+        }
+
+        let mut dgram = Vec::with_capacity(VIDEO_HEADER_LEN + chunk.len());
+        dgram.extend_from_slice(&VIDEO_MAGIC);
+        dgram.push(PROTOCOL_VERSION);
+        dgram.extend_from_slice(&frame_seq.to_be_bytes());
+        dgram.extend_from_slice(&timestamp_us.to_be_bytes());
+        dgram.extend_from_slice(&(index as u16).to_be_bytes());
+        dgram.extend_from_slice(&frag_count.to_be_bytes());
+        dgram.push(flags);
+        dgram.extend_from_slice(chunk);
+        out.push(dgram);
+    }
+
+    let final_len = au
+        .len()
+        .saturating_sub(usize::from(frag_count.saturating_sub(1)) * payload_size);
+    let mut repair_dgram = Vec::with_capacity(datagram_size);
+    repair_dgram.extend_from_slice(&VIDEO_MAGIC);
+    repair_dgram.push(PROTOCOL_VERSION);
+    repair_dgram.extend_from_slice(&frame_seq.to_be_bytes());
+    repair_dgram.extend_from_slice(&timestamp_us.to_be_bytes());
+    repair_dgram.extend_from_slice(&frag_count.to_be_bytes());
+    repair_dgram.extend_from_slice(&frag_count.to_be_bytes());
+    repair_dgram.push(flags | VIDEO_FLAG_REPAIR);
+    repair_dgram.extend_from_slice(&(final_len as u16).to_be_bytes());
+    repair_dgram.extend_from_slice(&repair);
+    out.push(repair_dgram);
     out
 }
 
@@ -498,12 +567,17 @@ pub fn parse_datagram(bytes: &[u8]) -> Option<(VideoHeader, &[u8])> {
     let timestamp_us = u64::from_be_bytes(bytes[12..20].try_into().ok()?);
     let frag_index = u16::from_be_bytes(bytes[20..22].try_into().ok()?);
     let frag_count = u16::from_be_bytes(bytes[22..24].try_into().ok()?);
-    let is_keyframe = bytes[24] & 1 != 0;
-    if frag_count == 0 || frag_index >= frag_count {
+    let flags = bytes[24];
+    let is_keyframe = flags & VIDEO_FLAG_KEYFRAME != 0;
+    let is_repair = flags & VIDEO_FLAG_REPAIR != 0;
+    if frag_count == 0
+        || (!is_repair && frag_index >= frag_count)
+        || (is_repair && frag_index != frag_count)
+    {
         return None;
     }
     let payload = &bytes[VIDEO_HEADER_LEN..];
-    if payload.is_empty() {
+    if payload.is_empty() || (is_repair && payload.len() <= VIDEO_REPAIR_PREFIX_LEN) {
         return None;
     }
     Some((
@@ -513,6 +587,7 @@ pub fn parse_datagram(bytes: &[u8]) -> Option<(VideoHeader, &[u8])> {
             frag_index,
             frag_count,
             is_keyframe,
+            is_repair,
         },
         payload,
     ))
@@ -534,6 +609,7 @@ struct PartialFrame {
     received: u16,
     total_bytes: usize,
     fragments: Vec<Option<Vec<u8>>>,
+    repair: Option<(usize, Vec<u8>)>,
     first_seen: Instant,
 }
 
@@ -541,6 +617,7 @@ struct PartialFrame {
 /// when a fragment is missing and the frame goes stale.
 pub struct Reassembler {
     frames: HashMap<u64, PartialFrame>,
+    highest_completed: Option<u64>,
     /// Frame seqs older than this without completing are dropped as lost.
     pub max_frame_age: Duration,
 }
@@ -549,6 +626,7 @@ impl Default for Reassembler {
     fn default() -> Self {
         Self {
             frames: HashMap::new(),
+            highest_completed: None,
             max_frame_age: Duration::from_millis(500),
         }
     }
@@ -558,6 +636,13 @@ impl Reassembler {
     /// Push one datagram. Returns the assembled access unit when this
     /// fragment completes its frame.
     pub fn push(&mut self, header: VideoHeader, payload: &[u8]) -> Option<AssembledFrame> {
+        if header.is_repair
+            && self
+                .highest_completed
+                .is_some_and(|seq| header.frame_seq <= seq)
+        {
+            return None;
+        }
         let entry = self
             .frames
             .entry(header.frame_seq)
@@ -568,6 +653,7 @@ impl Reassembler {
                 received: 0,
                 total_bytes: 0,
                 fragments: vec![None; header.frag_count as usize],
+                repair: None,
                 first_seen: Instant::now(),
             });
         // Consistency: conflicting metadata for the same seq means loss or
@@ -576,11 +662,55 @@ impl Reassembler {
             self.frames.remove(&header.frame_seq);
             return None;
         }
-        let slot = &mut entry.fragments[header.frag_index as usize];
-        if slot.is_none() {
-            *slot = Some(payload.to_vec());
-            entry.received += 1;
-            entry.total_bytes += payload.len();
+        if header.is_repair {
+            let final_len = usize::from(u16::from_be_bytes([payload[0], payload[1]]));
+            let parity = &payload[VIDEO_REPAIR_PREFIX_LEN..];
+            if final_len == 0 || final_len > parity.len() {
+                self.frames.remove(&header.frame_seq);
+                return None;
+            }
+            entry.repair = Some((final_len, parity.to_vec()));
+        } else {
+            let slot = &mut entry.fragments[header.frag_index as usize];
+            if slot.is_none() {
+                *slot = Some(payload.to_vec());
+                entry.received += 1;
+                entry.total_bytes += payload.len();
+            }
+        }
+
+        if entry.received + 1 == entry.frag_count {
+            let missing = entry.fragments.iter().position(Option::is_none);
+            if let (Some(missing), Some((final_len, parity))) = (missing, entry.repair.as_ref()) {
+                let mut recovered = parity.clone();
+                let mut valid = true;
+                for (index, fragment) in entry.fragments.iter().enumerate() {
+                    let Some(fragment) = fragment else { continue };
+                    let expected_len = if index + 1 == entry.fragments.len() {
+                        *final_len
+                    } else {
+                        parity.len()
+                    };
+                    if fragment.len() != expected_len {
+                        valid = false;
+                        break;
+                    }
+                    for (byte, received) in recovered.iter_mut().zip(fragment) {
+                        *byte ^= *received;
+                    }
+                }
+                if valid {
+                    let recovered_len = if missing + 1 == entry.fragments.len() {
+                        *final_len
+                    } else {
+                        parity.len()
+                    };
+                    recovered.truncate(recovered_len);
+                    entry.total_bytes += recovered.len();
+                    entry.fragments[missing] = Some(recovered);
+                    entry.received += 1;
+                }
+            }
         }
         if entry.received == entry.frag_count {
             let entry = self.frames.remove(&header.frame_seq).expect("present");
@@ -588,6 +718,10 @@ impl Reassembler {
             for frag in entry.fragments.into_iter() {
                 data.extend_from_slice(&frag.expect("all fragments present"));
             }
+            self.highest_completed = Some(
+                self.highest_completed
+                    .map_or(header.frame_seq, |seq| seq.max(header.frame_seq)),
+            );
             return Some(AssembledFrame {
                 frame_seq: header.frame_seq,
                 timestamp_us: entry.timestamp_us,
@@ -736,6 +870,58 @@ mod tests {
         assert_eq!(frame.frame_seq, 42);
         assert!(frame.is_keyframe);
         assert_eq!(frame.data, au);
+    }
+
+    #[test]
+    fn repair_shard_recovers_any_single_missing_fragment() {
+        let au = sample_au(MAX_FRAGMENT_PAYLOAD * 4 + 73);
+        let datagrams = fragment_with_repair(&au, 43, 987_654, true, MAX_DATAGRAM_SIZE);
+        let (repair_header, repair_payload) = parse_datagram(datagrams.last().unwrap()).unwrap();
+        assert!(repair_header.is_repair);
+        assert!(repair_header.is_keyframe);
+        assert_eq!(repair_header.frag_index, repair_header.frag_count);
+        assert_eq!(repair_payload.len() + VIDEO_HEADER_LEN, MAX_DATAGRAM_SIZE);
+        assert!(datagrams
+            .iter()
+            .all(|dgram| dgram.len() <= MAX_DATAGRAM_SIZE));
+
+        let data_fragments = usize::from(repair_header.frag_count);
+        for missing in 0..data_fragments {
+            let mut reassembler = Reassembler::default();
+            let mut assembled = None;
+            for (index, datagram) in datagrams.iter().enumerate() {
+                if index == missing {
+                    continue;
+                }
+                let (header, payload) = parse_datagram(datagram).unwrap();
+                if let Some(frame) = reassembler.push(header, payload) {
+                    assembled = Some(frame);
+                }
+            }
+            let frame = assembled.unwrap_or_else(|| panic!("fragment {missing} was not repaired"));
+            assert_eq!(frame.frame_seq, 43);
+            assert_eq!(frame.timestamp_us, 987_654);
+            assert!(frame.is_keyframe);
+            assert_eq!(frame.data, au);
+            assert_eq!(reassembler.pending(), 0);
+        }
+    }
+
+    #[test]
+    fn repair_shard_is_redundant_when_data_is_complete() {
+        let au = sample_au(MAX_FRAGMENT_PAYLOAD * 2 + 9);
+        let datagrams = fragment_with_repair(&au, 44, 1, false, MAX_DATAGRAM_SIZE);
+        let mut reassembler = Reassembler::default();
+        let mut completed = 0;
+        for datagram in &datagrams {
+            let (header, payload) = parse_datagram(datagram).unwrap();
+            if let Some(frame) = reassembler.push(header, payload) {
+                completed += 1;
+                assert_eq!(frame.data, au);
+            }
+        }
+        assert_eq!(completed, 1);
+        assert_eq!(reassembler.pending(), 0);
     }
 
     #[test]

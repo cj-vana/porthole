@@ -61,9 +61,13 @@ final class H264Decoder: VideoDecoder {
     }
 
     @discardableResult
-    func decode(accessUnit: Data, timestampMicros: UInt64) -> Bool {
+    func decode(accessUnit: Data,
+                sampleFormat: AnnexB.SampleFormat,
+                timestampMicros: UInt64) -> Bool {
         let prepareStarted = ContinuousClock.now
-        let nalUnits = AnnexB.locateNALUnits(in: accessUnit)
+        let nalUnits = sampleFormat == .lengthPrefixed
+            ? AnnexB.locateLengthPrefixedNALUnits(in: accessUnit)
+            : AnnexB.locateNALUnits(in: accessUnit)
         var sps: Data?
         var pps: Data?
         for nal in nalUnits {
@@ -83,20 +87,23 @@ final class H264Decoder: VideoDecoder {
             return false
         }
 
-        guard let sampleBuffer = VTDecode.makeSampleBuffer(accessUnit: accessUnit,
-                                                           codec: .h264,
-                                                           nalUnits: nalUnits,
-                                                           formatDescription: formatDescription,
-                                                           timestampMicros: timestampMicros) else {
+        guard let result = VTDecode.withSampleBuffer(
+            accessUnit: accessUnit,
+            sampleFormat: sampleFormat,
+            codec: .h264,
+            nalUnits: nalUnits,
+            formatDescription: formatDescription,
+            timestampMicros: timestampMicros,
+            body: { [self] sampleBuffer in
+                let prepareElapsed = ContinuousClock.now - prepareStarted
+                lastPrepareMilliseconds = Double(prepareElapsed.components.seconds) * 1e3
+                    + Double(prepareElapsed.components.attoseconds) / 1e15
+                return VTDecode.submit(sampleBuffer, to: session)
+            }
+        ) else {
             onFailure?("failed to build sample buffer")
             return false
         }
-
-        let prepareElapsed = ContinuousClock.now - prepareStarted
-        lastPrepareMilliseconds = Double(prepareElapsed.components.seconds) * 1e3
-            + Double(prepareElapsed.components.attoseconds) / 1e15
-
-        let result = VTDecode.submit(sampleBuffer, to: session)
         lastDecodeMilliseconds = result.milliseconds
         return finishSubmit(result.status)
     }
