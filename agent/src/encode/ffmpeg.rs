@@ -235,10 +235,12 @@ impl FfmpegEncoder {
         match cfg.encoder {
             EncoderBackend::Nvenc => {
                 // setparams tags BT.709 at the frame level (the Mac client
-                // honors VUI; US-005 follow-up). NVENC's internal RGB to YUV
-                // conversion ignores setparams for the matrix and tags
-                // bt470bg with bgra input, so we convert to nv12 in the
-                // filter chain (CPU swscale, measured cheap at 1440p60).
+                // honors VUI; US-005 follow-up). In quality mode we convert to
+                // NV12 with swscale so the matrix is explicitly BT.709. In
+                // gaming mode, preserve BGRA through the filter graph and let
+                // NVENC upload and convert it on the GPU. That avoids a full
+                // 14.7 MB CPU color-conversion pass; NVENC marks its internal
+                // conversion bt470bg and the client honors that VUI matrix.
                 // Gaming mode (low_latency) trades a little quality for the
                 // fastest preset and the ultra-low-latency tune; quality mode
                 // keeps p3/ll, which the encode-latency A/B found within a
@@ -248,9 +250,14 @@ impl FfmpegEncoder {
                 } else {
                     ("p3", "ll")
                 };
+                let filter = if cfg.low_latency {
+                    "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709"
+                } else {
+                    "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,format=nv12"
+                };
                 cmd.args([
                     "-vf",
-                    "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,format=nv12",
+                    filter,
                     "-preset",
                     preset,
                     "-tune",
