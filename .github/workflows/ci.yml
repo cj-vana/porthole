@@ -12,10 +12,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
+      # xkbcommon (virtual keyboard keymap) links the system library.
+      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev
+      - run: cargo fmt --check
+        working-directory: agent
       - run: cargo build --locked
         working-directory: agent
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --all-targets -- -D warnings
         working-directory: agent
       - run: cargo test
         working-directory: agent
@@ -24,8 +28,17 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - run: brew install xcodegen
+      - run: brew install xcodegen swiftlint
       - run: xcodegen generate
         working-directory: macos
+      - run: swiftlint lint --strict
+        working-directory: macos
       - run: xcodebuild -scheme Porthole -configuration Debug build CODE_SIGNING_ALLOWED=NO
+        working-directory: macos
+      - run: xcodebuild -scheme porthole-decode-test -configuration Debug build CODE_SIGNING_ALLOWED=NO
+        working-directory: macos
+      - run: xcodebuild -scheme porthole-input-test -configuration Debug -derivedDataPath build build CODE_SIGNING_ALLOWED=NO
+        working-directory: macos
+      # Byte-exact input translation gate; needs no agent or display.
+      - run: ./build/Build/Products/Debug/porthole-input-test local
         working-directory: macos

@@ -378,24 +378,31 @@ mod tests {
     #[test]
     fn virtual_display_rejects_malformed() {
         for bad in [
-            "2560x1440",     // missing refresh
-            "abc",           // garbage
-            "0x0@0",         // zeros
-            "2560x1440@",    // missing refresh value
-            "@144",          // missing dimensions
-            "2560X1440@144", // uppercase separator
+            "2560x1440",       // missing refresh
+            "abc",             // garbage
+            "0x0@0",           // zeros
+            "2560x1440@",      // missing refresh value
+            "@144",            // missing dimensions
+            "2560X1440@144",   // uppercase separator
             "2560x1440@144x",  // trailing garbage
             "-2560x1440@144",  // negative
             "2560x1440@144@2", // extra separator
         ] {
-            assert!(bad.parse::<VirtualDisplay>().is_err(), "{bad:?} should be rejected");
+            assert!(
+                bad.parse::<VirtualDisplay>().is_err(),
+                "{bad:?} should be rejected"
+            );
         }
         // Same validation from the TOML side.
         assert!(toml::from_str::<FileConfig>(r#"virtual_display = "abc""#).is_err());
         let file_cfg: FileConfig = toml::from_str(r#"virtual_display = "2560x1440@144""#).unwrap();
         assert_eq!(
             file_cfg.virtual_display.unwrap(),
-            VirtualDisplay { width: 2560, height: 1440, refresh_hz: 144 }
+            VirtualDisplay {
+                width: 2560,
+                height: 1440,
+                refresh_hz: 144
+            }
         );
     }
 

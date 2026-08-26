@@ -69,7 +69,11 @@ impl ShmBuffer {
             (),
         );
         pool.destroy();
-        Ok(Self { mmap, buffer, params })
+        Ok(Self {
+            mmap,
+            buffer,
+            params,
+        })
     }
 }
 
@@ -110,10 +114,7 @@ impl WlState {
         qh: &QueueHandle<WlState>,
     ) -> anyhow::Result<()> {
         let pending = self.pending.context("compositor sent no shm format")?;
-        let reusable = self
-            .buffer
-            .as_ref()
-            .is_some_and(|b| b.params == pending);
+        let reusable = self.buffer.as_ref().is_some_and(|b| b.params == pending);
         if !reusable {
             if let Some(old) = self.buffer.take() {
                 old.buffer.destroy();
@@ -312,7 +313,11 @@ impl WlrCapture {
         // Wayland registry; retry roundtrips instead of racing it (US-015).
         if let Some(want) = preferred_output {
             for _ in 0..20 {
-                if state.outputs.iter().any(|o| o.name.as_deref() == Some(want)) {
+                if state
+                    .outputs
+                    .iter()
+                    .any(|o| o.name.as_deref() == Some(want))
+                {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -324,9 +329,15 @@ impl WlrCapture {
 
         let chosen = preferred_output
             .and_then(|want| {
-                let found = state.outputs.iter().find(|o| o.name.as_deref() == Some(want));
+                let found = state
+                    .outputs
+                    .iter()
+                    .find(|o| o.name.as_deref() == Some(want));
                 if found.is_none() {
-                    tracing::warn!(output = want, "preferred output not in wayland registry, using first output");
+                    tracing::warn!(
+                        output = want,
+                        "preferred output not in wayland registry, using first output"
+                    );
                 }
                 found
             })

@@ -50,7 +50,9 @@ fn start_codes(buf: &[u8]) -> Vec<(usize, u8)> {
 }
 
 fn au_is_keyframe(au: &[u8], codec: Codec) -> bool {
-    start_codes(au).iter().any(|&(_, header)| is_idr(header, codec))
+    start_codes(au)
+        .iter()
+        .any(|&(_, header)| is_idr(header, codec))
 }
 
 /// Accumulates an Annex B stream and yields complete access units.

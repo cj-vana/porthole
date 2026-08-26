@@ -121,7 +121,9 @@ impl FfmpegEncoder {
             .stderr(Stdio::inherit());
 
         tracing::debug!(command = ?cmd, "spawning ffmpeg encoder");
-        let mut child = cmd.spawn().context("failed to spawn ffmpeg (is it installed?)")?;
+        let mut child = cmd
+            .spawn()
+            .context("failed to spawn ffmpeg (is it installed?)")?;
         let stdin = child.stdin.take().context("ffmpeg stdin not piped")?;
         let mut stdout = child.stdout.take().context("ffmpeg stdout not piped")?;
 

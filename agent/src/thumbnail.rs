@@ -108,7 +108,11 @@ mod tests {
 
     #[test]
     fn thumbnail_payload_round_trip() {
-        let (w, h, rgba) = (2u16, 2u16, vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        let (w, h, rgba) = (
+            2u16,
+            2u16,
+            vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        );
         let payload = encode_thumbnail(w, h, &rgba);
         let (dw, dh, dpixels) = decode_thumbnail(&payload).unwrap();
         assert_eq!((dw, dh), (w, h));

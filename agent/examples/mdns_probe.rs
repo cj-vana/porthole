@@ -6,7 +6,10 @@
 use std::time::Duration;
 
 fn main() -> anyhow::Result<()> {
-    let secs: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(5);
+    let secs: u64 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
     let register_test = std::env::args().any(|a| a == "--announce-test");
     let daemon = mdns_sd::ServiceDaemon::new()?;
     let mut test_fullname = None;

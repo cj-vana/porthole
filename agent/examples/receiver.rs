@@ -95,7 +95,8 @@ fn main() -> anyhow::Result<()> {
                         request_keyframe(&mut control, &mut last_keyframe_request);
                     }
                 }
-                highest_seen = Some(highest_seen.map_or(header.frame_seq, |hi| hi.max(header.frame_seq)));
+                highest_seen =
+                    Some(highest_seen.map_or(header.frame_seq, |hi| hi.max(header.frame_seq)));
                 if let Some(frame) = reassembler.push(header, payload) {
                     completed += 1;
                     bytes += frame.data.len() as u64;
@@ -124,7 +125,11 @@ fn main() -> anyhow::Result<()> {
         if elapsed >= Duration::from_secs(1) {
             let secs = elapsed.as_secs_f64();
             let total = completed + lost;
-            let loss_pct = if total > 0 { lost as f64 * 100.0 / total as f64 } else { 0.0 };
+            let loss_pct = if total > 0 {
+                lost as f64 * 100.0 / total as f64
+            } else {
+                0.0
+            };
             println!(
                 "recv: {:.0} fps, loss {:.2}%, {:.0} kbps ({} incomplete frames pending)",
                 completed as f64 / secs,
@@ -144,7 +149,8 @@ fn main() -> anyhow::Result<()> {
 /// many lost frames; one IDR fixes all of them).
 fn request_keyframe(control: &mut TcpStream, last: &mut Instant) {
     if last.elapsed() >= Duration::from_secs(1)
-        && protocol::write_control_message(control, protocol::CONTROL_MSG_KEYFRAME_REQUEST, &[]).is_ok()
+        && protocol::write_control_message(control, protocol::CONTROL_MSG_KEYFRAME_REQUEST, &[])
+            .is_ok()
     {
         println!("sent keyframe_request (loss detected)");
         *last = Instant::now();

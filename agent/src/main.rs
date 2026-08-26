@@ -166,19 +166,19 @@ fn capture_loop(
     let mut submitted_at: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
     // Debug aid: PORTHOLE_DUMP_VIDEO=<path> writes the encoded Annex B
     // stream to a file (used to ffprobe-verify encoder output).
-    let mut dump: Option<std::io::BufWriter<std::fs::File>> =
-        std::env::var_os("PORTHOLE_DUMP_VIDEO").and_then(|path| {
-            match std::fs::File::create(&path) {
-                Ok(f) => {
-                    tracing::info!(path = %std::path::Path::new(&path).display(), "dumping encoded stream");
-                    Some(std::io::BufWriter::new(f))
-                }
-                Err(err) => {
-                    tracing::error!(%err, "cannot open PORTHOLE_DUMP_VIDEO file");
-                    None
-                }
-            }
-        });
+    let mut dump: Option<std::io::BufWriter<std::fs::File>> = std::env::var_os(
+        "PORTHOLE_DUMP_VIDEO",
+    )
+    .and_then(|path| match std::fs::File::create(&path) {
+        Ok(f) => {
+            tracing::info!(path = %std::path::Path::new(&path).display(), "dumping encoded stream");
+            Some(std::io::BufWriter::new(f))
+        }
+        Err(err) => {
+            tracing::error!(%err, "cannot open PORTHOLE_DUMP_VIDEO file");
+            None
+        }
+    });
     let mut frames = 0u64;
     let mut submitted = 0u64;
     let mut encoded = 0u64;
@@ -325,7 +325,10 @@ async fn main() -> anyhow::Result<()> {
     };
     let capture_format = backend.format();
 
-    tracing::info!(version = env!("CARGO_PKG_VERSION"), "porthole-agent starting");
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "porthole-agent starting"
+    );
     tracing::info!(
         video_addr = %cfg.video_addr(),
         control_addr = %cfg.control_addr(),
@@ -428,7 +431,10 @@ async fn main() -> anyhow::Result<()> {
     if let Some((handle, shutdown, announcement)) = capture {
         shutdown.store(true, Ordering::Relaxed);
         // The capture thread finishes the in-flight frame, then exits.
-        if tokio::time::timeout(Duration::from_secs(3), handle).await.is_err() {
+        if tokio::time::timeout(Duration::from_secs(3), handle)
+            .await
+            .is_err()
+        {
             tracing::warn!("capture thread did not stop within 3s, exiting anyway");
         }
         // Dropping the announcement unregisters the mDNS service.

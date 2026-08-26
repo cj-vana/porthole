@@ -198,7 +198,9 @@ impl WaylandInput {
     /// Run the apply loop on a dedicated thread; events arrive by channel.
     pub fn spawn_thread(self) -> mpsc::Sender<InputEvent> {
         let (tx, rx) = mpsc::channel::<InputEvent>();
-        let spawned = thread::Builder::new().name("input".into()).spawn(move || self.run(rx));
+        let spawned = thread::Builder::new()
+            .name("input".into())
+            .spawn(move || self.run(rx));
         if let Err(err) = spawned {
             tracing::error!(%err, "failed to spawn input thread");
         }

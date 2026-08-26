@@ -138,7 +138,10 @@ pub trait Encoder: Send {
 
 /// Linux gets the ffmpeg subprocess encoder; everything else (or an encoder
 /// startup failure) gets the null encoder, which drops frames.
-pub fn create(cfg: &crate::config::Config, format: &crate::capture::CaptureFormat) -> Box<dyn Encoder> {
+pub fn create(
+    cfg: &crate::config::Config,
+    format: &crate::capture::CaptureFormat,
+) -> Box<dyn Encoder> {
     #[cfg(target_os = "linux")]
     {
         match ffmpeg::FfmpegEncoder::new(cfg, format) {
@@ -205,8 +208,14 @@ mod tests {
 
     #[test]
     fn encoder_backend_from_str() {
-        assert_eq!("nvenc".parse::<EncoderBackend>().unwrap(), EncoderBackend::Nvenc);
-        assert_eq!("VAAPI".parse::<EncoderBackend>().unwrap(), EncoderBackend::Vaapi);
+        assert_eq!(
+            "nvenc".parse::<EncoderBackend>().unwrap(),
+            EncoderBackend::Nvenc
+        );
+        assert_eq!(
+            "VAAPI".parse::<EncoderBackend>().unwrap(),
+            EncoderBackend::Vaapi
+        );
         assert!("qsv".parse::<EncoderBackend>().is_err());
     }
 }

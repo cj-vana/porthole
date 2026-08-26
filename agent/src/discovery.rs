@@ -72,7 +72,9 @@ fn announce_inner(cfg: &Config) -> anyhow::Result<Announcement> {
     // service is never announced (mdns-sd leaves addr_auto off by default).
     .enable_addr_auto();
     let fullname = info.get_fullname().to_string();
-    daemon.register(info).context("failed to register mDNS service")?;
+    daemon
+        .register(info)
+        .context("failed to register mDNS service")?;
     Ok(Announcement { daemon, fullname })
 }
 
@@ -91,8 +93,12 @@ impl Drop for Announcement {
 /// length-prefixed thumbnail (4-byte BE length + payload per protocol.md),
 /// close. A zero-length payload means no frame captured yet.
 pub fn spawn_thumbnail_server(cfg: &Config, latest: LatestFrame) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(cfg.thumbnail_addr())
-        .map_err(|e| anyhow::anyhow!("failed to bind thumbnail endpoint {}: {e}", cfg.thumbnail_addr()))?;
+    let listener = TcpListener::bind(cfg.thumbnail_addr()).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to bind thumbnail endpoint {}: {e}",
+            cfg.thumbnail_addr()
+        )
+    })?;
     tracing::info!(addr = %cfg.thumbnail_addr(), "thumbnail endpoint listening");
     thread::Builder::new()
         .name("thumbnail-server".into())
@@ -103,8 +109,9 @@ pub fn spawn_thumbnail_server(cfg: &Config, latest: LatestFrame) -> anyhow::Resu
                         let payload = {
                             let snapshot = latest.lock().expect("thumbnail slot poisoned").clone();
                             snapshot.and_then(|(data, w, h, stride)| {
-                                thumbnail::downscale_bgra_to_rgba(&data, w, h, stride)
-                                    .map(|(tw, th, rgba)| thumbnail::encode_thumbnail(tw, th, &rgba))
+                                thumbnail::downscale_bgra_to_rgba(&data, w, h, stride).map(
+                                    |(tw, th, rgba)| thumbnail::encode_thumbnail(tw, th, &rgba),
+                                )
                             })
                         }
                         .unwrap_or_default();

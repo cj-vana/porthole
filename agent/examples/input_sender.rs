@@ -66,9 +66,21 @@ fn send(stream: &mut TcpStream, event: &InputEvent) -> anyhow::Result<()> {
 }
 
 fn key_press(stream: &mut TcpStream, code: u16) -> anyhow::Result<()> {
-    send(stream, &InputEvent::Key { code, pressed: true })?;
+    send(
+        stream,
+        &InputEvent::Key {
+            code,
+            pressed: true,
+        },
+    )?;
     thread::sleep(Duration::from_millis(20));
-    send(stream, &InputEvent::Key { code, pressed: false })?;
+    send(
+        stream,
+        &InputEvent::Key {
+            code,
+            pressed: false,
+        },
+    )?;
     Ok(())
 }
 
@@ -76,10 +88,32 @@ fn key_press(stream: &mut TcpStream, code: u16) -> anyhow::Result<()> {
 fn ascii_to_key(c: char) -> Option<(u16, bool)> {
     let plain = match c {
         'a'..='z' => Some(match c {
-            'a' => 30, 'b' => 48, 'c' => 46, 'd' => 32, 'e' => 18, 'f' => 33, 'g' => 34,
-            'h' => 35, 'i' => 23, 'j' => 36, 'k' => 37, 'l' => 38, 'm' => 50, 'n' => 49,
-            'o' => 24, 'p' => 25, 'q' => 16, 'r' => 19, 's' => 31, 't' => 20, 'u' => 22,
-            'v' => 47, 'w' => 17, 'x' => 45, 'y' => 21, 'z' => 44,
+            'a' => 30,
+            'b' => 48,
+            'c' => 46,
+            'd' => 32,
+            'e' => 18,
+            'f' => 33,
+            'g' => 34,
+            'h' => 35,
+            'i' => 23,
+            'j' => 36,
+            'k' => 37,
+            'l' => 38,
+            'm' => 50,
+            'n' => 49,
+            'o' => 24,
+            'p' => 25,
+            'q' => 16,
+            'r' => 19,
+            's' => 31,
+            't' => 20,
+            'u' => 22,
+            'v' => 47,
+            'w' => 17,
+            'x' => 45,
+            'y' => 21,
+            'z' => 44,
             _ => unreachable!(),
         }),
         '1'..='9' => Some(c as u16 - b'1' as u16 + 2),
@@ -130,9 +164,21 @@ fn main() -> anyhow::Result<()> {
                 "middle" => BTN_MIDDLE,
                 other => bail!("unknown button {other:?} (left/right/middle)"),
             };
-            send(&mut stream, &InputEvent::PointerButton { button, pressed: true })?;
+            send(
+                &mut stream,
+                &InputEvent::PointerButton {
+                    button,
+                    pressed: true,
+                },
+            )?;
             thread::sleep(Duration::from_millis(30));
-            send(&mut stream, &InputEvent::PointerButton { button, pressed: false })?;
+            send(
+                &mut stream,
+                &InputEvent::PointerButton {
+                    button,
+                    pressed: false,
+                },
+            )?;
         }
         Cmd::Scroll { amount } => send(
             &mut stream,
@@ -144,18 +190,35 @@ fn main() -> anyhow::Result<()> {
         )?,
         Cmd::Type { text } => {
             for c in text.chars() {
-                let (code, shift) = ascii_to_key(c)
-                    .with_context(|| format!("no key mapping for {c:?} (small ASCII table only)"))?;
+                let (code, shift) = ascii_to_key(c).with_context(|| {
+                    format!("no key mapping for {c:?} (small ASCII table only)")
+                })?;
                 // Modifier state goes through key_modifiers messages; the
                 // virtual keyboard protocol does not derive it from key
                 // events (docs/protocol.md, type 0x15).
                 if shift {
-                    send(&mut stream, &InputEvent::KeyModifiers { depressed: MOD_SHIFT, latched: 0, locked: 0, group: 0 })?;
+                    send(
+                        &mut stream,
+                        &InputEvent::KeyModifiers {
+                            depressed: MOD_SHIFT,
+                            latched: 0,
+                            locked: 0,
+                            group: 0,
+                        },
+                    )?;
                     thread::sleep(Duration::from_millis(10));
                 }
                 key_press(&mut stream, code)?;
                 if shift {
-                    send(&mut stream, &InputEvent::KeyModifiers { depressed: 0, latched: 0, locked: 0, group: 0 })?;
+                    send(
+                        &mut stream,
+                        &InputEvent::KeyModifiers {
+                            depressed: 0,
+                            latched: 0,
+                            locked: 0,
+                            group: 0,
+                        },
+                    )?;
                 }
                 thread::sleep(Duration::from_millis(20));
             }

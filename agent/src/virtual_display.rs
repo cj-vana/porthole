@@ -101,23 +101,31 @@ mod imp {
             // Safety: getuid has no memory-safety requirements.
             format!("/run/user/{}", unsafe { libc::getuid() })
         });
-        let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok().or_else(|| {
-            std::fs::read_dir(format!("{runtime_dir}/hypr"))
-                .ok()?
-                .filter_map(Result::ok)
-                .find(|e| e.file_type().ok().is_some_and(|t| t.is_dir()))
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-        });
+        let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
+            .ok()
+            .or_else(|| {
+                std::fs::read_dir(format!("{runtime_dir}/hypr"))
+                    .ok()?
+                    .filter_map(Result::ok)
+                    .find(|e| e.file_type().ok().is_some_and(|t| t.is_dir()))
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+            });
         (runtime_dir, signature)
     }
 
-    fn hyprctl(args: &[&str], runtime_dir: &str, signature: Option<&str>) -> anyhow::Result<String> {
+    fn hyprctl(
+        args: &[&str],
+        runtime_dir: &str,
+        signature: Option<&str>,
+    ) -> anyhow::Result<String> {
         let mut cmd = Command::new("hyprctl");
         cmd.args(args).env("XDG_RUNTIME_DIR", runtime_dir);
         if let Some(sig) = signature {
             cmd.env("HYPRLAND_INSTANCE_SIGNATURE", sig);
         }
-        let out = cmd.output().context("failed to run hyprctl (is Hyprland running?)")?;
+        let out = cmd
+            .output()
+            .context("failed to run hyprctl (is Hyprland running?)")?;
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         // hyprctl reports failures on stdout and can still exit 0.
         if !out.status.success() || stdout.starts_with("error") {
@@ -131,7 +139,10 @@ mod imp {
         Ok(stdout)
     }
 
-    fn list_monitors(runtime_dir: &str, signature: Option<&str>) -> anyhow::Result<Vec<HyprMonitor>> {
+    fn list_monitors(
+        runtime_dir: &str,
+        signature: Option<&str>,
+    ) -> anyhow::Result<Vec<HyprMonitor>> {
         let out = hyprctl(&["monitors", "-j"], runtime_dir, signature)?;
         serde_json::from_str(&out).context("failed to parse hyprctl monitors output")
     }
@@ -185,7 +196,10 @@ mod imp {
             let before: HashSet<&str> = monitors.iter().map(|m| m.name.as_str()).collect();
             let out = hyprctl(&["output", "create", "headless"], &runtime_dir, sig)?;
             if !out.trim().eq_ignore_ascii_case("ok") {
-                bail!("hyprctl output create headless: unexpected reply {}", out.trim());
+                bail!(
+                    "hyprctl output create headless: unexpected reply {}",
+                    out.trim()
+                );
             }
             // Hyprland takes a beat before the new output shows in `monitors`.
             let mut created = None;

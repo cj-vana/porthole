@@ -49,7 +49,11 @@ fn main() -> anyhow::Result<()> {
 
     let file = std::fs::File::create(&args.out)
         .with_context(|| format!("failed to create {}", args.out.display()))?;
-    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), u32::from(width), u32::from(height));
+    let mut encoder = png::Encoder::new(
+        std::io::BufWriter::new(file),
+        u32::from(width),
+        u32::from(height),
+    );
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     let mut writer = encoder.write_header()?;
