@@ -1,0 +1,130 @@
+diff --git a/include/recorder/recorder.h b/include/recorder/recorder.h
+index 9ff13bd..f3dd5cb 100644
+--- a/include/recorder/recorder.h
++++ b/include/recorder/recorder.h
+@@ -47,6 +47,8 @@ int gsr_recorder_run(gsr_recorder *self);
+
+ /* These are safe to call from a signal handler or from another thread */
+ void gsr_recorder_stop(gsr_recorder *self);
++/* Force the next encoded video frame to be an intra/key frame. */
++void gsr_recorder_request_keyframe(gsr_recorder *self);
+ void gsr_recorder_toggle_pause(gsr_recorder *self);
+ /* Does nothing when the recording is already paused/unpaused */
+ void gsr_recorder_set_paused(gsr_recorder *self, bool paused);
+diff --git a/src/cli/main.c b/src/cli/main.c
+index aaa315c..de0776b 100644
+--- a/src/cli/main.c
++++ b/src/cli/main.c
+@@ -33,6 +33,7 @@ static gsr_recorder *recorder = NULL;
+ static volatile sig_atomic_t pending_toggle_pause = 0;
+ static volatile sig_atomic_t pending_toggle_replay_recording = 0;
+ static volatile sig_atomic_t pending_save_replay_seconds = 0;
++static volatile sig_atomic_t pending_keyframe = 0;
+
+ static void stop_handler(int signal_value) {
+     (void)signal_value;
+@@ -49,6 +50,14 @@ static void toggle_pause_handler(int signal_value) {
+         pending_toggle_pause = 1;
+ }
+
++static void request_keyframe_handler(int signal_value) {
++    (void)signal_value;
++    if(recorder)
++        gsr_recorder_request_keyframe(recorder);
++    else
++        pending_keyframe = 1;
++}
++
+ static void toggle_replay_recording_handler(int signal_value) {
+     (void)signal_value;
+     if(recorder)
+@@ -65,6 +74,11 @@ static void save_replay_seconds_handler(gsr_recorder *rec, int seconds) {
+ }
+
+ static void apply_pending_signals(gsr_recorder *rec) {
++    if(pending_keyframe) {
++        pending_keyframe = 0;
++        gsr_recorder_request_keyframe(rec);
++    }
++
+     if(pending_toggle_pause) {
+         pending_toggle_pause = 0;
+         gsr_recorder_toggle_pause(rec);
+@@ -213,6 +227,7 @@ static void install_signal_handlers(void) {
+     signal(SIGRTMIN+4, save_replay_5_minutes_handler);
+     signal(SIGRTMIN+5, save_replay_10_minutes_handler);
+     signal(SIGRTMIN+6, save_replay_30_minutes_handler);
++    signal(SIGRTMIN+7, request_keyframe_handler);
+ }
+
+ static void set_display_server_environment_variables(void) {
+diff --git a/src/recorder/recorder.c b/src/recorder/recorder.c
+index 7bc2cfd..14172f5 100644
+--- a/src/recorder/recorder.c
++++ b/src/recorder/recorder.c
+@@ -103,7 +103,7 @@ struct gsr_recorder {
+     atomic_int save_replay_seconds;
+     atomic_int save_replay_restart_replay;
+     bool should_stop_error;
+-    bool force_iframe_frame;
++    atomic_int force_iframe_frame;
+     int audio_max_frame_size;
+     bool use_damage_tracking;
+     gsr_damage damage;
+@@ -431,6 +431,7 @@ gsr_recorder* gsr_recorder_create(const gsr_recorder_params *params, const gsr_r
+     atomic_init(&self->replay_recording_state, 0);
+     atomic_init(&self->save_replay_seconds, 0);
+     atomic_init(&self->save_replay_restart_replay, GSR_RESTART_REPLAY_USE_OPTION);
++    atomic_init(&self->force_iframe_frame, 0);
+     self->audio_max_frame_size = 1024;
+     int error_code = GSR_ERROR_GENERIC;
+     self->hdr = video_codec_is_hdr(params->settings->video_codec);
+@@ -628,7 +629,8 @@ static void recorder_capture_and_encode_frame(gsr_recorder *self, bool damaged)
+                     continue;
+             }
+
+-            if(self->force_iframe_frame) {
++            const bool force_iframe_frame = atomic_exchange(&self->force_iframe_frame, 0) == 1;
++            if(force_iframe_frame) {
+                 self->video_frame->pict_type = AV_PICTURE_TYPE_I;
+             }
+
+@@ -640,8 +642,7 @@ static void recorder_capture_and_encode_frame(gsr_recorder *self, bool damaged)
+                 gsr_log(GSR_LOG_LEVEL_ERROR, "avcodec_send_frame failed, error: %s", gsr_av_error_to_string(ret));
+             }
+
+-            if(self->force_iframe_frame) {
+-                self->force_iframe_frame = false;
++            if(force_iframe_frame) {
+                 self->video_frame->pict_type = AV_PICTURE_TYPE_NONE;
+             }
+         }
+@@ -717,7 +718,7 @@ static void recorder_apply_replay_recording_toggle(gsr_recorder *self) {
+
+             self->replay_recording = true;
+             atomic_store(&self->replay_recording_state, 1);
+-            self->force_iframe_frame = true;
++            atomic_store(&self->force_iframe_frame, 1);
+             gsr_log(GSR_LOG_LEVEL_INFO, "Started recording");
+             if(self->callbacks.recording_started)
+                 self->callbacks.recording_started(self->replay_recording_filepath, self->callbacks.userdata);
+@@ -808,8 +809,6 @@ int gsr_recorder_run(gsr_recorder *self) {
+
+     gsr_replay_save_init(&self->replay_save);
+
+-    self->force_iframe_frame = false;
+-
+     gsr_recording_clock_start(self->recording_clock);
+     self->record_start_time = gsr_recording_clock_get_start_time(self->recording_clock);
+
+@@ -951,6 +950,10 @@ void gsr_recorder_stop(gsr_recorder *self) {
+     atomic_store(&self->running, 0);
+ }
+
++void gsr_recorder_request_keyframe(gsr_recorder *self) {
++    atomic_store(&self->force_iframe_frame, 1);
++}
++
+ void gsr_recorder_toggle_pause(gsr_recorder *self) {
+     atomic_store(&self->toggle_pause, 1);
+ }

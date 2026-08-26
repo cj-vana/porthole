@@ -56,6 +56,8 @@ struct StatsWindow {
     }
 
     var decoded = 0
+    /// Distinct video frames whose Metal command buffers completed.
+    var rendered = 0
     var presented = 0
     var decodeMilliseconds = 0.0
     var prepareMilliseconds = 0.0
@@ -64,6 +66,8 @@ struct StatsWindow {
     var captureToArrival = Average()
     var captureToDecoded = Average()
     var captureToPresented = Average()
+    var captureToRendered = Average()
+    var submitToRendered = Average()
     var decodedToDraw = Average()
     var drawToPresented = Average()
     var submitToPresented = Average()
@@ -92,6 +96,7 @@ struct StatsWindow {
         let agentFps = agentStats.map { "\($0.captureFps)/\($0.encodeFps)" } ?? "n/a"
         let txKbps = agentStats.map { String($0.txKbps) } ?? "n/a"
         return "stats fps=\(decoded)"
+            + " gpu_fps=\(rendered)"
             + " present_fps=\(presented)"
             + " prep_ms=\(ms(decoded > 0 ? prepareMilliseconds / Double(decoded) : nil, 2))"
             + " decode_ms=\(ms(averageDecodeMs, 2))"
@@ -100,9 +105,11 @@ struct StatsWindow {
             + " cap_arrive_ms=\(ms(captureToArrival.milliseconds, 1))"
             + " cap_decoded_ms=\(ms(captureToDecoded.milliseconds, 1))"
             + " cap_present_ms=\(ms(captureToPresented.milliseconds, 1))"
+            + " cap_gpu_ms=\(ms(captureToRendered.milliseconds, 1))"
             + " decoded_draw_ms=\(ms(decodedToDraw.milliseconds, 2))"
             + " draw_present_ms=\(ms(drawToPresented.milliseconds, 2))"
             + " submit_present_ms=\(ms(submitToPresented.milliseconds, 2))"
+            + " submit_gpu_ms=\(ms(submitToRendered.milliseconds, 2))"
             + " loss=\(ms(lossPercent, 2))%"
             + " queue=\(queueDepth)"
             + " agent_fps=\(agentFps)"

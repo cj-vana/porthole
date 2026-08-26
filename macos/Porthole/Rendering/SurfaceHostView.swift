@@ -53,7 +53,7 @@ struct MetalSurfaceView: NSViewRepresentable {
         surface.lowLatencyPresentation = lowLatency
         surface.isPaused = false
         surface.enableSetNeedsDisplay = false
-        let host = SurfaceHostView(surface: surface)
+        let host = SurfaceHostView(surface: surface, renderer: context.coordinator)
         host.onFullscreenChanged = onFullscreenChanged
         return host
     }
@@ -77,6 +77,7 @@ struct MetalSurfaceView: NSViewRepresentable {
 /// owns the native-fullscreen bridge for the fullscreen mode.
 final class SurfaceHostView: NSScrollView {
     let surface: SessionSurfaceView
+    private let renderer: MetalRenderer
 
     /// Reports enter/exit of native fullscreen; called on main.
     var onFullscreenChanged: ((Bool) -> Void)?
@@ -102,8 +103,9 @@ final class SurfaceHostView: NSScrollView {
     private var observers: [NSObjectProtocol] = []
     private let logger = Logger(subsystem: "com.porthole.mac", category: "fullscreen")
 
-    init(surface: SessionSurfaceView) {
+    init(surface: SessionSurfaceView, renderer: MetalRenderer) {
         self.surface = surface
+        self.renderer = renderer
         super.init(frame: .zero)
         drawsBackground = false
         scrollerStyle = .overlay
@@ -197,8 +199,19 @@ final class SurfaceHostView: NSScrollView {
             reportFullscreen(isFullscreen)
         } else {
             fullscreenTogglePending = true
+            logger.info("fullscreen toggle scheduled target=\(self.wantsFullscreen)")
+            // AppKit snapshots the live window when toggleFullScreen starts.
+            // Suspending Metal before this call can leave that snapshot
+            // transaction waiting forever after `willEnter`; the notification
+            // handler below suspends presentation at the safe boundary.
             window.makeKeyAndOrderFront(nil)
-            window.toggleFullScreen(nil)
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(35)) { [weak self, weak window] in
+                guard let self, let window,
+                      self.fullscreenTogglePending,
+                      !self.fullscreenTransitionActive else { return }
+                self.logger.info("fullscreen toggle dispatched target=\(self.wantsFullscreen)")
+                window.toggleFullScreen(nil)
+            }
             // AppKit can ignore a request while SwiftUI is finishing scene
             // attachment without posting any notification. Retry a bounded
             // number of times; the pending bit also prevents duplicate
@@ -208,6 +221,7 @@ final class SurfaceHostView: NSScrollView {
                 self.fullscreenTogglePending = false
                 if self.fullscreenRetryCount < 3 {
                     self.fullscreenRetryCount += 1
+                    self.logger.info("fullscreen toggle retry=\(self.fullscreenRetryCount)")
                     self.applyFullscreen()
                 } else {
                     self.reportFullscreen(window.styleMask.contains(.fullScreen))
@@ -252,7 +266,10 @@ final class SurfaceHostView: NSScrollView {
             // fullScreenPrimary leaves `Enter Full Screen` disabled while
             // auxiliary/fullScreenNone remain set.
             prepareForFullscreen(window)
-            logger.info("fullscreen window ready style=\(window.styleMask.rawValue) behavior=\(window.collectionBehavior.rawValue)")
+            logger.info("""
+                fullscreen window ready style=\(window.styleMask.rawValue) \
+                behavior=\(window.collectionBehavior.rawValue)
+                """)
         }
         // A persisted fullscreen mode arrives before the window exists;
         // apply it once there is a window to toggle, and re-derive the
@@ -263,16 +280,22 @@ final class SurfaceHostView: NSScrollView {
 
     private func observeWindow() {
         observe(NSWindow.willEnterFullScreenNotification) {
+            $0.logger.info("fullscreen will enter")
             $0.fullscreenTogglePending = false
             $0.fullscreenTransitionActive = true
+            $0.beginPresentationTransition()
         }
         observe(NSWindow.willExitFullScreenNotification) {
+            $0.logger.info("fullscreen will exit")
             $0.fullscreenTogglePending = false
             $0.fullscreenTransitionActive = true
+            $0.beginPresentationTransition()
         }
         observe(NSWindow.didEnterFullScreenNotification) {
+            $0.logger.info("fullscreen did enter")
             $0.fullscreenTogglePending = false
             $0.fullscreenTransitionActive = false
+            $0.renderer.resumePresentation(view: $0.surface)
             // Track the completed window state locally before SwiftUI
             // propagates the callback. Otherwise applyFullscreen can see the
             // stale pre-transition intent and immediately undo a user action.
@@ -282,8 +305,10 @@ final class SurfaceHostView: NSScrollView {
             $0.applyFullscreen()
         }
         observe(NSWindow.didExitFullScreenNotification) {
+            $0.logger.info("fullscreen did exit")
             $0.fullscreenTogglePending = false
             $0.fullscreenTransitionActive = false
+            $0.renderer.resumePresentation(view: $0.surface)
             $0.wantsFullscreen = false
             $0.hasFullscreenIntent = true
             $0.reportFullscreen(false)
@@ -292,6 +317,14 @@ final class SurfaceHostView: NSScrollView {
         // Dragging the window between a 1x and a 2x display changes what
         // "one video pixel on one device pixel" means in points.
         observe(NSWindow.didChangeBackingPropertiesNotification) { $0.layoutSurface() }
+    }
+
+    /// Drain the old display binding for the entire Space transition. AppKit
+    /// snapshots the existing layer contents before posting `willEnter` or
+    /// `willExit`; reacquiring CAMetalLayer drawables during that animation can
+    /// prevent WindowServer from completing the swapchain handoff.
+    private func beginPresentationTransition() {
+        renderer.suspendPresentation()
     }
 
     private func observe(_ name: Notification.Name, _ handler: @escaping (SurfaceHostView) -> Void) {

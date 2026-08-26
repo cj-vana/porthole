@@ -196,6 +196,10 @@ final class StreamSession: ObservableObject {
                 """)
             self?.renderer.setColorState(matrix: colorState.matrix, fullRange: colorState.fullRange)
         }
+        wireRendererTelemetry()
+    }
+
+    private func wireRendererTelemetry() {
         renderer.onFramePresented = { [weak self] timing in
             self?.decodeQueue.async {
                 guard let self else { return }
@@ -213,6 +217,20 @@ final class StreamSession: ObservableObject {
                 )
                 self.stats.submitToPresented.add(
                     Int64(timing.presentedMicros) - Int64(timing.submittedMicros)
+                )
+            }
+        }
+        renderer.onFrameRenderCompleted = { [weak self] timing in
+            self?.decodeQueue.async {
+                guard let self else { return }
+                self.stats.rendered += 1
+                if let captureClientMicros = timing.captureClientMicros {
+                    self.stats.captureToRendered.add(
+                        Int64(timing.completedMicros) - Int64(captureClientMicros)
+                    )
+                }
+                self.stats.submitToRendered.add(
+                    Int64(timing.completedMicros) - Int64(timing.submittedMicros)
                 )
             }
         }

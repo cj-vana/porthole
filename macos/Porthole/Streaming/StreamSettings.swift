@@ -4,6 +4,10 @@ import Foundation
 /// (US-013). Two presets: quality is the connect-time default, gaming
 /// trades bitrate-per-frame for motion clarity and encoder latency.
 struct StreamSettings: Equatable {
+    /// Must match the agent's gaming profile. The hello does not carry the
+    /// low-latency bit, so its sparse keyframe cadence is the mode marker.
+    private static let gamingKeyframeIntervalSecs: UInt32 = 300
+
     var fps: UInt16
     var codec: Hello.Codec
     var bitrateMbps: UInt16
@@ -27,9 +31,12 @@ struct StreamSettings: Equatable {
     }
 
     /// Whether a hello already describes this configuration, so a matching
-    /// stream is not restarted for nothing. low_latency is not echoed in
-    /// hello and cannot be compared.
+    /// stream is not restarted for nothing. `low_latency` is not echoed in
+    /// hello; gaming's sparse keyframe interval proves the agent applied it.
     func matches(_ hello: Hello) -> Bool {
-        hello.fps == UInt32(fps) && hello.codec == codec && hello.bitrateMbps == UInt32(bitrateMbps)
+        hello.fps == UInt32(fps)
+            && hello.codec == codec
+            && hello.bitrateMbps == UInt32(bitrateMbps)
+            && (!lowLatency || hello.keyframeIntervalSecs == Self.gamingKeyframeIntervalSecs)
     }
 }

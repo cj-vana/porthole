@@ -35,6 +35,12 @@ const SOCKET_READ_TIMEOUT: Duration = Duration::from_millis(100);
 /// The estimate only affects telemetry/timestamps, never scheduling.
 const CAPTURE_TO_RTP_ESTIMATE: Duration = Duration::from_micros(1_000);
 const RTP_CLOCK_HZ: u64 = 90_000;
+/// The optional Porthole helper is upstream GSR 6.0.1 plus the small patch in
+/// `agent/patches`: SIGRTMIN+7 atomically marks the next frame as an IDR.
+/// Keep it app-owned so a distro package update cannot silently replace the
+/// signaling contract. Machines without it retain the restart fallback.
+const PORTHOLE_GSR_PATH: &str = "/usr/local/libexec/porthole/gpu-screen-recorder";
+const FORCE_KEYFRAME_SIGNAL_OFFSET: i32 = 7;
 
 pub struct GsrEncoder {
     codec: Codec,
@@ -43,6 +49,7 @@ pub struct GsrEncoder {
     pending: VecDeque<EncodedFrame>,
     reader_stop: Arc<AtomicBool>,
     reader_thread: Option<thread::JoinHandle<()>>,
+    supports_in_process_keyframes: bool,
 }
 
 impl GsrEncoder {
@@ -83,7 +90,13 @@ impl GsrEncoder {
             .spawn(move || read_rtp_access_units(socket, codec, tx, thread_stop))
             .context("failed to spawn GSR RTP reader thread")?;
 
-        let mut command = Command::new("gpu-screen-recorder");
+        let supports_in_process_keyframes = std::path::Path::new(PORTHOLE_GSR_PATH).is_file();
+        let binary = if supports_in_process_keyframes {
+            PORTHOLE_GSR_PATH
+        } else {
+            "gpu-screen-recorder"
+        };
+        let mut command = Command::new(binary);
         command
             .args(["-w", "portal"])
             .args(["-restore-portal-session", "yes"])
@@ -153,6 +166,7 @@ impl GsrEncoder {
             codec = %cfg.codec,
             fps = cfg.fps.get(),
             bitrate_mbps = cfg.bitrate_mbps,
+            in_process_keyframes = supports_in_process_keyframes,
             "GSR dma-buf capture verified"
         );
         Ok(Self {
@@ -162,6 +176,7 @@ impl GsrEncoder {
             pending: VecDeque::from([first]),
             reader_stop,
             reader_thread: Some(reader_thread),
+            supports_in_process_keyframes,
         })
     }
 }
@@ -177,7 +192,17 @@ impl Encoder for GsrEncoder {
     }
 
     fn request_keyframe(&mut self) -> anyhow::Result<()> {
-        // The pipeline restarts subprocess encoders for an immediate IDR.
+        if !self.supports_in_process_keyframes {
+            bail!("installed gpu-screen-recorder has no force-IDR signal");
+        }
+        let signal = libc::SIGRTMIN() + FORCE_KEYFRAME_SIGNAL_OFFSET;
+        // Safety: `child.id()` is the live subprocess PID. kill(2) only
+        // delivers the app-private signal; it does not access Rust memory.
+        let result = unsafe { libc::kill(self.child.id() as libc::pid_t, signal) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error()).context("cannot signal GSR for an IDR");
+        }
+        tracing::debug!(signal, "requested in-process GSR keyframe");
         Ok(())
     }
 

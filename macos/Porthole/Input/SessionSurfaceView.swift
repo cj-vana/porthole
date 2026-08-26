@@ -20,9 +20,9 @@ final class SessionSurfaceView: MTKView {
         }
     }
 
-    /// Gaming-mode presentation bypasses the compositor's vsync queue. This
-    /// can tear during motion, but removes multiple refreshes of latency; the
-    /// normal quality path stays synchronized.
+    /// Gaming presents each decoded frame immediately from the newest-only
+    /// mailbox with compositor synchronization disabled. Quality remains
+    /// synchronized to the display.
     var lowLatencyPresentation = false {
         didSet {
             if oldValue != lowLatencyPresentation {
@@ -76,11 +76,8 @@ final class SessionSurfaceView: MTKView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        // Draw-on-arrival presents one drawable per decoded frame and waits
-        // on it (the renderer coalesces to newest-wins), so the layer's
-        // default triple buffer only adds up to a frame of worst-case
-        // present latency without deepening throughput. Two is the
-        // low-latency setting and cannot stall a one-frame-deep pipeline.
+        // Configure the layer after it has moved into its window so AppKit's
+        // backing layer is available and tied to the destination display.
         applyPresentationMode()
         window?.isOpaque = true
         window?.backgroundColor = .black
@@ -98,6 +95,10 @@ final class SessionSurfaceView: MTKView {
 
     private func applyPresentationMode() {
         guard let metalLayer = layer as? CAMetalLayer else { return }
+        // Keep one drawable scanning out and one drawable writable. The
+        // renderer opens its mailbox slot on GPU completion, so a third
+        // drawable only permits an obsolete frame to queue for another
+        // refresh (about 6.9 ms at 144 Hz) without increasing throughput.
         metalLayer.maximumDrawableCount = 2
         // Fullscreen Space transitions can temporarily make every drawable
         // unavailable. A bounded nextDrawable() wait lets the mailbox recover

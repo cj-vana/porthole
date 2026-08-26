@@ -600,12 +600,7 @@ impl Encoder for FfmpegEncoder {
     }
 
     fn request_keyframe(&mut self) -> anyhow::Result<()> {
-        // TODO(US-003/FR-4): a subprocess ffmpeg cannot force an IDR
-        // mid-session. Options: restart the encoder, or move to libavcodec
-        // bindings when this becomes user-visible. Periodic IDRs come from
-        // -g until then.
-        tracing::debug!("request_keyframe: not supported by the subprocess encoder yet");
-        Ok(())
+        anyhow::bail!("ffmpeg subprocess cannot force an IDR in place")
     }
 
     fn codec(&self) -> Codec {

@@ -6,8 +6,8 @@
 //! fragments encoded access units, sized to the configured MTU, and paces
 //! each burst at the connected client. Loss recovery (FR-4) is the client's
 //! `keyframe_request` message, surfaced here as
-//! [`ControlEvent::KeyframeRequest`]; the pipeline answers it by restarting
-//! the encoder session, which yields a fresh IDR.
+//! [`ControlEvent::KeyframeRequest`]; the GPU-resident helper forces its next
+//! frame to an IDR in process, with an encoder restart compatibility fallback.
 //!
 //! Each control connection has exactly one writer: a thread that owns the
 //! write side and drains a bounded channel of framed messages. The hello,

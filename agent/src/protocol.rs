@@ -19,6 +19,10 @@ pub const VIDEO_FLAG_KEYFRAME: u8 = 1 << 0;
 /// Video header flag: this datagram is the XOR repair shard for the frame.
 /// Its fragment index equals (rather than precedes) `frag_count`.
 pub const VIDEO_FLAG_REPAIR: u8 = 1 << 1;
+/// Video header flag: this is the weighted second repair shard. It is always
+/// combined with [`VIDEO_FLAG_REPAIR`] and uses index `frag_count + 1` so
+/// older receivers reject it while continuing to use the first shard.
+pub const VIDEO_FLAG_REPAIR_SECONDARY: u8 = 1 << 2;
 /// Repair payload prefix containing the true final-fragment byte count.
 pub const VIDEO_REPAIR_PREFIX_LEN: usize = 2;
 /// Datagram size ceiling; safe under a 1500-byte MTU. Receivers accept
@@ -463,6 +467,7 @@ pub struct VideoHeader {
     pub frag_count: u16,
     pub is_keyframe: bool,
     pub is_repair: bool,
+    pub is_secondary_repair: bool,
 }
 
 /// Fragment one access unit into datagrams of at most `datagram_size`
@@ -493,16 +498,73 @@ pub fn fragment(
     out
 }
 
-/// Fragment one access unit and append a zero-wait XOR repair shard.
+/// Multiply two symbols in GF(2^16), using the primitive polynomial
+/// x^16 + x^12 + x^3 + x + 1. Sixteen-bit symbols let every possible UDP
+/// fragment index have a distinct non-zero coefficient.
+fn gf16_mul(mut left: u16, mut right: u16) -> u16 {
+    let mut product = 0u16;
+    for _ in 0..16 {
+        if right & 1 != 0 {
+            product ^= left;
+        }
+        let carry = left & 0x8000 != 0;
+        left <<= 1;
+        if carry {
+            left ^= 0x100b;
+        }
+        right >>= 1;
+    }
+    product
+}
+
+fn gf16_inverse(value: u16) -> Option<u16> {
+    if value == 0 {
+        return None;
+    }
+    // a^(2^16 - 2) is the multiplicative inverse in GF(2^16).
+    let mut base = value;
+    let mut exponent = 65_534u32;
+    let mut result = 1u16;
+    while exponent > 0 {
+        if exponent & 1 != 0 {
+            result = gf16_mul(result, base);
+        }
+        base = gf16_mul(base, base);
+        exponent >>= 1;
+    }
+    Some(result)
+}
+
+/// XOR `coefficient * input` into `output`, treating adjacent bytes as one
+/// big-endian GF(2^16) symbol and padding an odd final byte with zero.
+fn xor_scaled(output: &mut [u8], input: &[u8], coefficient: u16) {
+    for offset in (0..input.len()).step_by(2) {
+        let symbol =
+            u16::from_be_bytes([input[offset], input.get(offset + 1).copied().unwrap_or(0)]);
+        let coded = gf16_mul(coefficient, symbol).to_be_bytes();
+        output[offset] ^= coded[0];
+        if offset + 1 < output.len() {
+            output[offset + 1] ^= coded[1];
+        }
+    }
+}
+
+fn scaled(input: &[u8], coefficient: u16) -> Vec<u8> {
+    let mut output = vec![0u8; input.len()];
+    xor_scaled(&mut output, input, coefficient);
+    output
+}
+
+/// Fragment one access unit and append two zero-wait repair shards.
 ///
-/// Losing any one data datagram no longer loses the frame: the receiver XORs
-/// the remaining fragments with the repair payload to recreate it locally.
-/// The repair shard is sent after the data, so loss-free frames complete on
-/// the exact same datagram as before and pay no extra receive-side latency.
+/// The first shard is ordinary XOR parity. The second is a weighted parity
+/// over GF(2^16), which makes any two missing data fragments solvable. Both
+/// are sent after the data, so loss-free frames complete on the exact same
+/// datagram as before and pay no extra receive-side latency.
 /// Two bytes are reserved from each path-sized payload so the repair shard can
 /// carry the true final-fragment length without exceeding the configured MTU.
-/// Old receivers ignore the repair datagram (its index is outside their
-/// accepted data range) and still decode every data fragment normally.
+/// Old receivers use the first repair shard and ignore the second (whose
+/// index is outside their accepted repair range).
 pub fn fragment_with_repair(
     au: &[u8],
     frame_seq: u64,
@@ -511,11 +573,14 @@ pub fn fragment_with_repair(
     datagram_size: usize,
 ) -> Vec<Vec<u8>> {
     let datagram_size = datagram_size.clamp(MIN_DATAGRAM_SIZE, MAX_DATAGRAM_SIZE);
-    let payload_size = datagram_size - VIDEO_HEADER_LEN - VIDEO_REPAIR_PREFIX_LEN;
+    // GF(2^16) operates on adjacent byte pairs. Round down by at most one so
+    // the weighted parity never loses half of its final symbol.
+    let payload_size = (datagram_size - VIDEO_HEADER_LEN - VIDEO_REPAIR_PREFIX_LEN) & !1;
     let frag_count = au.len().div_ceil(payload_size).max(1) as u16;
     let flags = if is_keyframe { VIDEO_FLAG_KEYFRAME } else { 0 };
     let mut repair = vec![0u8; payload_size];
-    let mut out = Vec::with_capacity(frag_count as usize + 1);
+    let mut secondary_repair = vec![0u8; payload_size];
+    let mut out = Vec::with_capacity(frag_count as usize + 2);
 
     for index in 0..usize::from(frag_count) {
         let start = index * payload_size;
@@ -524,6 +589,7 @@ pub fn fragment_with_repair(
         for (parity, byte) in repair.iter_mut().zip(chunk) {
             *parity ^= *byte;
         }
+        xor_scaled(&mut secondary_repair, chunk, (index + 1) as u16);
 
         let mut dgram = Vec::with_capacity(VIDEO_HEADER_LEN + chunk.len());
         dgram.extend_from_slice(&VIDEO_MAGIC);
@@ -551,6 +617,18 @@ pub fn fragment_with_repair(
     repair_dgram.extend_from_slice(&(final_len as u16).to_be_bytes());
     repair_dgram.extend_from_slice(&repair);
     out.push(repair_dgram);
+
+    let mut secondary_dgram = Vec::with_capacity(datagram_size);
+    secondary_dgram.extend_from_slice(&VIDEO_MAGIC);
+    secondary_dgram.push(PROTOCOL_VERSION);
+    secondary_dgram.extend_from_slice(&frame_seq.to_be_bytes());
+    secondary_dgram.extend_from_slice(&timestamp_us.to_be_bytes());
+    secondary_dgram.extend_from_slice(&frag_count.saturating_add(1).to_be_bytes());
+    secondary_dgram.extend_from_slice(&frag_count.to_be_bytes());
+    secondary_dgram.push(flags | VIDEO_FLAG_REPAIR | VIDEO_FLAG_REPAIR_SECONDARY);
+    secondary_dgram.extend_from_slice(&(final_len as u16).to_be_bytes());
+    secondary_dgram.extend_from_slice(&secondary_repair);
+    out.push(secondary_dgram);
     out
 }
 
@@ -570,9 +648,16 @@ pub fn parse_datagram(bytes: &[u8]) -> Option<(VideoHeader, &[u8])> {
     let flags = bytes[24];
     let is_keyframe = flags & VIDEO_FLAG_KEYFRAME != 0;
     let is_repair = flags & VIDEO_FLAG_REPAIR != 0;
+    let is_secondary_repair = flags & VIDEO_FLAG_REPAIR_SECONDARY != 0;
+    let valid_repair_index = if is_secondary_repair {
+        is_repair && frag_count.checked_add(1) == Some(frag_index)
+    } else {
+        is_repair && frag_index == frag_count
+    };
     if frag_count == 0
         || (!is_repair && frag_index >= frag_count)
-        || (is_repair && frag_index != frag_count)
+        || (is_repair && !valid_repair_index)
+        || (!is_repair && is_secondary_repair)
     {
         return None;
     }
@@ -588,6 +673,7 @@ pub fn parse_datagram(bytes: &[u8]) -> Option<(VideoHeader, &[u8])> {
             frag_count,
             is_keyframe,
             is_repair,
+            is_secondary_repair,
         },
         payload,
     ))
@@ -610,7 +696,119 @@ struct PartialFrame {
     total_bytes: usize,
     fragments: Vec<Option<Vec<u8>>>,
     repair: Option<(usize, Vec<u8>)>,
+    secondary_repair: Option<(usize, Vec<u8>)>,
     first_seen: Instant,
+}
+
+fn expected_fragment_len(
+    entry: &PartialFrame,
+    index: usize,
+    shard_len: usize,
+    final_len: usize,
+) -> usize {
+    if index + 1 == entry.fragments.len() {
+        final_len
+    } else {
+        shard_len
+    }
+}
+
+fn residual_parity(
+    entry: &PartialFrame,
+    parity: &[u8],
+    final_len: usize,
+    weighted: bool,
+) -> Option<Vec<u8>> {
+    let mut residual = parity.to_vec();
+    for (index, fragment) in entry.fragments.iter().enumerate() {
+        let Some(fragment) = fragment else { continue };
+        if fragment.len() != expected_fragment_len(entry, index, parity.len(), final_len) {
+            return None;
+        }
+        if weighted {
+            xor_scaled(&mut residual, fragment, (index + 1) as u16);
+        } else {
+            for (byte, received) in residual.iter_mut().zip(fragment) {
+                *byte ^= *received;
+            }
+        }
+    }
+    Some(residual)
+}
+
+/// Apply one or both repair shards. This runs only after loss; the ordered,
+/// loss-free path still completes before either repair datagram is inspected.
+fn recover_missing_fragments(entry: &mut PartialFrame) {
+    let missing: Vec<usize> = entry
+        .fragments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, fragment)| fragment.is_none().then_some(index))
+        .collect();
+    if missing.is_empty() || missing.len() > 2 {
+        return;
+    }
+
+    let recovered = if missing.len() == 1 {
+        let index = missing[0];
+        if let Some((final_len, parity)) = entry.repair.as_ref() {
+            residual_parity(entry, parity, *final_len, false)
+                .map(|bytes| (*final_len, vec![(index, bytes)]))
+        } else if let Some((final_len, parity)) = entry.secondary_repair.as_ref() {
+            residual_parity(entry, parity, *final_len, true).and_then(|residual| {
+                gf16_inverse((index + 1) as u16)
+                    .map(|inverse| (*final_len, vec![(index, scaled(&residual, inverse))]))
+            })
+        } else {
+            None
+        }
+    } else {
+        let (Some((final_len, parity)), Some((secondary_final_len, secondary))) =
+            (entry.repair.as_ref(), entry.secondary_repair.as_ref())
+        else {
+            return;
+        };
+        if final_len != secondary_final_len || parity.len() != secondary.len() {
+            return;
+        }
+        let first = missing[0];
+        let second = missing[1];
+        let Some(primary_residual) = residual_parity(entry, parity, *final_len, false) else {
+            return;
+        };
+        let Some(mut secondary_residual) = residual_parity(entry, secondary, *final_len, true)
+        else {
+            return;
+        };
+        xor_scaled(
+            &mut secondary_residual,
+            &primary_residual,
+            (second + 1) as u16,
+        );
+        let Some(inverse) = gf16_inverse(((first + 1) as u16) ^ ((second + 1) as u16)) else {
+            return;
+        };
+        let first_bytes = scaled(&secondary_residual, inverse);
+        let mut second_bytes = primary_residual;
+        for (output, received) in second_bytes.iter_mut().zip(&first_bytes) {
+            *output ^= *received;
+        }
+        Some((
+            *final_len,
+            vec![(first, first_bytes), (second, second_bytes)],
+        ))
+    };
+
+    let Some((final_len, recovered)) = recovered else {
+        return;
+    };
+    for (index, mut bytes) in recovered {
+        let recovered_len = expected_fragment_len(entry, index, bytes.len(), final_len);
+        bytes.truncate(recovered_len);
+        entry.total_bytes += bytes.len();
+        entry.fragments[index] = Some(bytes);
+        entry.received += 1;
+    }
 }
 
 /// Reassembles fragmented access units. A frame is dropped (counted lost)
@@ -654,6 +852,7 @@ impl Reassembler {
                 total_bytes: 0,
                 fragments: vec![None; header.frag_count as usize],
                 repair: None,
+                secondary_repair: None,
                 first_seen: Instant::now(),
             });
         // Consistency: conflicting metadata for the same seq means loss or
@@ -669,7 +868,11 @@ impl Reassembler {
                 self.frames.remove(&header.frame_seq);
                 return None;
             }
-            entry.repair = Some((final_len, parity.to_vec()));
+            if header.is_secondary_repair {
+                entry.secondary_repair = Some((final_len, parity.to_vec()));
+            } else {
+                entry.repair = Some((final_len, parity.to_vec()));
+            }
         } else {
             let slot = &mut entry.fragments[header.frag_index as usize];
             if slot.is_none() {
@@ -679,38 +882,8 @@ impl Reassembler {
             }
         }
 
-        if entry.received + 1 == entry.frag_count {
-            let missing = entry.fragments.iter().position(Option::is_none);
-            if let (Some(missing), Some((final_len, parity))) = (missing, entry.repair.as_ref()) {
-                let mut recovered = parity.clone();
-                let mut valid = true;
-                for (index, fragment) in entry.fragments.iter().enumerate() {
-                    let Some(fragment) = fragment else { continue };
-                    let expected_len = if index + 1 == entry.fragments.len() {
-                        *final_len
-                    } else {
-                        parity.len()
-                    };
-                    if fragment.len() != expected_len {
-                        valid = false;
-                        break;
-                    }
-                    for (byte, received) in recovered.iter_mut().zip(fragment) {
-                        *byte ^= *received;
-                    }
-                }
-                if valid {
-                    let recovered_len = if missing + 1 == entry.fragments.len() {
-                        *final_len
-                    } else {
-                        parity.len()
-                    };
-                    recovered.truncate(recovered_len);
-                    entry.total_bytes += recovered.len();
-                    entry.fragments[missing] = Some(recovered);
-                    entry.received += 1;
-                }
-            }
+        if entry.frag_count.saturating_sub(entry.received) <= 2 {
+            recover_missing_fragments(entry);
         }
         if entry.received == entry.frag_count {
             let entry = self.frames.remove(&header.frame_seq).expect("present");
@@ -849,6 +1022,14 @@ mod tests {
     }
 
     #[test]
+    fn gf16_inverses_round_trip() {
+        for value in 1..=1024u16 {
+            let inverse = gf16_inverse(value).expect("non-zero field element");
+            assert_eq!(gf16_mul(value, inverse), 1, "value {value}");
+        }
+    }
+
+    #[test]
     fn fragment_reassemble_round_trip() {
         let au = sample_au(MAX_FRAGMENT_PAYLOAD * 3 + 17);
         let datagrams = fragment(&au, 42, 123_456_789, true, MAX_DATAGRAM_SIZE);
@@ -876,11 +1057,19 @@ mod tests {
     fn repair_shard_recovers_any_single_missing_fragment() {
         let au = sample_au(MAX_FRAGMENT_PAYLOAD * 4 + 73);
         let datagrams = fragment_with_repair(&au, 43, 987_654, true, MAX_DATAGRAM_SIZE);
-        let (repair_header, repair_payload) = parse_datagram(datagrams.last().unwrap()).unwrap();
+        let (repair_header, repair_payload) =
+            parse_datagram(&datagrams[datagrams.len() - 2]).unwrap();
         assert!(repair_header.is_repair);
+        assert!(!repair_header.is_secondary_repair);
         assert!(repair_header.is_keyframe);
         assert_eq!(repair_header.frag_index, repair_header.frag_count);
-        assert_eq!(repair_payload.len() + VIDEO_HEADER_LEN, MAX_DATAGRAM_SIZE);
+        assert!(repair_payload.len() + VIDEO_HEADER_LEN <= MAX_DATAGRAM_SIZE);
+        let (secondary_header, secondary_payload) =
+            parse_datagram(datagrams.last().unwrap()).unwrap();
+        assert!(secondary_header.is_repair);
+        assert!(secondary_header.is_secondary_repair);
+        assert_eq!(secondary_header.frag_index, secondary_header.frag_count + 1);
+        assert!(secondary_payload.len() + VIDEO_HEADER_LEN <= MAX_DATAGRAM_SIZE);
         assert!(datagrams
             .iter()
             .all(|dgram| dgram.len() <= MAX_DATAGRAM_SIZE));
@@ -904,6 +1093,54 @@ mod tests {
             assert!(frame.is_keyframe);
             assert_eq!(frame.data, au);
             assert_eq!(reassembler.pending(), 0);
+        }
+    }
+
+    #[test]
+    fn secondary_repair_recovers_when_primary_is_lost() {
+        let au = sample_au(MAX_FRAGMENT_PAYLOAD * 3 + 19);
+        let datagrams = fragment_with_repair(&au, 45, 23, false, MAX_DATAGRAM_SIZE);
+        let data_fragments = datagrams.len() - 2;
+        for missing in 0..data_fragments {
+            let mut reassembler = Reassembler::default();
+            let mut assembled = None;
+            for (index, datagram) in datagrams.iter().enumerate() {
+                if index == missing || index == data_fragments {
+                    continue;
+                }
+                let (header, payload) = parse_datagram(datagram).unwrap();
+                if let Some(frame) = reassembler.push(header, payload) {
+                    assembled = Some(frame);
+                }
+            }
+            assert_eq!(assembled.expect("secondary repair").data, au);
+        }
+    }
+
+    #[test]
+    fn dual_repair_recovers_any_two_missing_fragments() {
+        let au = sample_au(MAX_FRAGMENT_PAYLOAD * 6 + 71);
+        let datagrams = fragment_with_repair(&au, 46, 24, true, MAX_DATAGRAM_SIZE);
+        let data_fragments = datagrams.len() - 2;
+        for first in 0..data_fragments {
+            for second in first + 1..data_fragments {
+                let mut reassembler = Reassembler::default();
+                let mut assembled = None;
+                for (index, datagram) in datagrams.iter().enumerate() {
+                    if index == first || index == second {
+                        continue;
+                    }
+                    let (header, payload) = parse_datagram(datagram).unwrap();
+                    if let Some(frame) = reassembler.push(header, payload) {
+                        assembled = Some(frame);
+                    }
+                }
+                let frame = assembled
+                    .unwrap_or_else(|| panic!("fragments {first} and {second} were not repaired"));
+                assert_eq!(frame.data, au);
+                assert!(frame.is_keyframe);
+                assert_eq!(reassembler.pending(), 0);
+            }
         }
     }
 

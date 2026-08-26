@@ -84,7 +84,12 @@ control reader (no trip through the video pipeline). UDP video on 52800:
 each access unit is fragmented into datagrams sized from `--mtu` (MTU minus
 28 bytes of IP and UDP headers, so 1252 bytes at the default 1280) with a
 25-byte header (magic, version, frame sequence, capture timestamp,
-fragment index/count, keyframe flag), all big-endian. A datagram larger
+fragment index/count, keyframe/repair flags), all big-endian. The agent sends
+all data first, then ordinary XOR parity and GF(2^16)-weighted parity. That
+repairs any two missing data datagrams locally; loss-free frames complete
+before either parity datagram arrives, so protection adds no decode wait.
+The two-byte repair prefix and even field symbols make the default data shard
+1224 bytes. A datagram larger
 than the path MTU gets IP-fragmented, and losing any piece loses the whole
 datagram; that is what made keyframe bursts unrecoverable over a
 WireGuard tunnel with the old fixed 1400-byte size. One client at a time; a
@@ -100,6 +105,11 @@ tunnel's ring between the kernel and its own thread overruns at line rate.
 The sender therefore paces each access unit's burst at 400 Mbit/s, sleeping
 only once the deficit reaches 50 microseconds, so a 500 KB IDR takes about
 10 ms to leave instead of a fraction of one.
+
+Gaming mode keeps routine IDRs five minutes apart and asks the app-owned GSR
+helper for an in-process IDR on join or unrepaired loss. The helper contract
+and reproducible upstream patch live in `patches/`; an unpatched system GSR
+falls back to rebuilding the encoder session.
 
 The control channel has TCP_NODELAY set and exactly one writer per
 connection: a thread that owns the write side and drains a bounded queue

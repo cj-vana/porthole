@@ -37,6 +37,10 @@ use encode::Codec;
 
 /// Heartbeat interval while the agent idles (pre-capture scaffold behavior).
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+/// Gaming clients request an immediate IDR on join or loss. Keeping routine
+/// IDRs sparse avoids a multi-hundred-datagram burst every two seconds while
+/// retaining a periodic safety net if a control request is ever missed.
+const GAMING_KEYFRAME_INTERVAL_SECS: u32 = 300;
 
 /// Porthole Linux agent: screen capture, NVENC encode, LAN streaming.
 #[derive(Debug, Parser)]
@@ -184,8 +188,8 @@ fn init_tracing() {
 /// paced at the configured stream fps (capture itself can run faster, e.g.
 /// 144 Hz on the headless output), drain encoded access units, fragment and
 /// send them to the connected client. Handles control events: client
-/// connect/disconnect and keyframe requests (answered by restarting the
-/// encoder session, which yields a fresh IDR, FR-4). Logs a once-per-second
+/// connect/disconnect and keyframe requests (answered in process when the
+/// backend supports it, with a session restart fallback, FR-4). Logs a once-per-second
 /// stats line for capture, encode, and transmit together, and sends the
 /// same numbers to the client as `agent_stats` while one is connected.
 /// Build the hello a client receives on connect and after a settings change
@@ -403,6 +407,7 @@ fn capture_loop(
     };
     // Recomputed whenever a settings message (US-013) changes the framerate.
     let mut frame_interval = Duration::from_secs_f64(1.0 / f64::from(cfg.fps.get()));
+    let quality_keyframe_interval_secs = cfg.keyframe_interval_secs;
     // Accumulating deadline: captures arrive quantized to the compositor's
     // frame tick (e.g. 6.9ms at 144 Hz), so checking elapsed >= interval
     // would under-feed (45 fps at 60 target). Track the schedule instead.
@@ -481,22 +486,30 @@ fn capture_loop(
                     tracing::info!(generation, "client gone, video paused");
                 }
                 transport::ControlEvent::KeyframeRequest => {
-                    // FR-4: a subprocess ffmpeg cannot force an IDR
-                    // mid-session, so restart the encoder; the new session
-                    // starts with an IDR.
-                    let restart_start = Instant::now();
-                    rebuild_encoder(
-                        &mut encoder,
-                        &cfg,
-                        &capture_format,
-                        &raw_capture_enabled,
-                        &mailbox,
-                    );
-                    pending_frames.clear();
-                    tracing::info!(
-                        restart_ms = restart_start.elapsed().as_millis(),
-                        "encoder restarted for keyframe request"
-                    );
+                    match encoder.request_keyframe() {
+                        Ok(()) => {
+                            tracing::info!("encoder will emit an in-process keyframe");
+                        }
+                        Err(err) => {
+                            // Compatibility path for ordinary GSR and FFmpeg
+                            // subprocesses, which cannot change pict_type
+                            // after launch.
+                            let restart_start = Instant::now();
+                            rebuild_encoder(
+                                &mut encoder,
+                                &cfg,
+                                &capture_format,
+                                &raw_capture_enabled,
+                                &mailbox,
+                            );
+                            pending_frames.clear();
+                            tracing::info!(
+                                %err,
+                                restart_ms = restart_start.elapsed().as_millis(),
+                                "encoder restarted for keyframe request"
+                            );
+                        }
+                    }
                 }
                 transport::ControlEvent::Settings(settings) => {
                     // US-013 gaming mode: apply the requested framerate, codec,
@@ -520,6 +533,11 @@ fn capture_loop(
                     };
                     cfg.bitrate_mbps = u32::from(settings.bitrate_mbps).max(1);
                     cfg.low_latency = settings.low_latency;
+                    cfg.keyframe_interval_secs = if settings.low_latency {
+                        GAMING_KEYFRAME_INTERVAL_SECS
+                    } else {
+                        quality_keyframe_interval_secs
+                    };
                     rebuild_encoder(
                         &mut encoder,
                         &cfg,
@@ -538,6 +556,7 @@ fn capture_loop(
                         fps = cfg.fps.get(),
                         codec = %cfg.codec,
                         bitrate_mbps = cfg.bitrate_mbps,
+                        keyframe_interval_secs = cfg.keyframe_interval_secs,
                         low_latency = cfg.low_latency,
                         "stream reconfigured"
                     );

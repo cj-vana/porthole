@@ -132,8 +132,8 @@ pub struct EncodedFrame {
 /// Implemented by `ffmpeg::FfmpegEncoder` on Linux; configurable bitrate,
 /// codec, and keyframe interval come from [`crate::config::Config`]
 /// (PRD FR-2). `request_keyframe` backs FR-4 (client reports decode-fatal
-/// loss -> emit IDR immediately); the subprocess encoder cannot force an IDR
-/// mid-session yet, see its TODO.
+/// loss -> emit IDR immediately). An error means the pipeline must rebuild
+/// the encoder as its compatibility fallback.
 pub trait Encoder: Send {
     /// Submit one raw frame for encoding.
     fn encode(&mut self, frame: &crate::capture::RawFrame) -> anyhow::Result<()>;
@@ -142,9 +142,8 @@ pub trait Encoder: Send {
     /// (US-003) will consume these.
     fn drain(&mut self) -> Vec<EncodedFrame>;
 
-    /// Force the next output frame to be a keyframe (IDR). Unused until the
-    /// transport's loss handling (US-003) calls it.
-    #[allow(dead_code)]
+    /// Force the next output frame to be a keyframe (IDR). Return an error
+    /// when the backend cannot do so without a session rebuild.
     fn request_keyframe(&mut self) -> anyhow::Result<()>;
 
     /// Codec this encoder instance produces.
@@ -228,7 +227,7 @@ impl Encoder for NullEncoder {
     }
 
     fn request_keyframe(&mut self) -> anyhow::Result<()> {
-        Ok(())
+        anyhow::bail!("null encoder cannot produce an IDR")
     }
 
     fn codec(&self) -> Codec {

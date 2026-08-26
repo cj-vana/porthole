@@ -138,6 +138,9 @@ enum VTDecode {
         return (session, status)
     }
 
+    // The allocation, direct population, and sample construction are one
+    // ownership transaction; splitting it would widen unsafe pointer scope.
+    // swiftlint:disable function_body_length
     /// Assemble a CMSampleBuffer from Annex B without first materializing an
     /// AVCC `Data`. The CoreMedia block is the only destination allocation:
     /// NAL lengths and bytes are written into it in one pass, avoiding the
@@ -227,7 +230,11 @@ enum VTDecode {
         guard status == noErr else { return nil }
         return sampleBuffer
     }
+    // swiftlint:enable function_body_length
 
+    // The closure intentionally bounds borrowed Data storage to the complete
+    // CoreMedia submit; all sample metadata is explicit at this boundary.
+    // swiftlint:disable function_body_length function_parameter_count
     /// Build a sample and use it synchronously. Length-prefixed live buffers
     /// can be borrowed by CoreMedia without allocating or copying; the body
     /// runs inside `Data.withUnsafeBytes`, which keeps that pointer valid for
@@ -298,6 +305,7 @@ enum VTDecode {
             }
         }
     }
+    // swiftlint:enable function_body_length function_parameter_count
 
     /// Decode one sample buffer synchronously: with both asynchronous and
     /// temporal-processing flags clear, VideoToolbox guarantees the output

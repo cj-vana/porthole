@@ -257,12 +257,14 @@ carries no video or control traffic.
 
 ## Video channel (UDP)
 
-Each encoded access unit (Annex B h264/hevc) is split into fragments with a
-fixed 25-byte header. The datagram size ceiling is 1400 bytes (safe under a
-1500-byte MTU), so the largest fragment payload is 1375 bytes. The agent
+Each encoded access unit (Annex B h264/hevc) is split into data fragments with
+a fixed 25-byte header, followed by two zero-wait repair shards. The datagram
+size ceiling is 1400 bytes (safe under a 1500-byte MTU). Repair metadata takes
+two bytes and the GF(2^16) symbols require an even size, so the largest data
+fragment payload is 1372 bytes. The agent
 sizes datagrams from its `mtu` setting (default 1280, the IPv6 minimum and
 the WireGuard/Tailscale tunnel MTU): datagram size = mtu - 28 (IPv4 + UDP
-headers), so 1252-byte datagrams by default. A datagram that has to be
+headers), so 1252-byte datagrams with 1224-byte data shards by default. A datagram that has to be
 IP-fragmented in transit is lost when any piece is lost, which is what
 made keyframe bursts unrecoverable over a 1280-byte tunnel with
 1400-byte datagrams. Receivers accept any size up to the ceiling.
@@ -282,18 +284,38 @@ offset  size  field
 20      2     fragment index (BE u16, 0-based)
 22      2     fragment count (BE u16)
 24      1     flags: bit 0 = access unit contains an IDR (keyframe)
+                    bit 1 = repair shard
+                    bit 2 = secondary weighted repair shard (requires bit 1)
 25      n     fragment payload
 ```
+
+`fragment count` counts data shards only. Their indices are `0 ..< count`.
+The primary repair shard has index `count`; the secondary repair shard has
+index `count + 1`. Each repair payload starts with the true final-data-shard
+length as a big-endian u16, followed by one padded shard:
+
+- Primary P parity is the bytewise XOR of every data shard.
+- Secondary Q parity treats adjacent bytes as big-endian GF(2^16) symbols and
+  XORs data shard `i` multiplied by coefficient `i + 1`. The field polynomial
+  is x^16 + x^12 + x^3 + x + 1.
+
+P and Q solve any two missing data shards. Either shard can solve one missing
+data shard, so losing one repair datagram does not remove single-loss
+protection. Both repairs follow all data: the normal ordered, loss-free path
+completes on its final data datagram and pays no repair wait or decode latency.
+Receivers that only understand P ignore Q by its out-of-range index.
 
 Receiver rules:
 
 - Reassemble per frame sequence; a frame is decodable only when all
   fragments are present.
-- Drop a frame when any fragment is missing (stale partial frames; the
-  reference receiver uses 500 ms).
+- Recreate one or two missing data fragments from P/Q as soon as enough
+  shards arrive. Do not delay a complete data frame to wait for repair.
+- Drop a frame when missing data exceeds available repair capacity (stale
+  partial frames; the reference receiver uses 500 ms).
 - A gap in completed frame sequences means whole frames were lost.
-- Any loss is decode-fatal until the next IDR: send keyframe_request. The
-  reference receiver throttles requests to 1/second.
+- An unrepaired loss is decode-fatal until the next IDR: send
+  `keyframe_request`. The reference receiver throttles requests to 1/second.
 - Start decoding (or dumping) from the first keyframe access unit.
 
 Reference receiver: `cargo run --example receiver -- <agent-ip> [--dump

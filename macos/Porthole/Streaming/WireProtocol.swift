@@ -199,10 +199,10 @@ extension WireProtocol {
     /// 12      8     timestamp (BE u64), microseconds since pipeline start
     /// 20      2     fragment index (BE u16, 0-based)
     /// 22      2     fragment count (BE u16)
-    /// 24      1     flags: bit 0 = IDR, bit 1 = XOR repair shard
+    /// 24      1     flags: bit 0 = IDR, bit 1 = repair, bit 2 = secondary repair
     /// ```
-    /// A repair shard uses `fragmentIndex == fragmentCount`; data fragments
-    /// remain zero-based and strictly below `fragmentCount`.
+    /// The XOR shard uses `fragmentIndex == fragmentCount`; the weighted
+    /// shard uses `fragmentCount + 1`. Data fragments remain strictly below.
     struct DatagramHeader {
         static let length = 25
         static let maxDatagramSize = 1400
@@ -213,6 +213,7 @@ extension WireProtocol {
         let fragmentCount: UInt16
         let isKeyframe: Bool
         let isRepair: Bool
+        let isSecondaryRepair: Bool
     }
 
     /// Parse one UDP datagram into header + payload. Returns nil for
@@ -235,8 +236,14 @@ extension WireProtocol {
         let fragmentIndex = UInt16(bytes[20]) << 8 | UInt16(bytes[21])
         let fragmentCount = UInt16(bytes[22]) << 8 | UInt16(bytes[23])
         let isRepair = bytes[24] & 0x02 != 0
+        let isSecondaryRepair = bytes[24] & 0x04 != 0
+        let (secondaryIndex, secondaryOverflow) = fragmentCount.addingReportingOverflow(1)
+        let validRepairIndex = isSecondaryRepair
+            ? isRepair && !secondaryOverflow && fragmentIndex == secondaryIndex
+            : isRepair && fragmentIndex == fragmentCount
         guard fragmentCount > 0,
-              isRepair ? fragmentIndex == fragmentCount : fragmentIndex < fragmentCount else {
+              isRepair ? validRepairIndex : fragmentIndex < fragmentCount,
+              isRepair || !isSecondaryRepair else {
             return nil
         }
 
@@ -253,7 +260,8 @@ extension WireProtocol {
                               fragmentIndex: fragmentIndex,
                               fragmentCount: fragmentCount,
                               isKeyframe: bytes[24] & 0x01 != 0,
-                              isRepair: isRepair)
+                              isRepair: isRepair,
+                              isSecondaryRepair: isSecondaryRepair)
     }
 
     /// One audio datagram (US-009): a 16-byte header, then one Opus packet

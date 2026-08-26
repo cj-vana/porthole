@@ -244,8 +244,10 @@ device) is logged and costs sound only; the session stays up on video.
   AudioConverter Opus decode, and the jitter buffer feeding an
   AVAudioSourceNode, as described above.
 - `Porthole/Streaming/Reassembler.swift` reassembles fragmented access units
-  per the protocol's receiver rules: incomplete frames are dropped after
-  500 ms, sequence gaps and stale frames count as loss.
+  per the protocol's receiver rules. Two trailing zero-wait parity shards
+  recover any two missing data datagrams without retransmission; complete
+  data frames never wait for them. Unrecoverable frames are dropped after
+  500 ms, and sequence gaps and stale frames count as loss.
 - `Porthole/Streaming/AnnexB.swift` splits Annex B streams into NAL units and
   access units and converts access units to the length-prefixed form
   VideoToolbox expects.
@@ -281,9 +283,11 @@ device) is logged and costs sound only; the session stays up on video.
   cursor rect while captured.
 - `Porthole/Rendering/MetalRenderer.swift` wraps `MTKView`. Live frames are
   converted to Metal textures via CVMetalTextureCache and drawn aspect-fit;
-  YCbCr to RGB conversion runs in the fragment shader. Each new decoded frame
-  registers a presented handler on its drawable, which is where
-  `cap_present_ms` comes from. With no stream, it draws the test pattern.
+  YCbCr to RGB conversion runs in the fragment shader. Gaming mode bypasses
+  the main thread, late-selects the newest decoded frame after drawable
+  acquisition, and uses a two-drawable pool so stale pixels cannot queue a
+  third refresh. Presented and GPU-completed handlers produce
+  `cap_present_ms` and `cap_gpu_ms`; with no stream, it draws the test pattern.
 - `Porthole/Rendering/Shaders.metal` has the test pattern shaders (SMPTE-style
   bars, frame-pacing ticker sized to the selected rate, time-derived marker)
   and the video shaders (letterboxed fullscreen triangle, NV12 to RGB).
