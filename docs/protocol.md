@@ -250,8 +250,10 @@ offset  size  field
 The agent writes the file into its configured transfer folder (default
 `~/Downloads`, agent `--transfer-dir`) under a temporary name and renames it
 into place once the full size has arrived, so a partial transfer never
-leaves a file that looks complete. The connection closes when the agent has
-the whole file. This channel carries no video or control traffic.
+leaves a file that looks complete. When the whole file is safely on disk the
+agent writes one acknowledgement byte (0x01) and closes the connection; the
+client waits for that byte before reporting the transfer done. This channel
+carries no video or control traffic.
 
 ## Video channel (UDP)
 
