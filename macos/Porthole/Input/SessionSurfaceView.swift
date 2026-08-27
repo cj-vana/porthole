@@ -368,8 +368,7 @@ final class SessionSurfaceView: MTKView {
     }
 
     override func scrollWheel(with event: NSEvent) {
-        // Captured scroll is remote input; uncaptured scroll stays local so
-        // the one-to-one mode's scroll view can pan (US-010).
+        // Captured scroll is remote input; uncaptured scroll stays local.
         if inputHandler?.isCaptured == true {
             inputHandler?.handleScroll(event)
         } else {

@@ -3,16 +3,16 @@ import MetalKit
 import os
 import SwiftUI
 
-/// SwiftUI wrapper around the session surface (US-005/006), hosted in a
-/// scroll view for the US-010 display modes.
+/// SwiftUI wrapper around the session surface (US-005/006), hosted in the
+/// native-fullscreen bridge for the US-010 display modes.
 ///
 /// US-005: while a stream is live the renderer draws decoded CVPixelBuffers
 /// (see `MetalRenderer.display`); the test pattern remains as the
 /// disconnected idle state. US-006: the surface is a SessionSurfaceView
 /// that captures keyboard/mouse/trackpad input while it holds focus.
-/// US-010: fit letterboxes into the window, one-to-one sizes the surface so
-/// one video pixel lands on one backing-store pixel (scrolling when the
-/// video is bigger than the window), fullscreen is the native kind.
+/// US-010: Fit occupies the window and Full uses native macOS fullscreen.
+/// Both report their backing-pixel viewport so the Linux virtual display can
+/// render exactly the pixels the client will show.
 struct MetalSurfaceView: NSViewRepresentable {
     /// Target rate for the view's display link: 60/120/144, or 0 for the
     /// screen's maximum. The system clamps it to what the display supports.
@@ -24,9 +24,6 @@ struct MetalSurfaceView: NSViewRepresentable {
     /// transitions (the cursor itself is decided in SessionSurfaceView).
     let pointerLocked: Bool
     let displayMode: DisplayMode
-    /// Remote video size in pixels; .zero until the stream is live, which
-    /// keeps one-to-one on the fit fallback until the size is known.
-    let videoSize: CGSize
     /// Shared renderer owned by `StreamSession`; also the surface's delegate.
     let renderer: MetalRenderer
     /// Input translator owned by `StreamSession`.
@@ -34,6 +31,8 @@ struct MetalSurfaceView: NSViewRepresentable {
     /// Native fullscreen transitions, including ones started by the window
     /// itself (green button, exit gesture), so the chrome stays in sync.
     let onFullscreenChanged: (Bool) -> Void
+    /// Settled drawable viewport in backing pixels.
+    let onViewportSizeChanged: (CGSize) -> Void
 
     func makeCoordinator() -> MetalRenderer {
         renderer
@@ -55,35 +54,31 @@ struct MetalSurfaceView: NSViewRepresentable {
         context.coordinator.setLowLatencyPresentation(lowLatency)
         let host = SurfaceHostView(surface: surface, renderer: context.coordinator)
         host.onFullscreenChanged = onFullscreenChanged
+        host.onViewportSizeChanged = onViewportSizeChanged
         return host
     }
 
     func updateNSView(_ nsView: SurfaceHostView, context: Context) {
         nsView.onFullscreenChanged = onFullscreenChanged
+        nsView.onViewportSizeChanged = onViewportSizeChanged
         nsView.surface.targetFrameRate = frameRate
         nsView.surface.lowLatencyPresentation = lowLatency
         renderer.setLowLatencyPresentation(lowLatency)
         nsView.surface.pointerLocked = pointerLocked
-        let oneToOne = displayMode == .oneToOne && videoSize != .zero
-        nsView.apply(mode: displayMode, videoSize: videoSize)
-        renderer.setFillsDrawable(oneToOne)
         nsView.setWantsFullscreen(displayMode == .fullscreen)
     }
 }
 
-/// Hosts the session surface in a scroll view so one-to-one mode can pan a
-/// video larger than the window; fit and fullscreen pin the surface to the
-/// scroll view's own size (no scrolling, the renderer letterboxes). Also
-/// owns the native-fullscreen bridge for the fullscreen mode.
+/// Pins the surface to the window and owns the native-fullscreen bridge.
 final class SurfaceHostView: NSScrollView {
     let surface: SessionSurfaceView
     private let renderer: MetalRenderer
 
     /// Reports enter/exit of native fullscreen; called on main.
     var onFullscreenChanged: ((Bool) -> Void)?
+    var onViewportSizeChanged: ((CGSize) -> Void)?
 
-    private var mode: DisplayMode = .fit
-    private var videoSize: CGSize = .zero
+    private var reportedViewportSize: CGSize?
     private var wantsFullscreen = false
     /// SwiftUI can attach the represented view to a restored window before
     /// its first update supplies the persisted display mode. Do not interpret
@@ -119,7 +114,7 @@ final class SurfaceHostView: NSScrollView {
             guard let renderer, let surface else { return }
             renderer.attach(view: surface)
         }
-        let clipView = CenteringClipView()
+        let clipView = NSClipView()
         clipView.drawsBackground = false
         contentView = clipView
         documentView = surface
@@ -140,13 +135,6 @@ final class SurfaceHostView: NSScrollView {
         }
     }
 
-    func apply(mode: DisplayMode, videoSize: CGSize) {
-        guard mode != self.mode || videoSize != self.videoSize else { return }
-        self.mode = mode
-        self.videoSize = videoSize
-        layoutSurface()
-    }
-
     override func layout() {
         super.layout()
         layoutSurface()
@@ -159,31 +147,28 @@ final class SurfaceHostView: NSScrollView {
         layoutSurface()
     }
 
-    /// One-to-one means one video pixel per backing-store pixel. The
-    /// surface's drawable is its point size times the backing scale, so the
-    /// frame that yields a video-sized drawable is the pixel dimensions
-    /// divided by that scale: a 2560x1440 stream occupies 1280x720 points
-    /// on a Retina (2x) display and 2560x1440 points on a 1x display, and a
-    /// glyph the remote rendered into n pixels lands on exactly n device
-    /// pixels here, with no resampling to blur it.
     private func layoutSurface() {
-        let oneToOne = mode == .oneToOne && videoSize.width > 0 && videoSize.height > 0
-        let size: NSSize
-        if oneToOne {
-            let scale = window?.backingScaleFactor ?? 2
-            size = NSSize(width: videoSize.width / scale, height: videoSize.height / scale)
-        } else {
-            size = contentView.bounds.size
-        }
+        let size = contentView.bounds.size
         if surface.frame.size != size {
             surface.setFrameSize(size)
         }
-        if hasVerticalScroller != oneToOne {
-            hasHorizontalScroller = oneToOne
-            hasVerticalScroller = oneToOne
-            horizontalScrollElasticity = oneToOne ? .automatic : .none
-            verticalScrollElasticity = oneToOne ? .automatic : .none
-        }
+        reportViewportSize()
+    }
+
+    /// `convertToBacking` is AppKit's pixel-aligned source of truth across
+    /// Retina scale changes; do not infer pixels by multiplying a scale.
+    private func reportViewportSize() {
+        guard let window,
+              !fullscreenTransitionActive,
+              !fullscreenTogglePending,
+              !hasFullscreenIntent || window.styleMask.contains(.fullScreen) == wantsFullscreen,
+              surface.bounds.width > 0,
+              surface.bounds.height > 0 else { return }
+        let backing = surface.convertToBacking(surface.bounds).size
+        let size = CGSize(width: backing.width.rounded(), height: backing.height.rounded())
+        guard size != reportedViewportSize else { return }
+        reportedViewportSize = size
+        onViewportSizeChanged?(size)
     }
 
     // MARK: Native fullscreen (US-010)
@@ -297,8 +282,7 @@ final class SurfaceHostView: NSScrollView {
                 """)
         }
         // A persisted fullscreen mode arrives before the window exists;
-        // apply it once there is a window to toggle, and re-derive the
-        // one-to-one size for this window's backing scale.
+        // apply it once there is a window to toggle and report its viewport.
         applyFullscreen()
         layoutSurface()
     }
@@ -324,9 +308,10 @@ final class SurfaceHostView: NSScrollView {
             $0.logger.info("fullscreen did exit")
             $0.completePresentationTransition(enteredFullscreen: false)
         }
-        // Dragging the window between a 1x and a 2x display changes what
-        // "one video pixel on one device pixel" means in points.
+        // Dragging between a 1x and a 2x display changes the backing-pixel
+        // viewport even if the window's point size is unchanged.
         observe(NSWindow.didChangeBackingPropertiesNotification) { $0.layoutSurface() }
+        observe(NSWindow.didChangeScreenNotification) { $0.layoutSurface() }
     }
 
     /// Drain the old display binding for the entire Space transition. AppKit
@@ -369,6 +354,7 @@ final class SurfaceHostView: NSScrollView {
         surface.setFullscreenPresentationSettled(enteredFullscreen)
         surface.reapplyPresentationMode()
         renderer.resumePresentation(view: surface)
+        layoutSurface()
         // Track the completed window state locally before SwiftUI propagates
         // the callback. Otherwise applyFullscreen can see the stale
         // pre-transition intent and immediately undo a user action.
@@ -391,22 +377,5 @@ final class SurfaceHostView: NSScrollView {
                   (notification.object as? NSWindow) === window else { return }
             handler(self)
         })
-    }
-}
-
-/// Centers a document smaller than the clip area (AppKit pins it to the
-/// origin edge otherwise), so a one-to-one video smaller than the window
-/// floats centered like the letterboxed fit mode.
-final class CenteringClipView: NSClipView {
-    override func constrainBoundsRect(_ proposedBounds: NSRect) -> NSRect {
-        var bounds = super.constrainBoundsRect(proposedBounds)
-        guard let documentView else { return bounds }
-        if documentView.frame.width < bounds.width {
-            bounds.origin.x = (documentView.frame.width - bounds.width) / 2
-        }
-        if documentView.frame.height < bounds.height {
-            bounds.origin.y = (documentView.frame.height - bounds.height) / 2
-        }
-        return bounds
     }
 }

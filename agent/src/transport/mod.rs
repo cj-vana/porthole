@@ -68,6 +68,8 @@ pub enum ControlEvent {
     KeyframeRequest,
     /// The client asked to reconfigure the stream (gaming mode, US-013).
     Settings(protocol::Settings),
+    /// The client viewport settled at a new backing-pixel size.
+    DisplayResize(protocol::DisplayResize),
 }
 
 /// The current connection's writer queue, tagged with its generation so a
@@ -350,6 +352,21 @@ fn read_loop(args: ReaderArgs) {
                     None => {
                         tracing::debug!(%peer, len = payload.len(), "malformed settings, ignored")
                     }
+                }
+            }
+            Ok(Some((protocol::CONTROL_MSG_DISPLAY_RESIZE, payload))) => {
+                match protocol::DisplayResize::decode(&payload) {
+                    Some(resize) => {
+                        tracing::info!(%peer, ?resize, "client requested display resize");
+                        if tx.send(ControlEvent::DisplayResize(resize)).is_err() {
+                            break;
+                        }
+                    }
+                    None => tracing::debug!(
+                        %peer,
+                        len = payload.len(),
+                        "malformed display resize, ignored"
+                    ),
                 }
             }
             Ok(Some((protocol::CONTROL_MSG_GAMEPAD, payload))) => {

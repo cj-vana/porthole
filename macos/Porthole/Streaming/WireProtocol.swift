@@ -39,6 +39,8 @@ enum ControlMessageType: UInt8 {
     case clipboard = 0x07
     /// client -> agent (US-014): gamepad state, 17-byte payload.
     case gamepad = 0x08
+    /// client -> agent: resize the owned virtual display, 8-byte payload.
+    case displayResize = 0x09
     // Input messages (client -> agent, US-006). Layouts in docs/protocol.md.
     case pointerMotionAbs = 0x10
     case pointerMotionRel = 0x11
@@ -165,6 +167,15 @@ extension WireProtocol {
         payload.appendUInt16BE(bitrateMbps)
         payload.append(lowLatency ? 1 : 0)
         return encodeControlMessage(.settings, payload: payload)
+    }
+
+    /// Resize the agent's owned headless output to the settled client
+    /// viewport. StreamSession clamps and even-aligns dimensions first.
+    static func encodeDisplayResize(width: UInt32, height: UInt32) -> Data {
+        var payload = Data(capacity: 8)
+        payload.appendUInt32BE(width)
+        payload.appendUInt32BE(height)
+        return encodeControlMessage(.displayResize, payload: payload)
     }
 
     /// Encode a `gamepad_state` control frame (US-014):

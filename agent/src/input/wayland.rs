@@ -44,7 +44,7 @@ mod vk {
 use vk::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
 use vk::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1;
 
-use super::InputEvent;
+use super::{InputEvent, InputGeometry};
 
 #[derive(Default)]
 struct State {
@@ -141,8 +141,7 @@ pub struct WaylandInput {
     pointer: ZwlrVirtualPointerV1,
     keyboard: ZwpVirtualKeyboardV1,
     start: Instant,
-    output_width: u32,
-    output_height: u32,
+    geometry: InputGeometry,
     // Hold the keymap fd open for the lifetime of the keyboard upload.
     _keymap_file: File,
     // Bound globals kept alive.
@@ -151,7 +150,7 @@ pub struct WaylandInput {
 }
 
 impl WaylandInput {
-    pub fn new(output_width: u32, output_height: u32) -> anyhow::Result<Self> {
+    pub fn new(geometry: InputGeometry) -> anyhow::Result<Self> {
         let conn = Connection::connect_to_env()
             .context("failed to connect to Wayland for input injection")?;
         let display = conn.display();
@@ -187,8 +186,7 @@ impl WaylandInput {
             pointer,
             keyboard,
             start: Instant::now(),
-            output_width,
-            output_height,
+            geometry,
             _keymap_file: keymap_file,
             _seat: state.seat.take().expect("checked above"),
             _registry: registry,
@@ -218,12 +216,13 @@ impl WaylandInput {
         // button without one until the next frame arrives.
         match event {
             InputEvent::PointerMotionAbs { x, y } => {
+                let (output_width, output_height) = self.geometry.dimensions();
                 self.pointer.motion_absolute(
                     time,
                     x.max(0) as u32,
                     y.max(0) as u32,
-                    self.output_width,
-                    self.output_height,
+                    output_width,
+                    output_height,
                 );
                 self.pointer.frame();
             }

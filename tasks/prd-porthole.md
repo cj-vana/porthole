@@ -18,7 +18,7 @@ Primary use case: hours-long coding/dev sessions (so text must be razor sharp) p
 - One-click connect to a Linux machine in under 3 seconds, with zero typing of IPs/ports.
 - Sustain 1440p (2560×1440) streaming at 60fps on a LAN with hardware encode (Linux, NVENC or VAAPI) and hardware decode (Mac/VideoToolbox), plus selectable 120fps and 144fps modes for high-refresh displays.
 - Glass-to-glass latency under 40ms in the default "quality" mode; target under 25ms in "gaming" mode at up to 144fps.
-- Text in a code editor is crisp and comfortable for multi-hour sessions at 1:1 scaling on a Retina display.
+- Text in a code editor is crisp because the remote source matches the Retina viewport.
 - Feel 100% native on macOS: trackpad scroll/gestures, system shortcuts, fullscreen spaces, Retina rendering.
 - Ship the extras that make it a daily driver: clipboard sync, audio, file drag & drop, gamepad passthrough.
 
@@ -127,10 +127,10 @@ Acceptance Criteria:
 Description: As a user, I want control over how the remote screen maps to my Retina display so text is always crisp.
 
 Acceptance Criteria:
-- [x] Modes: fit-to-window, 1:1 pixels, and native macOS fullscreen (own Space)
-- [x] HiDPI/Retina rendering path so 1:1 text is sharp, not upscaled-blurry
+- [x] Modes: adaptive fit-to-window and native macOS fullscreen (own Space)
+- [x] HiDPI/Retina path sizes the remote headless output to the client viewport
 - [x] Mode switchable from the in-session toolbar and persisted per machine
-- [x] Verify in the running app: 6pt code font comfortably readable in 1:1 mode
+- [ ] Verify in the running app: resize Fit and Full and confirm crisp matching output geometry
 
 ### US-011: File drag & drop
 Description: As a user, I want to drag a file onto the stream window to send it to the Linux machine.
@@ -193,7 +193,7 @@ Mac app:
 - FR-13: Connect on click; complete handshake and show video in under 3 seconds on LAN.
 - FR-14: Decode H.264/HEVC with VideoToolbox and render via Metal with correct color and aspect.
 - FR-15: Capture keyboard/mouse/trackpad input with native feel; configurable handling of macOS system shortcuts.
-- FR-16: Provide display modes (fit, 1:1, fullscreen Space), persisted per machine.
+- FR-16: Provide adaptive Fit and Full display modes, persisted per machine.
 - FR-17: Sync clipboard both ways with loop prevention and a settings toggle.
 - FR-18: Play the audio stream with volume/mute controls.
 - FR-19: Accept file drags onto the session window and transfer with progress, off the video path.
@@ -209,7 +209,7 @@ Mac app:
 - Recording, screenshots tooling, or annotation.
 - iOS/iPadOS/Windows/web clients; Windows agent.
 - AV1 codec (revisit later; requires RTX 40-series for NVENC AV1).
-- 4:4:4 chroma "perfect text" path. v1 achieves crispness via high bitrate + 1:1 Retina scaling; 4:4:4 is an open question below, not a commitment.
+- 4:4:4 chroma "perfect text" path. v1 uses high bitrate plus source-sized Retina output; 4:4:4 is an open question below, not a commitment.
 - Wake-on-LAN, agent auto-update, and any account/cloud sign-in.
 
 ## Design Considerations
@@ -238,7 +238,7 @@ Mac app:
 - 1440p60 sustained for 30 minutes with no dropped-frame storms and < 5% CPU on the Mac client.
 - 1440p at 120fps and at 144fps sustained in Gaming mode on a 144Hz display (10-minute spot check each).
 - Glass-to-glass latency < 40ms (quality mode) and ≤ 25ms (gaming mode) measured by the stats overlay.
-- A 6pt code font is comfortably readable at 1:1 scaling on a Retina display (subjective pass/fail by the user).
+- The remote output matches the Fit/Full backing-pixel viewport and text remains crisp without local upscaling.
 - Copy/paste works both directions in < 1s without ever creating a sync loop.
 - The user's verdict: "I'd rather use this than any screen share app I've tried."
 

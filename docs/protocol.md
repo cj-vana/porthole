@@ -35,7 +35,7 @@ offset  size  field
 0       1     codec: 0 = h264, 1 = hevc
 1       4     width (BE u32)
 5       4     height (BE u32)
-9       4     fps (BE u32)
+9       4     configured capture ceiling in fps (BE u32; not a measured rate)
 13      4     bitrate in Mbps (BE u32)
 17      4     keyframe interval in seconds (BE u32)
 21      2     video port (BE u16): the UDP port the agent sends video to
@@ -111,7 +111,7 @@ Payload length is 14. Sent only while a client is connected.
 
 ### settings (type 0x06, client -> agent, US-013)
 
-Reconfigure the live stream: gaming mode selects a higher framerate, the
+Reconfigure the live stream: gaming mode selects a higher capture ceiling, the
 low-latency encoder bias, and optionally HEVC.
 
 ```
@@ -122,12 +122,35 @@ offset  size  field
 5       1     low_latency: 1 biases the encoder toward latency over quality
 ```
 
-Payload length is 6. The agent applies it by restarting its encoder with
-the new parameters and sending a fresh `hello`, so the next access unit is
-an IDR in the requested codec. The client should re-init its decoder for
+Payload length is 6. The fps value is a ceiling: variable-frame-rate capture
+only emits real compositor frames, and `agent_stats` is the source of measured
+capture/encode rates. The agent applies settings by restarting its encoder
+with the new parameters and sending a fresh `hello`, so the next access unit
+is an IDR in the requested codec. The client should re-init its decoder for
 the requested codec as soon as it sends this, rather than waiting for the
 hello, because the hello is advisory (a dropped hello must not strand the
 client on the old codec).
+
+### display_resize (type 0x09, client -> agent)
+
+Resize the headless output owned by the agent after the client viewport has
+settled. Agents that do not own a virtual display ignore this message; they
+never resize a physical monitor. Unknown-message handling makes this backward
+compatible with older agents.
+
+```
+offset  size  field
+0       4     width in pixels (BE u32)
+4       4     height in pixels (BE u32)
+```
+
+Payload length is 8. Both dimensions must be even; width must be 320..8192
+and height 180..8192. A valid resize stops capture, reconfigures the virtual
+output, recreates capture and encoder resources, updates absolute-pointer
+geometry, and sends a fresh `hello`. The first new access unit is an IDR.
+Clients should deduplicate and debounce interactive window resizing. When a
+settings change and resize are part of one action, send them consecutively so
+the agent can coalesce them into one pipeline rebuild.
 
 ### Input messages (client -> agent, US-006)
 

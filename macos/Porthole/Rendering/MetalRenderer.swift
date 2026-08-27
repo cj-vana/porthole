@@ -158,8 +158,6 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     /// the completed transition rebinds and submits the newest mailbox entry.
     private var presentationSuspended = false
     private var colorState = ColorState(matrix: .bt709, fullRange: false)
-    /// US-010 one-to-one mode draws the quad unscaled; see setFillsDrawable.
-    private var fillsDrawable = false
     override convenience init() {
         guard let device = MTLCreateSystemDefaultDevice() else {
             preconditionFailure("Porthole requires a Metal-capable GPU")
@@ -693,13 +691,11 @@ extension MetalRenderer {
         }
         let holdsPreviousFrame = frame.generation == lastGamingGeneration
         let colors = colorState
-        let fills = fillsDrawable
         frameLock.unlock()
 
         let drawableSize = CGSize(width: drawable.texture.width,
                                   height: drawable.texture.height)
         let coversDrawable = Self.videoCoversDrawable(frame: frame,
-                                                      fills: fills,
                                                       drawableSize: drawableSize)
         let renderPass = MTLRenderPassDescriptor()
         renderPass.colorAttachments[0].texture = drawable.texture
@@ -717,7 +713,6 @@ extension MetalRenderer {
 
         guard drawVideo(frame: frame,
                         colors: colors,
-                        fills: fills,
                         drawableSize: drawableSize,
                         encoder: encoder) else {
             encoder.endEncoding()
@@ -983,15 +978,6 @@ extension MetalRenderer {
         frameLock.unlock()
     }
 
-    /// US-010 one-to-one mode: the hosting view sizes the drawable to match
-    /// the video pixel for pixel, so the quad must fill it exactly rather
-    /// than trusting the letterbox math to land on a scale of 1.
-    func setFillsDrawable(_ fills: Bool) {
-        frameLock.lock()
-        fillsDrawable = fills
-        frameLock.unlock()
-    }
-
     // MARK: MTKViewDelegate
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
@@ -1018,7 +1004,6 @@ extension MetalRenderer {
         let token = activeRenderToken
         let frame = token == nil ? nil : latestFrame
         let colors = colorState
-        let fills = fillsDrawable
         frameLock.unlock()
         // Select the latest frame after acquiring a drawable: nextDrawable
         // can wait, and a frame decoded during that wait should not be charged
@@ -1029,7 +1014,6 @@ extension MetalRenderer {
         if let frame {
             drewVideo = drawVideo(frame: frame,
                                   colors: colors,
-                                  fills: fills,
                                   drawableSize: view.drawableSize,
                                   encoder: encoder)
         }
@@ -1114,9 +1098,8 @@ extension MetalRenderer {
     // MARK: Stream video (US-005)
 
     /// Avoid loading/clearing a drawable that the video fully overwrites.
-    private static func videoCoversDrawable(frame: StreamFrame, fills: Bool,
+    private static func videoCoversDrawable(frame: StreamFrame,
                                             drawableSize: CGSize) -> Bool {
-        if fills { return true }
         guard frame.width > 0, frame.height > 0, drawableSize.width > 0,
               drawableSize.height > 0 else { return false }
         let widthAtDrawableHeight = CGFloat(frame.width) * drawableSize.height
@@ -1131,7 +1114,6 @@ extension MetalRenderer {
     /// back to the test pattern for this draw.
     private func drawVideo(frame: StreamFrame,
                            colors: ColorState,
-                           fills: Bool,
                            drawableSize: CGSize,
                            encoder: MTLRenderCommandEncoder) -> Bool {
         // NV12: plane 0 is luma (r8), plane 1 is interleaved CbCr (rg8).
@@ -1140,18 +1122,16 @@ extension MetalRenderer {
             return false
         }
 
-        // Aspect-fit the video into the drawable (letterbox or pillarbox),
-        // unless one-to-one mode already sized the drawable to the video.
+        // Aspect-fit during the brief interval before a remote source resize
+        // settles, then the source and drawable naturally share an aspect.
         var scale = SIMD2<Float>(1, 1)
-        if !fills {
-            guard drawableSize.height > 0 else { return false }
-            let drawableAspect = Float(drawableSize.width / drawableSize.height)
-            let videoAspect = Float(frame.width) / Float(frame.height)
-            if videoAspect > drawableAspect {
-                scale.y = drawableAspect / videoAspect
-            } else {
-                scale.x = videoAspect / drawableAspect
-            }
+        guard drawableSize.height > 0 else { return false }
+        let drawableAspect = Float(drawableSize.width / drawableSize.height)
+        let videoAspect = Float(frame.width) / Float(frame.height)
+        if videoAspect > drawableAspect {
+            scale.y = drawableAspect / videoAspect
+        } else {
+            scale.x = videoAspect / drawableAspect
         }
 
         var colorCoeffs = Self.colorCoefficients(for: colors.matrix)

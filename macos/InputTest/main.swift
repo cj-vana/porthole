@@ -255,7 +255,16 @@ func runLocalTests() {
     ])
     wire.removeAll()
 
-    // 9. A thumbnail fetched over a Tailscale/CGNAT endpoint must not teach
+    // 9. A settled 3456x2234 Retina viewport is an exact display_resize
+    //    control frame: four-byte length includes the one-byte type.
+    checkBytes("display resize 3456x2234",
+               Array(WireProtocol.encodeDisplayResize(width: 3_456, height: 2_234)), [
+                   0, 0, 0, 9, 0x09,
+                   0, 0, 0x0D, 0x80,
+                   0, 0, 0x08, 0xBA
+               ])
+
+    // 10. A thumbnail fetched over a Tailscale/CGNAT endpoint must not teach
     //    the session to bypass a simultaneously advertised physical LAN
     //    address. The preference still wins among equally ranked paths.
     let txt = ["v": Data("1".utf8)]
@@ -289,7 +298,7 @@ func runLive(host: String, command: [String]) -> Never {
         case .ready:
             break
         case .hello(let hello):
-            print("hello: \(hello.width)x\(hello.height)@\(hello.fps) from \(host)")
+            print("hello: \(hello.width)x\(hello.height), cap \(hello.fps) fps from \(host)")
             helloReceived.signal()
         case .pong, .agentStats:
             break // latency probes are the app's concern, not this gate's

@@ -287,6 +287,17 @@ impl CaptureMailbox {
         *self.format.lock().expect("capture format poisoned") = format;
     }
 
+    /// Prepare the same bounded mailbox for a new capture generation after
+    /// the previous producer has stopped and joined.
+    fn reset(&self, format: capture::CaptureFormat) {
+        self.slot.lock().expect("capture mailbox poisoned").take();
+        self.update_format(format);
+        self.captured.store(0, Ordering::Relaxed);
+        self.replaced.store(0, Ordering::Relaxed);
+        self.done.store(false, Ordering::Release);
+        self.ready.notify_all();
+    }
+
     fn format(&self) -> capture::CaptureFormat {
         self.format.lock().expect("capture format poisoned").clone()
     }
@@ -299,6 +310,19 @@ impl CaptureMailbox {
     }
 }
 
+struct CaptureProducer {
+    stop: Arc<AtomicBool>,
+    handle: thread::JoinHandle<()>,
+}
+
+impl CaptureProducer {
+    fn stop(self, mailbox: &CaptureMailbox) {
+        self.stop.store(true, Ordering::Release);
+        mailbox.ready.notify_all();
+        let _ = self.handle.join();
+    }
+}
+
 fn spawn_capture_producer(
     mut backend: Box<dyn capture::CaptureBackend>,
     mailbox: Arc<CaptureMailbox>,
@@ -306,13 +330,15 @@ fn spawn_capture_producer(
     pipeline_start: Instant,
     raw_capture_enabled: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
-) -> std::io::Result<thread::JoinHandle<()>> {
-    thread::Builder::new()
+) -> std::io::Result<CaptureProducer> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let handle = thread::Builder::new()
         .name("wayland-capture".into())
         .spawn(move || {
             let mut sequence = 0u64;
             let mut has_thumbnail = false;
-            while !shutdown.load(Ordering::Relaxed) {
+            while !shutdown.load(Ordering::Relaxed) && !thread_stop.load(Ordering::Acquire) {
                 let publish_video = raw_capture_enabled.load(Ordering::Acquire);
                 // A capture-owning encoder imports compositor dma-bufs itself.
                 // Keep one startup frame for the picker, then avoid every SHM
@@ -347,7 +373,8 @@ fn spawn_capture_producer(
                 }
             }
             mailbox.finish();
-        })
+        })?;
+    Ok(CaptureProducer { stop, handle })
 }
 
 fn rebuild_encoder(
@@ -374,32 +401,99 @@ fn rebuild_encoder(
     }
 }
 
+/// Recreate every resource bound to the virtual output after its geometry or
+/// refresh changes. The old producer is joined before the mailbox generation
+/// is reset, so a late `finish` can never terminate the new pipeline.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_capture_pipeline(
+    encoder: &mut Box<dyn encode::Encoder>,
+    cfg: &config::Config,
+    preferred_output: &str,
+    capture_format: &mut capture::CaptureFormat,
+    capture_backend: &mut String,
+    producer: &mut Option<CaptureProducer>,
+    mailbox: &Arc<CaptureMailbox>,
+    latest_frame: &discovery::LatestFrame,
+    pipeline_start: Instant,
+    raw_capture_enabled: &Arc<AtomicBool>,
+    shutdown: &Arc<AtomicBool>,
+) -> bool {
+    let restart_start = Instant::now();
+    raw_capture_enabled.store(true, Ordering::Release);
+    let placeholder: Box<dyn encode::Encoder> =
+        Box::new(encode::NullEncoder::new(cfg.codec, cfg.encoder));
+    drop(std::mem::replace(encoder, placeholder));
+    if let Some(old) = producer.take() {
+        old.stop(mailbox);
+    }
+
+    let backend = capture::select_backend(Some(preferred_output));
+    let format = backend.format();
+    if format.width == 0 || format.height == 0 {
+        tracing::error!(
+            output = preferred_output,
+            "capture backend unavailable after display reconfigure"
+        );
+        return false;
+    }
+    *capture_backend = backend.name().to_string();
+    *capture_format = format.clone();
+    mailbox.reset(format.clone());
+    *latest_frame.lock().expect("thumbnail slot poisoned") = None;
+
+    *encoder = encode::create(cfg, &format);
+    let needs_raw_frames = encoder.needs_raw_frames();
+    raw_capture_enabled.store(needs_raw_frames, Ordering::Release);
+    match spawn_capture_producer(
+        backend,
+        mailbox.clone(),
+        latest_frame.clone(),
+        pipeline_start,
+        raw_capture_enabled.clone(),
+        shutdown.clone(),
+    ) {
+        Ok(new_producer) => *producer = Some(new_producer),
+        Err(err) => {
+            tracing::error!(%err, "failed to restart Wayland capture thread");
+            return false;
+        }
+    }
+    tracing::info!(
+        output = preferred_output,
+        resolution = format!("{}x{}", format.width, format.height),
+        restart_ms = restart_start.elapsed().as_millis(),
+        "capture pipeline rebuilt for display mode"
+    );
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn capture_loop(
     backend: Box<dyn capture::CaptureBackend>,
     mut encoder: Box<dyn encode::Encoder>,
     mut cfg: config::Config,
-    capture_format: capture::CaptureFormat,
+    mut capture_format: capture::CaptureFormat,
     mut sender: transport::VideoSender,
     events: std::sync::mpsc::Receiver<transport::ControlEvent>,
     control: transport::ControlSender,
     audio: Option<audio::AudioHandle>,
     latest_frame: discovery::LatestFrame,
+    input_geometry: input::InputGeometry,
     pipeline_start: Instant,
     shutdown: Arc<AtomicBool>,
 ) {
-    let capture_backend = backend.name().to_string();
+    let mut capture_backend = backend.name().to_string();
     let mailbox = Arc::new(CaptureMailbox::new(capture_format.clone()));
     let raw_capture_enabled = Arc::new(AtomicBool::new(encoder.needs_raw_frames()));
-    let capture_thread = match spawn_capture_producer(
+    let mut capture_producer = match spawn_capture_producer(
         backend,
         mailbox.clone(),
-        latest_frame,
+        latest_frame.clone(),
         pipeline_start,
         raw_capture_enabled.clone(),
         shutdown.clone(),
     ) {
-        Ok(handle) => handle,
+        Ok(producer) => Some(producer),
         Err(err) => {
             tracing::error!(%err, "failed to start Wayland capture thread");
             return;
@@ -458,8 +552,12 @@ fn capture_loop(
     let mut client_generation: Option<u64> = None;
     let mut window_start = Instant::now();
     while !shutdown.load(Ordering::Relaxed) {
-        // Control channel events (client connect/disconnect, keyframe
-        // requests) are handled between frames.
+        // Settings and display-size frames are adjacent on the same TCP
+        // stream. Retain only the newest of each while draining this turn so
+        // one UI action causes at most one capture/encoder rebuild.
+        let mut requested_settings = None;
+        let mut requested_resize = None;
+        let mut keyframe_requested = false;
         for event in events.try_iter() {
             match event {
                 transport::ControlEvent::ClientConnected { generation, ip } => {
@@ -486,62 +584,115 @@ fn capture_loop(
                     tracing::info!(generation, "client gone, video paused");
                 }
                 transport::ControlEvent::KeyframeRequest => {
-                    match encoder.request_keyframe() {
-                        Ok(()) => {
-                            tracing::info!("encoder will emit an in-process keyframe");
-                        }
-                        Err(err) => {
-                            // Compatibility path for ordinary GSR and FFmpeg
-                            // subprocesses, which cannot change pict_type
-                            // after launch.
-                            let restart_start = Instant::now();
-                            rebuild_encoder(
-                                &mut encoder,
-                                &cfg,
-                                &capture_format,
-                                &raw_capture_enabled,
-                                &mailbox,
-                            );
-                            pending_frames.clear();
-                            tracing::info!(
-                                %err,
-                                restart_ms = restart_start.elapsed().as_millis(),
-                                "encoder restarted for keyframe request"
-                            );
-                        }
-                    }
+                    keyframe_requested = true;
                 }
                 transport::ControlEvent::Settings(settings) => {
-                    // US-013 gaming mode: apply the requested framerate, codec,
-                    // bitrate, and latency bias, restart the encoder so the
-                    // next access unit is a fresh IDR in the new codec, and
-                    // send an updated hello. The client applies its own
-                    // request immediately, so a dropped hello does not strand
-                    // it on the old codec.
-                    if let Ok(fps) = config::Fps::new(settings.fps) {
-                        // A configured headless output is part of the capture
-                        // clock. Retiming it with the encoder avoids sampling
-                        // one cadence only to resample it again for the client.
-                        virtual_display::match_stream_refresh(cfg.virtual_display, settings.fps);
-                        cfg.fps = fps;
-                        frame_interval = Duration::from_secs_f64(1.0 / f64::from(fps.get()));
-                    } else {
-                        tracing::warn!(
-                            fps = settings.fps,
-                            "settings: unsupported fps, keeping current"
-                        );
-                    }
-                    cfg.codec = match settings.codec {
-                        porthole_agent::protocol::CodecTag::H264 => encode::Codec::H264,
-                        porthole_agent::protocol::CodecTag::Hevc => encode::Codec::Hevc,
-                    };
-                    cfg.bitrate_mbps = u32::from(settings.bitrate_mbps).max(1);
-                    cfg.low_latency = settings.low_latency;
-                    cfg.keyframe_interval_secs = if settings.low_latency {
-                        GAMING_KEYFRAME_INTERVAL_SECS
-                    } else {
-                        quality_keyframe_interval_secs
-                    };
+                    requested_settings = Some(settings);
+                }
+                transport::ControlEvent::DisplayResize(resize) => {
+                    requested_resize = Some(resize);
+                }
+            }
+        }
+
+        if let Some(settings) = requested_settings {
+            if let Ok(fps) = config::Fps::new(settings.fps) {
+                cfg.fps = fps;
+                frame_interval = Duration::from_secs_f64(1.0 / f64::from(fps.get()));
+            } else {
+                tracing::warn!(
+                    fps = settings.fps,
+                    "settings: unsupported fps, keeping current"
+                );
+            }
+            cfg.codec = match settings.codec {
+                porthole_agent::protocol::CodecTag::H264 => encode::Codec::H264,
+                porthole_agent::protocol::CodecTag::Hevc => encode::Codec::Hevc,
+            };
+            cfg.bitrate_mbps = u32::from(settings.bitrate_mbps).max(1);
+            cfg.low_latency = settings.low_latency;
+            cfg.keyframe_interval_secs = if settings.low_latency {
+                GAMING_KEYFRAME_INTERVAL_SECS
+            } else {
+                quality_keyframe_interval_secs
+            };
+        }
+
+        let mut desired_display = cfg.virtual_display;
+        if requested_settings.is_some() || requested_resize.is_some() {
+            if let Some(display) = desired_display.as_mut() {
+                // The headless output is the source clock; its refresh follows
+                // the capture ceiling while its pixels follow the viewport.
+                display.refresh_hz = u32::from(cfg.fps.get());
+                if let Some(resize) = requested_resize {
+                    display.width = resize.width;
+                    display.height = resize.height;
+                }
+            } else if let Some(resize) = requested_resize {
+                tracing::warn!(
+                    width = resize.width,
+                    height = resize.height,
+                    "display resize ignored: agent does not own a virtual display"
+                );
+            }
+        }
+
+        let mut stream_reconfigured = false;
+        if desired_display != cfg.virtual_display {
+            if let Some(output) = virtual_display::ensure(desired_display) {
+                cfg.virtual_display = desired_display;
+                stream_reconfigured = rebuild_capture_pipeline(
+                    &mut encoder,
+                    &cfg,
+                    &output,
+                    &mut capture_format,
+                    &mut capture_backend,
+                    &mut capture_producer,
+                    &mailbox,
+                    &latest_frame,
+                    pipeline_start,
+                    &raw_capture_enabled,
+                    &shutdown,
+                );
+                if stream_reconfigured {
+                    input_geometry.update(capture_format.width, capture_format.height);
+                }
+            } else {
+                tracing::warn!("virtual display reconfiguration was not applied");
+            }
+        }
+
+        if requested_settings.is_some() && !stream_reconfigured {
+            rebuild_encoder(
+                &mut encoder,
+                &cfg,
+                &capture_format,
+                &raw_capture_enabled,
+                &mailbox,
+            );
+            stream_reconfigured = true;
+        }
+
+        if stream_reconfigured {
+            pending_frames.clear();
+            next_submit = Instant::now();
+            let hello = hello_for(&cfg, &capture_format);
+            control.update_hello(hello);
+            control.try_send(porthole_agent::protocol::CONTROL_MSG_HELLO, &hello.encode());
+            tracing::info!(
+                resolution = format!("{}x{}", capture_format.width, capture_format.height),
+                fps_cap = cfg.fps.get(),
+                codec = %cfg.codec,
+                bitrate_mbps = cfg.bitrate_mbps,
+                keyframe_interval_secs = cfg.keyframe_interval_secs,
+                low_latency = cfg.low_latency,
+                "stream reconfigured"
+            );
+        } else if keyframe_requested {
+            match encoder.request_keyframe() {
+                Ok(()) => tracing::info!("encoder will emit an in-process keyframe"),
+                Err(err) => {
+                    let restart_start = Instant::now();
                     rebuild_encoder(
                         &mut encoder,
                         &cfg,
@@ -550,19 +701,10 @@ fn capture_loop(
                         &mailbox,
                     );
                     pending_frames.clear();
-                    next_submit = Instant::now();
-                    let hello = hello_for(&cfg, &capture_format);
-                    // Update both the connected client and the hello future
-                    // clients receive, so a reconnect is not told the old codec.
-                    control.update_hello(hello);
-                    control.try_send(porthole_agent::protocol::CONTROL_MSG_HELLO, &hello.encode());
                     tracing::info!(
-                        fps = cfg.fps.get(),
-                        codec = %cfg.codec,
-                        bitrate_mbps = cfg.bitrate_mbps,
-                        keyframe_interval_secs = cfg.keyframe_interval_secs,
-                        low_latency = cfg.low_latency,
-                        "stream reconfigured"
+                        %err,
+                        restart_ms = restart_start.elapsed().as_millis(),
+                        "encoder restarted for keyframe request"
                     );
                 }
             }
@@ -732,7 +874,9 @@ fn capture_loop(
     }
     shutdown.store(true, Ordering::Relaxed);
     mailbox.ready.notify_all();
-    let _ = capture_thread.join();
+    if let Some(producer) = capture_producer.take() {
+        producer.stop(&mailbox);
+    }
 }
 
 #[tokio::main]
@@ -796,7 +940,7 @@ async fn main() -> anyhow::Result<()> {
         // The pipeline clock: video datagram timestamps and pong answers
         // both count microseconds from here.
         let pipeline_start = Instant::now();
-        let input_tx = input::spawn(capture_format.width, capture_format.height);
+        let (input_tx, input_geometry) = input::spawn(capture_format.width, capture_format.height);
         // US-008: clipboard sync. The control reader forwards text the client
         // copied through clip_tx; the clipboard module applies it and watches
         // the Linux clipboard, sending changes back over the control channel.
@@ -852,6 +996,7 @@ async fn main() -> anyhow::Result<()> {
                     control,
                     audio,
                     latest_frame,
+                    input_geometry,
                     pipeline_start,
                     shutdown,
                 )
@@ -934,5 +1079,35 @@ mod pipeline_tests {
 
         mailbox.finish();
         assert!(mailbox.is_done_and_empty());
+    }
+
+    #[test]
+    fn capture_mailbox_reset_starts_a_fresh_generation() {
+        let mailbox = CaptureMailbox::new(capture::CaptureFormat::default());
+        mailbox.publish(captured(1));
+        mailbox.finish();
+
+        let format = capture::CaptureFormat {
+            width: 1920,
+            height: 1080,
+            ..capture::CaptureFormat::default()
+        };
+        mailbox.reset(format);
+        assert!(!mailbox.is_done_and_empty());
+        assert!(mailbox.take_timeout(Duration::ZERO).is_none());
+        assert_eq!(mailbox.take_window_counts(), (0, 0));
+        assert_eq!(
+            (mailbox.format().width, mailbox.format().height),
+            (1920, 1080)
+        );
+
+        mailbox.publish(captured(2));
+        assert_eq!(
+            mailbox
+                .take_timeout(Duration::ZERO)
+                .expect("new generation frame")
+                .captured_us,
+            2
+        );
     }
 }

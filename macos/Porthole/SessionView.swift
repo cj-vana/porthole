@@ -20,8 +20,8 @@ struct SessionView: View {
     @AppStorage("pointerLock") private var pointerLock = false
     /// Gaming mode (US-013): high-rate low-latency HEVC stream.
     @AppStorage("gamingMode") private var gamingMode = false
-    /// The gaming-mode stream rate. Maximum oversamples a 120/144 Hz panel to
-    /// prevent the remote capture clock from beating against local scanout.
+    /// The gaming-mode capture ceiling. VFR can deliver fewer real source
+    /// frames when the compositor has no changed buffer to send.
     @AppStorage("gamingFps") private var gamingFps = 288
     /// Latency HUD over the stream (US-013).
     @AppStorage("statsOverlay") private var statsOverlay = false
@@ -41,6 +41,9 @@ struct SessionView: View {
     /// not actually fullscreen; hiding chrome from preference alone would
     /// leave no local escape hatch.
     @State private var isNativeFullscreen = false
+    /// Manual chrome collapse is intentionally not persisted: every new
+    /// session starts with an obvious local control surface.
+    @State private var controlsHidden = false
     @State private var shortcutCapturePermissionRequired = false
     @StateObject private var session = StreamSession()
     /// Drag-and-drop file transfers to the connected machine (US-011).
@@ -58,13 +61,15 @@ struct SessionView: View {
                              lowLatency: gamingMode,
                              pointerLocked: session.pointerLockActive,
                              displayMode: displayMode,
-                             videoSize: videoSize,
                              renderer: session.renderer,
                              input: session.input,
-                             onFullscreenChanged: syncFullscreen)
+                             onFullscreenChanged: syncFullscreen,
+                             onViewportSizeChanged: session.setRemoteDisplaySize)
                 .id(session.surfaceGeneration)
 
-            if !exclusiveGamingSurface {
+            if controlsHidden, !exclusiveGamingSurface {
+                revealControlsButton
+            } else if !exclusiveGamingSurface {
                 VStack(spacing: 8) {
                     statusBar
                     controlBar
@@ -75,7 +80,7 @@ struct SessionView: View {
         .overlay(alignment: .topTrailing) {
             if statsOverlay, case .live = session.state, !exclusiveGamingSurface {
                 StatsHUD(stats: session.latency)
-                    .padding(.top, 124)
+                    .padding(.top, controlsHidden ? 16 : 124)
                     .padding(.trailing, 16)
             }
         }
@@ -93,9 +98,6 @@ struct SessionView: View {
         .preferredColorScheme(.dark)
         .navigationTitle(machine.name)
         .onAppear {
-            if gamingMode, displayMode != .fullscreen {
-                displayMode = .fullscreen
-            }
             applySystemShortcutSetting(sendSystemShortcuts)
             session.input.wantsPointerLock = pointerLock
             session.audio.setVolume(Float(audioVolume))
@@ -124,9 +126,6 @@ struct SessionView: View {
             session.input.wantsPointerLock = newValue
         }
         .onChange(of: gamingMode) { _, enabled in
-            if enabled, displayMode != .fullscreen {
-                displayMode = .fullscreen
-            }
             session.setGamingMode(enabled, fps: gamingFps)
         }
         .onChange(of: gamingFps) { _, fps in
@@ -149,6 +148,7 @@ struct SessionView: View {
             session.disconnect()
             host = newMachine.host
             displayMode = DisplayMode.stored(forMachine: newMachine.id)
+            controlsHidden = false
             connect()
         }
         .alert("Allow Shortcut Capture",
@@ -160,15 +160,6 @@ struct SessionView: View {
         } message: {
             Text("Enable Porthole in Privacy & Security > Accessibility, then turn Shortcuts on again.")
         }
-    }
-
-    /// Remote video size in pixels once known; .zero keeps one-to-one on
-    /// the fit fallback until the stream is live.
-    private var videoSize: CGSize {
-        if case .live(let width, let height, _) = session.state {
-            return CGSize(width: width, height: height)
-        }
-        return .zero
     }
 
     /// A fullscreen gaming frame should be one opaque Metal surface. The
@@ -244,6 +235,13 @@ struct SessionView: View {
                 }
             }
             .disabled(host.isEmpty)
+            Button {
+                controlsHidden = true
+            } label: {
+                Image(systemName: "chevron.up")
+            }
+            .buttonStyle(.borderless)
+            .help("Hide Porthole controls")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
@@ -260,12 +258,12 @@ struct SessionView: View {
             }
             .pickerStyle(.segmented)
             .fixedSize()
-            .help("Fit letterboxes; 1:1 shows one video pixel per screen pixel; Full is native fullscreen")
-            Picker("Frame rate", selection: $targetFrameRate) {
+            .help("Fit adapts the Linux display to this window; Full adapts it to native fullscreen")
+            Picker("Local display", selection: $targetFrameRate) {
                 Text("Auto").tag(0)
-                Text("60").tag(60)
-                Text("120").tag(120)
-                Text("144").tag(144)
+                Text("60 Hz").tag(60)
+                Text("120 Hz").tag(120)
+                Text("144 Hz").tag(144)
             }
             .pickerStyle(.segmented)
             .fixedSize()
@@ -273,17 +271,17 @@ struct SessionView: View {
             Toggle("Gaming", isOn: $gamingMode)
                 .toggleStyle(.switch)
                 .controlSize(.small)
-                .help("High-rate HEVC with the encoder biased toward latency; off returns to 60 fps H.264")
+                .help("High-rate HEVC with the encoder biased toward latency; off returns to a 60 fps H.264 ceiling")
             if gamingMode {
-                Picker("Gaming frame rate", selection: $gamingFps) {
-                    Text("120").tag(120)
-                    Text("144").tag(144)
-                    Text("Ultra 180").tag(180)
-                    Text("Maximum 288").tag(288)
+                Picker("Capture ceiling", selection: $gamingFps) {
+                    Text("Max 120").tag(120)
+                    Text("Max 144").tag(144)
+                    Text("Max 180").tag(180)
+                    Text("Max 288").tag(288)
                 }
                 .pickerStyle(.segmented)
                 .fixedSize()
-                .help("Maximum requests 288 Hz; VFR sends only real compositor frames")
+                .help("A ceiling, not a promise: VFR sends only real compositor frames; Stats shows delivered rates")
             }
             Toggle("Stats", isOn: $statsOverlay)
                 .toggleStyle(.switch)
@@ -327,6 +325,24 @@ struct SessionView: View {
         }
     }
 
+    /// A visible, pointer-operable escape hatch even when Shortcuts captures
+    /// every local key chord. Exclusive fullscreen gaming intentionally omits
+    /// it; unmodified Escape exits that mode without compositor overlay cost.
+    private var revealControlsButton: some View {
+        Button {
+            controlsHidden = false
+        } label: {
+            Image(systemName: "chevron.down")
+                .font(.headline)
+                .padding(.horizontal, 18)
+                .padding(.vertical, 4)
+                .background(.ultraThinMaterial, in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .padding(.top, 4)
+        .help("Show Porthole controls")
+    }
+
     /// Files dropped on the session window transfer to the connected
     /// machine (US-011). Gated on the live state: only then is
     /// connectedHost the candidate that actually answered, rather than
@@ -368,7 +384,7 @@ struct SessionView: View {
         case .waitingForKeyframe:
             return "Waiting for keyframe..."
         case .live(let width, let height, let fps):
-            return "Live \(width)x\(height)@\(fps)"
+            return "Live \(width)x\(height) · cap ≤\(fps) fps"
         }
     }
 }
@@ -382,7 +398,10 @@ private struct StatsHUD: View {
 
     var body: some View {
         Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 3) {
-            row("fps", stats.decodedFps.map(String.init))
+            row("source fps", stats.sourceFps.map(String.init))
+            row("encoded fps", stats.encodedFps.map(String.init))
+            row("decoded fps", stats.decodedFps.map(String.init))
+            row("presented fps", stats.presentedFps.map(String.init))
             row("present", milliseconds(stats.capturePresentMs))
             row("encode", milliseconds(stats.encodeMs))
             row("network", milliseconds(stats.networkMs))

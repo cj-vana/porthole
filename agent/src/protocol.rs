@@ -87,9 +87,18 @@ pub const CONTROL_MSG_PONG: u8 = 4;
 pub const CONTROL_MSG_AGENT_STATS: u8 = 5;
 /// Control message type: client -> agent stream reconfiguration (US-013).
 pub const CONTROL_MSG_SETTINGS: u8 = 6;
+/// Control message type: client -> agent virtual-display geometry.
+pub const CONTROL_MSG_DISPLAY_RESIZE: u8 = 9;
 
 /// settings payload length.
 pub const SETTINGS_PAYLOAD_LEN: usize = 6;
+/// display_resize payload length.
+pub const DISPLAY_RESIZE_PAYLOAD_LEN: usize = 8;
+/// Smallest useful encoder-safe virtual display.
+pub const MIN_DISPLAY_WIDTH: u32 = 320;
+pub const MIN_DISPLAY_HEIGHT: u32 = 180;
+/// Bound remote allocation and Hyprland mode requests to a practical 8K box.
+pub const MAX_DISPLAY_DIMENSION: u32 = 8192;
 
 /// Stream reconfiguration a client asks for at runtime (gaming mode,
 /// US-013): a different framerate, codec, or bitrate, and whether to bias
@@ -124,6 +133,39 @@ impl Settings {
             bitrate_mbps: u16::from_be_bytes(payload[3..5].try_into().ok()?),
             low_latency: payload[5] != 0,
         })
+    }
+}
+
+/// Requested headless-output geometry. Chroma-subsampled hardware encoders
+/// require even dimensions, so validation happens at the trust boundary
+/// before the request can reach Hyprland or allocate capture buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayResize {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl DisplayResize {
+    pub fn new(width: u32, height: u32) -> Option<Self> {
+        let valid = (MIN_DISPLAY_WIDTH..=MAX_DISPLAY_DIMENSION).contains(&width)
+            && (MIN_DISPLAY_HEIGHT..=MAX_DISPLAY_DIMENSION).contains(&height)
+            && width.is_multiple_of(2)
+            && height.is_multiple_of(2);
+        valid.then_some(Self { width, height })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        [self.width.to_be_bytes(), self.height.to_be_bytes()].concat()
+    }
+
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        if payload.len() != DISPLAY_RESIZE_PAYLOAD_LEN {
+            return None;
+        }
+        Self::new(
+            u32::from_be_bytes(payload[0..4].try_into().ok()?),
+            u32::from_be_bytes(payload[4..8].try_into().ok()?),
+        )
     }
 }
 
@@ -1311,6 +1353,27 @@ mod tests {
         let (t, p) = read_control_message(&mut cursor).unwrap().expect("message");
         assert_eq!(t, CONTROL_MSG_SETTINGS);
         assert_eq!(Settings::decode(&p), Some(settings));
+    }
+
+    #[test]
+    fn display_resize_round_trip_and_bounds() {
+        let resize = DisplayResize::new(3456, 2234).expect("valid Retina viewport");
+        let payload = resize.encode();
+        assert_eq!(payload.len(), DISPLAY_RESIZE_PAYLOAD_LEN);
+        assert_eq!(DisplayResize::decode(&payload), Some(resize));
+
+        let framed = encode_control_message(CONTROL_MSG_DISPLAY_RESIZE, &payload);
+        let mut cursor = std::io::Cursor::new(framed);
+        let (message_type, decoded) = read_control_message(&mut cursor).unwrap().expect("message");
+        assert_eq!(message_type, CONTROL_MSG_DISPLAY_RESIZE);
+        assert_eq!(DisplayResize::decode(&decoded), Some(resize));
+
+        assert!(DisplayResize::new(319, 1080).is_none());
+        assert!(DisplayResize::new(1920, 179).is_none());
+        assert!(DisplayResize::new(8194, 4320).is_none());
+        assert!(DisplayResize::new(1921, 1080).is_none());
+        assert!(DisplayResize::new(1920, 1081).is_none());
+        assert!(DisplayResize::decode(&payload[..7]).is_none());
     }
 
     #[test]

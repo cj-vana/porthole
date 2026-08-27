@@ -95,6 +95,12 @@ final class ControlChannel {
         connection?.send(content: frame, completion: .contentProcessed { _ in })
     }
 
+    /// Resize the agent-owned virtual output after the local viewport settles.
+    func sendDisplayResize(width: UInt32, height: UInt32) {
+        let frame = WireProtocol.encodeDisplayResize(width: width, height: height)
+        connection?.send(content: frame, completion: .contentProcessed { _ in })
+    }
+
     /// Clipboard text sync (US-008): UTF-8 payload, no trailing NUL. An
     /// empty string clears the remote selection.
     func sendClipboard(_ text: String) {

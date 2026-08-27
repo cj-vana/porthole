@@ -7,12 +7,9 @@ import Foundation
 /// rewriting machines.json plus activeSessionMachine for a view preference
 /// would ripple a disconnect/reconnect through onChange(of: machine).
 enum DisplayMode: String, CaseIterable, Identifiable {
-    /// Aspect-fit letterbox into the window (the US-005 behavior).
+    /// Adapt the remote virtual display to the window and aspect-fit it.
     case fit
-    /// One video pixel on one backing-store pixel, scrollable, for
-    /// razor-sharp text; see SurfaceHostView.layoutSurface.
-    case oneToOne
-    /// Native macOS fullscreen in its own Space, letterboxed like fit.
+    /// Native macOS fullscreen in its own Space, also source-size adaptive.
     case fullscreen
 
     var id: String { rawValue }
@@ -21,7 +18,6 @@ enum DisplayMode: String, CaseIterable, Identifiable {
     var label: String {
         switch self {
         case .fit: return "Fit"
-        case .oneToOne: return "1:1"
         case .fullscreen: return "Full"
         }
     }

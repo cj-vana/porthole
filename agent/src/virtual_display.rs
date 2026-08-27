@@ -17,15 +17,6 @@ pub fn ensure(requested: Option<VirtualDisplay>) -> Option<String> {
     imp::ensure(requested)
 }
 
-/// Match a configured headless output to a live stream rate. Physical
-/// monitors are left untouched by the same safety check as startup setup.
-#[cfg(target_os = "linux")]
-pub fn match_stream_refresh(requested: Option<VirtualDisplay>, refresh_hz: u16) {
-    let Some(mut display) = requested else { return };
-    display.refresh_hz = u32::from(refresh_hz);
-    let _ = imp::ensure(Some(display));
-}
-
 /// Ensure XDG_RUNTIME_DIR and WAYLAND_DISPLAY are set so the Wayland client
 /// can connect even from a bare SSH shell or a minimal systemd unit. Values
 /// already in the env win; otherwise derived from /run/user/<uid>/.
@@ -62,9 +53,6 @@ pub fn ensure(requested: Option<VirtualDisplay>) -> Option<String> {
     }
     None
 }
-
-#[cfg(not(target_os = "linux"))]
-pub fn match_stream_refresh(_requested: Option<VirtualDisplay>, _refresh_hz: u16) {}
 
 #[cfg(target_os = "linux")]
 mod imp {

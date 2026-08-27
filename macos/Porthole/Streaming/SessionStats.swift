@@ -8,8 +8,13 @@ struct LatencyStats: Equatable {
     /// Capture on the agent to the drawable's compositor-reported presentation.
     var capturePresentMs: Double?
     var rttMs: Double?
+    /// Measured source captures and encoded access units from the agent.
+    var sourceFps: Int?
+    var encodedFps: Int?
     /// Frames decoded in the last second.
     var decodedFps: Int?
+    /// Drawables whose presentation was reported in the last second.
+    var presentedFps: Int?
     /// Mean decode wall time over the last second.
     var decodeMs: Double?
     /// Agent-side mean from frame submit to access unit ready.
@@ -257,7 +262,10 @@ struct StatsWindow {
     func snapshot(rttMicros: UInt64?, agentStats: AgentStats?) -> LatencyStats {
         LatencyStats(capturePresentMs: captureToPresented.milliseconds,
                      rttMs: rttMicros.map { Double($0) / 1000 },
+                     sourceFps: agentStats.map { Int($0.captureFps) },
+                     encodedFps: agentStats.map { Int($0.encodeFps) },
                      decodedFps: decoded,
+                     presentedFps: presented,
                      decodeMs: decoded > 0 ? averageDecodeMs : nil,
                      encodeMs: agentStats.map { Double($0.encodeLatencyMicros) / 1000 },
                      lossPercent: UInt64(completed) + lost > 0 ? lossPercent : nil)

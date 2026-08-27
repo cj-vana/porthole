@@ -200,9 +200,15 @@ Chrome toggles (both persisted):
   pointer_motion_rel deltas (NSEvent deltaX/deltaY, 1/256 px units) for games
   and 3D apps. It engages only while the surface has focus and Esc releases it.
 
-## Frame rate
+## Display size and frame rates
 
-The "Frame rate" control in the session chrome sets the display link that
+Fit and Full both report the Metal surface's backing-pixel viewport to the
+agent. After a 300 ms resize settle, an agent-owned Hyprland headless output
+is reconfigured to that geometry; capture, encoding, absolute-pointer mapping,
+and the decoder's fresh IDR then move together. Agents never resize physical
+monitors. A legacy stored 1:1 preference migrates to Fit automatically.
+
+The "Local display" control in the session chrome sets the display link that
 drives the Metal surface: Auto (the default), 60, 120, or 144, persisted
 across launches. Auto resolves to the maximum refresh rate of the screen the
 window is on and is re-evaluated when the view lands in a window and whenever
@@ -212,9 +218,11 @@ above the panel's maximum is clamped by the display link, and the test
 pattern's ticker shows it: cells advance at the selected rate while only 60
 draws happen per second, so the clamp appears as skipped cells.
 
-Gaming has a separate source-rate control. Maximum requests 288 Hz HEVC even
+Gaming has a separate capture-ceiling control. Max 288 requests 288 Hz HEVC even
 on a 120/144 Hz client panel; VFR sends only real frames (about 214 Hz on the
-2560x1440 test host). The deliberate oversampling prevents independent
+2560x1440 test host). The labels deliberately say Max: this is not a claim
+that 288 frames were delivered. Stats reports measured source, encoded,
+decoded, and presented rates separately. The deliberate oversampling prevents independent
 capture and scanout clocks from slowly beating into doubled and missed frames.
 Core Video supplies the physical display's phase and period once; an
 independent mach-time cadence wheel then remains evenly phase-locked even when
@@ -279,12 +287,13 @@ device) is logged and costs sound only; the session stays up on video.
   (`ThumbnailFetcher`).
 - `Porthole/SessionView.swift` is the session screen: Metal surface, floating
   chrome with status text and the latency readout, captured/lock indicators,
-  the Auto/60/120/144 display control, the 120/144/180/Maximum 288 gaming source
-  control, the two input toggles, audio controls, host field, and connect button.
+  Fit/Full sizing, the Auto/60/120/144 Hz local-display control, the
+  Max 120/144/180/288 capture-ceiling control, measured-rate Stats, collapsible
+  controls, input toggles, audio controls, host field, and connect button.
 - `Porthole/Streaming/WireProtocol.swift` implements the v1 wire format:
   length-prefixed TCP control frames, `hello`, `pong`, and `agent_stats`
-  parsing, `ping` encoding, the message type table including the 0x10-0x15
-  input types, the 25-byte video datagram header, and the 16-byte audio
+  parsing, `ping`, settings, and display-resize encoding, the message type
+  table including the 0x10-0x15 input types, the 25-byte video datagram header, and the 16-byte audio
   datagram header.
 - `Porthole/Streaming/ControlChannel.swift` is the TCP client
   (Network.framework, TCP_NODELAY). keyframe_request throttled to one per

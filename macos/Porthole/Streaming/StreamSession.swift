@@ -4,6 +4,28 @@ import CoreVideo
 import Foundation
 import os
 
+/// Encoder-safe virtual-display geometry normalized from an AppKit backing
+/// rectangle. The agent independently enforces the same trust boundary.
+private struct RemoteDisplaySize: Equatable {
+    static let minWidth = 320
+    static let minHeight = 180
+    static let maxDimension = 8_192
+
+    let width: UInt32
+    let height: UInt32
+
+    init?(_ size: CGSize) {
+        guard size.width.isFinite, size.height.isFinite,
+              size.width > 0, size.height > 0 else { return nil }
+        let boundedWidth = min(max(Int(size.width.rounded(.down)), Self.minWidth),
+                               Self.maxDimension)
+        let boundedHeight = min(max(Int(size.height.rounded(.down)), Self.minHeight),
+                                Self.maxDimension)
+        width = UInt32(boundedWidth - boundedWidth % 2)
+        height = UInt32(boundedHeight - boundedHeight % 2)
+    }
+}
+
 /// Owns one streaming session: TCP control channel, UDP video receiver,
 /// fragment reassembly, hardware decode, and handoff of decoded frames to
 /// the Metal renderer. One instance lives for the app's lifetime; connect
@@ -67,6 +89,11 @@ final class StreamSession: ObservableObject {
     private var needsKeyframe = true
     /// The stored gaming toggle has been applied to this session (US-013).
     private var appliedStoredSettings = false
+    /// The latest AppKit viewport and the most recent resize sent. Decode
+    /// queue only; desired size survives reconnects within this session view.
+    private var desiredDisplaySize: RemoteDisplaySize?
+    private var sentDisplaySize: RemoteDisplaySize?
+    private var displayResizeWorkItem: DispatchWorkItem?
     /// Sequence of the access unit currently inside decode(); valid because
     /// the decode queue is serial and decoding is synchronous.
     private var decodingSequence: UInt64?
@@ -115,6 +142,11 @@ final class StreamSession: ObservableObject {
         appliedStoredSettings = false
         highestSubmittedSequence = nil
         consecutiveEmptySeconds = 0
+        decodeQueue.sync {
+            displayResizeWorkItem?.cancel()
+            displayResizeWorkItem = nil
+            sentDisplaySize = nil
+        }
         if connectStartedAt == nil {
             connectStartedAt = Date()
         }
@@ -134,6 +166,9 @@ final class StreamSession: ObservableObject {
         audioReceiver.stop()
         audio.stop()
         decodeQueue.sync {
+            displayResizeWorkItem?.cancel()
+            displayResizeWorkItem = nil
+            sentDisplaySize = nil
             decoder.invalidate()
             clockOffset.reset()
             latestAgentStats = nil
@@ -155,6 +190,18 @@ final class StreamSession: ObservableObject {
     /// touching the connection.
     func setClipboardSync(_ enabled: Bool) {
         peripherals.clipboardEnabled = enabled
+    }
+
+    /// AppKit reports every layout change; exact deduplication plus a short
+    /// settle delay turns an interactive drag into one remote mode change.
+    func setRemoteDisplaySize(_ size: CGSize) {
+        guard let normalized = RemoteDisplaySize(size) else { return }
+        decodeQueue.async { [weak self] in
+            guard let self, self.desiredDisplaySize != normalized else { return }
+            self.desiredDisplaySize = normalized
+            guard self.appliedStoredSettings else { return }
+            self.scheduleDisplayResize()
+        }
     }
 
     private func wireDialer() {
@@ -415,11 +462,21 @@ extension StreamSession {
             self?.input.videoSize = CGSize(width: Int(hello.width), height: Int(hello.height))
         }
         logger.info("""
-            hello: codec \(hello.codec.rawValue), \(hello.width)x\(hello.height)@\(hello.fps), \
+            hello: codec \(hello.codec.rawValue), \(hello.width)x\(hello.height), cap \(hello.fps) fps, \
             keyframe every \(hello.keyframeIntervalSecs)s, video port \(hello.videoPort)
             """)
         if decoder.select(hello.codec) {
             needsKeyframe = true
+        }
+        let helloSize = RemoteDisplaySize(
+            CGSize(width: Int(hello.width), height: Int(hello.height))
+        )
+        if helloSize == desiredDisplaySize {
+            displayResizeWorkItem?.cancel()
+            displayResizeWorkItem = nil
+            sentDisplaySize = helloSize
+        } else if previous != nil, appliedStoredSettings {
+            scheduleDisplayResize()
         }
         guard let previous else {
             setState(.waitingForKeyframe)
@@ -440,6 +497,9 @@ extension StreamSession {
         if previous.videoPort != hello.videoPort {
             video.stop()
             guard bindVideo(port: hello.videoPort) else { return }
+        }
+        if previous.width != hello.width || previous.height != hello.height {
+            needsKeyframe = true
         }
         if case .live = state {
             setState(.live(width: Int(hello.width), height: Int(hello.height), fps: Int(hello.fps)))
@@ -462,7 +522,9 @@ extension StreamSession {
     /// reconfigured hello, which is advisory (docs/protocol.md "settings").
     func setGamingMode(_ enabled: Bool, fps: Int = 144) {
         decodeQueue.async { [weak self] in
-            self?.apply(enabled ? .gaming(fps: fps) : .quality)
+            guard let self else { return }
+            self.apply(enabled ? .gaming(fps: fps) : .quality)
+            self.sendDisplayResizeIfNeeded()
         }
     }
 
@@ -486,13 +548,42 @@ extension StreamSession {
         guard !appliedStoredSettings else { return }
         appliedStoredSettings = true
         let stored = StreamSettings.stored()
-        if stored != .quality, let hello, !stored.matches(hello) {
-            // This runs inside the frame-decoded callback, which is nested in
-            // a synchronous decode. apply() switches the decoder and
-            // invalidates the current session, so it must not run here: doing
-            // so invalidates a VideoToolbox session from within its own decode
-            // callback and deadlocks the wait. Defer it to the next queue turn.
-            decodeQueue.async { [weak self] in self?.apply(stored) }
+        let shouldApplySettings = stored != .quality && hello.map { !stored.matches($0) } == true
+        // This runs inside the frame-decoded callback, nested in synchronous
+        // VideoToolbox decode. Switching the decoder here would invalidate its
+        // own callback. The next queue turn also lets settings and resize ride
+        // the TCP stream back-to-back for one agent-side rebuild.
+        decodeQueue.async { [weak self] in
+            guard let self else { return }
+            if shouldApplySettings {
+                self.apply(stored)
+            }
+            self.sendDisplayResizeIfNeeded()
         }
+    }
+
+    private func scheduleDisplayResize() {
+        displayResizeWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.sendDisplayResizeIfNeeded()
+        }
+        displayResizeWorkItem = work
+        decodeQueue.asyncAfter(deadline: .now() + .milliseconds(300), execute: work)
+    }
+
+    private func sendDisplayResizeIfNeeded() {
+        displayResizeWorkItem?.cancel()
+        displayResizeWorkItem = nil
+        let remoteSizeChanged = desiredDisplaySize.map {
+            $0.width != hello?.width || $0.height != hello?.height
+        } == true
+        guard let desiredDisplaySize,
+              desiredDisplaySize != sentDisplaySize,
+              remoteSizeChanged else { return }
+        sentDisplaySize = desiredDisplaySize
+        needsKeyframe = true
+        control.sendDisplayResize(width: desiredDisplaySize.width,
+                                  height: desiredDisplaySize.height)
+        logger.info("requested display size \(desiredDisplaySize.width)x\(desiredDisplaySize.height)")
     }
 }

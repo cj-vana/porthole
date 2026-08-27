@@ -43,8 +43,9 @@ It is two programs that share one wire protocol:
 - Native Mac input: pixel-precise trackpad scrolling, modifier keys, exclusive
   remote shortcut capture (including Command-Space and Command-Tab), a
   pointer-lock mode for games, and a single on-screen cursor.
-- Display modes: fit, 1:1 native pixels (razor-sharp text, scrollable), and
-  fullscreen in its own Space.
+- Display modes: adaptive Fit and native Full. The Linux headless output
+  follows the settled Mac viewport in backing pixels instead of encoding a
+  fixed source only to rescale it locally.
 - Two-way clipboard sync, desktop audio (Opus), file drag and drop, and
   gamepad passthrough.
 
