@@ -27,12 +27,11 @@ use porthole_agent::protocol::{self, Hello, InputEvent};
 use crate::config::Config;
 use crate::encode::EncodedFrame;
 
-/// Normal access units can use a gigabit burst on the tested 2.5 GbE LAN,
-/// cutting their serialization below half a millisecond. Oversized units
-/// (normally IDRs) stay at the proven conservative rate: hundreds of UDP
-/// packets at a gigabit can overflow a NIC or tunnel ring even when the
-/// receiver's socket buffer is large enough.
-const FAST_PACING_RATE_BPS: f64 = 1e9;
+/// Normal access units can ride the tested 2.5 GbE LAN at line rate. Overlay
+/// peers retain the proven gigabit ceiling because userspace tunnel rings are
+/// much easier to overrun than a hardware receive queue.
+const DIRECT_LAN_FAST_PACING_RATE_BPS: f64 = 2.5e9;
+const TUNNEL_FAST_PACING_RATE_BPS: f64 = 1e9;
 const LARGE_FRAME_PACING_RATE_BPS: f64 = 400e6;
 const FAST_FRAME_MAX_BYTES: usize = 256 * 1024;
 /// Sleeps shorter than this are skipped; the deficit carries into the next
@@ -42,6 +41,18 @@ const MIN_PACING_SLEEP: Duration = Duration::from_micros(50);
 /// dropping. Stats and pongs are tiny and best effort; a full queue means
 /// the client stopped reading.
 const WRITER_QUEUE_DEPTH: usize = 64;
+
+fn fast_pacing_rate(ip: IpAddr) -> f64 {
+    let direct = match ip {
+        IpAddr::V4(ip) => ip.is_private() || ip.is_link_local() || ip.is_loopback(),
+        IpAddr::V6(ip) => ip.is_unique_local() || ip.is_unicast_link_local() || ip.is_loopback(),
+    };
+    if direct {
+        DIRECT_LAN_FAST_PACING_RATE_BPS
+    } else {
+        TUNNEL_FAST_PACING_RATE_BPS
+    }
+}
 
 /// Events from the control channel toward the capture/encode pipeline.
 #[derive(Debug)]
@@ -475,7 +486,7 @@ impl VideoSender {
         let pacing_rate = if frame.is_keyframe || frame.data.len() > FAST_FRAME_MAX_BYTES {
             LARGE_FRAME_PACING_RATE_BPS
         } else {
-            FAST_PACING_RATE_BPS
+            fast_pacing_rate(client.ip())
         };
         let burst_start = Instant::now();
         let mut burst_bytes = 0u64;
@@ -502,5 +513,35 @@ impl VideoSender {
             self.bytes_sent += dgram.len() as u64;
         }
         Ok(Some(seq))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn direct_lan_frames_use_line_rate_pacing() {
+        assert_eq!(
+            fast_pacing_rate(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 67))),
+            DIRECT_LAN_FAST_PACING_RATE_BPS
+        );
+        assert_eq!(
+            fast_pacing_rate(IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1))),
+            DIRECT_LAN_FAST_PACING_RATE_BPS
+        );
+    }
+
+    #[test]
+    fn overlay_and_public_frames_keep_tunnel_pacing() {
+        assert_eq!(
+            fast_pacing_rate(IpAddr::V4(Ipv4Addr::new(100, 105, 41, 71))),
+            TUNNEL_FAST_PACING_RATE_BPS
+        );
+        assert_eq!(
+            fast_pacing_rate(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))),
+            TUNNEL_FAST_PACING_RATE_BPS
+        );
     }
 }

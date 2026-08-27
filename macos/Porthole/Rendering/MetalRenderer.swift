@@ -1,17 +1,9 @@
 import CoreVideo
 import MetalKit
 import QuartzCore
-
-/// Draws the session surface: the decoded video stream when connected, the
-/// US-004 procedural test pattern otherwise.
-///
-/// Stream frames arrive as NV12 CVPixelBuffers from VideoToolbox on the
-/// decode queue and are converted to Metal textures per draw via
-/// CVMetalTextureCache (zero-copy off the IOSurface). The video quad is
-/// aspect-fit (letterboxed) into the drawable, which is at native Retina
-/// resolution. YCbCr conversion happens in the fragment shader with the
-/// matrix reported by the SPS VUI (BT.709 default for HD).
-///
+/// Draws decoded video while connected and the US-004 test pattern otherwise.
+/// VideoToolbox's NV12 IOSurfaces map into zero-copy Metal textures; the shader
+/// applies SPS color state and letterboxes into the native-Retina drawable.
 /// Presentation timing: while a stream is live the view's display link is
 /// paused. Quality mode asks MTKView for a draw on arrival. Gaming mode skips
 /// MTKView and the main thread entirely: the decode queue writes a newest-only
@@ -61,9 +53,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
 
     let device: MTLDevice
 
-    /// The surface this renderer draws into; attached by MetalSurfaceView on
-    /// the main thread. Gaming draws retain only its CAMetalLayer while the
-    /// normal MTKView path continues to use this weak reference.
+    /// Gaming retains the attached surface's layer; quality uses the view.
     private weak var view: MTKView?
     private weak var streamLayer: CAMetalLayer?
 
@@ -75,9 +65,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     var onFrameRenderCompleted: ((RenderCompletionTiming) -> Void)?
 
     private let commandQueue: MTLCommandQueue
-    /// Serial within one swapchain generation. A fullscreen transition may
-    /// strand `nextDrawable()` in the old generation indefinitely, so resume
-    /// replaces this lane instead of putting the new layer behind that wait.
+    /// Replaced when a swapchain transition could strand `nextDrawable()`.
     private var directRenderQueue = DispatchQueue(label: "com.porthole.mac.direct-scanout.0",
                                                   qos: .userInteractive)
     private var directRenderQueueGeneration: UInt64 = 0
@@ -155,15 +143,16 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
 
     // MARK: Stream frame handoff (called from the decode queue)
 
-    /// Main-thread attachment when SwiftUI creates the surface and whenever
-    /// MTKView reports that its concrete CAMetalLayer is ready.
+    /// Main-thread attachment when MTKView's CAMetalLayer is ready.
     /// `nextDrawable()` is explicitly designed to be called from a
     /// rendering thread, so gaming mode keeps the layer and never touches the
     /// AppKit view off-main.
     func attach(view: MTKView) {
         self.view = view
+        let layer = view.layer as? CAMetalLayer
         frameLock.lock()
-        streamLayer = view.layer as? CAMetalLayer
+        if streamLayer !== layer { rotateDirectRenderQueueLocked() }
+        streamLayer = layer
         activeRenderToken = nil
         let token = !presentationSuspended && latestFrame != nil
             ? reserveRenderTokenLocked()
@@ -188,16 +177,18 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         self.view = view
         frameLock.lock()
         streamLayer = view.layer as? CAMetalLayer
-        directRenderQueueGeneration &+= 1
-        directRenderQueue = DispatchQueue(
-            label: "com.porthole.mac.direct-scanout.\(directRenderQueueGeneration)",
-            qos: .userInteractive
-        )
+        rotateDirectRenderQueueLocked()
         presentationSuspended = false
         activeRenderToken = nil
         let token = latestFrame != nil ? reserveRenderTokenLocked() : nil
         frameLock.unlock()
         if let token { scheduleRender(token: token) }
+    }
+
+    private func rotateDirectRenderQueueLocked() {
+        directRenderQueueGeneration &+= 1
+        let label = "com.porthole.mac.direct-scanout.\(directRenderQueueGeneration)"
+        directRenderQueue = DispatchQueue(label: label, qos: .userInteractive)
     }
 
     /// Switch between MTKView's synchronized quality path and direct gaming

@@ -20,6 +20,8 @@ struct MetalSurfaceView: NSViewRepresentable {
     /// Gaming mode may present between display-link ticks to minimize the
     /// decoded-frame-to-scanout delay. Quality mode remains synchronized.
     let lowLatency: Bool
+    /// Two minimizes queueing; three is the adaptive cadence-recovery path.
+    let drawablePoolDepth: Int
     /// Pointer lock state, so the view can refresh its cursor rects on
     /// transitions (the cursor itself is decided in SessionSurfaceView).
     let pointerLocked: Bool
@@ -43,16 +45,17 @@ struct MetalSurfaceView: NSViewRepresentable {
         let surface = SessionSurfaceView(frame: .zero, device: context.coordinator.device)
         surface.inputHandler = input
         surface.delegate = context.coordinator
-        context.coordinator.attach(view: surface)
-        context.coordinator.setLowLatencyPresentation(lowLatency)
         surface.colorPixelFormat = MetalRenderer.pixelFormat
         surface.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
-        // Idle: the display link drives the test pattern. Live: the renderer
-        // pauses the link and draws as frames arrive (see MetalRenderer.display).
+        // Idle uses the display link; live streaming pauses it and presents on
+        // decoded-frame arrival (see MetalRenderer.display).
         surface.targetFrameRate = frameRate
+        surface.lowLatencyDrawableCount = drawablePoolDepth
         surface.lowLatencyPresentation = lowLatency
         surface.isPaused = false
         surface.enableSetNeedsDisplay = false
+        context.coordinator.attach(view: surface)
+        context.coordinator.setLowLatencyPresentation(lowLatency)
         let host = SurfaceHostView(surface: surface, renderer: context.coordinator)
         host.onFullscreenChanged = onFullscreenChanged
         return host
@@ -61,6 +64,7 @@ struct MetalSurfaceView: NSViewRepresentable {
     func updateNSView(_ nsView: SurfaceHostView, context: Context) {
         nsView.onFullscreenChanged = onFullscreenChanged
         nsView.surface.targetFrameRate = frameRate
+        nsView.surface.lowLatencyDrawableCount = drawablePoolDepth
         nsView.surface.lowLatencyPresentation = lowLatency
         renderer.setLowLatencyPresentation(lowLatency)
         nsView.surface.pointerLocked = pointerLocked
@@ -100,6 +104,11 @@ final class SurfaceHostView: NSScrollView {
     /// first request before its animation begins.
     private var fullscreenTogglePending = false
     private var fullscreenRetryCount = 0
+    /// AppKit can finish moving a window between Spaces without delivering
+    /// the matching did-enter/did-exit notification. In that case the
+    /// renderer must not remain suspended forever. Each transition gets a
+    /// generation so a late watchdog cannot disturb a newer transition.
+    private var fullscreenTransitionGeneration: UInt64 = 0
     private var observers: [NSObjectProtocol] = []
     private let logger = Logger(subsystem: "com.porthole.mac", category: "fullscreen")
 
@@ -295,38 +304,21 @@ final class SurfaceHostView: NSScrollView {
             $0.logger.info("fullscreen will enter")
             $0.fullscreenTogglePending = false
             $0.fullscreenTransitionActive = true
-            $0.beginPresentationTransition()
+            $0.beginPresentationTransition(targetFullscreen: true)
         }
         observe(NSWindow.willExitFullScreenNotification) {
             $0.logger.info("fullscreen will exit")
             $0.fullscreenTogglePending = false
             $0.fullscreenTransitionActive = true
-            $0.beginPresentationTransition()
+            $0.beginPresentationTransition(targetFullscreen: false)
         }
         observe(NSWindow.didEnterFullScreenNotification) {
             $0.logger.info("fullscreen did enter")
-            $0.fullscreenTogglePending = false
-            $0.fullscreenTransitionActive = false
-            $0.surface.reapplyPresentationMode()
-            $0.renderer.resumePresentation(view: $0.surface)
-            // Track the completed window state locally before SwiftUI
-            // propagates the callback. Otherwise applyFullscreen can see the
-            // stale pre-transition intent and immediately undo a user action.
-            $0.wantsFullscreen = true
-            $0.hasFullscreenIntent = true
-            $0.reportFullscreen(true)
-            $0.applyFullscreen()
+            $0.completePresentationTransition(enteredFullscreen: true)
         }
         observe(NSWindow.didExitFullScreenNotification) {
             $0.logger.info("fullscreen did exit")
-            $0.fullscreenTogglePending = false
-            $0.fullscreenTransitionActive = false
-            $0.surface.reapplyPresentationMode()
-            $0.renderer.resumePresentation(view: $0.surface)
-            $0.wantsFullscreen = false
-            $0.hasFullscreenIntent = true
-            $0.reportFullscreen(false)
-            $0.applyFullscreen()
+            $0.completePresentationTransition(enteredFullscreen: false)
         }
         // Dragging the window between a 1x and a 2x display changes what
         // "one video pixel on one device pixel" means in points.
@@ -337,8 +329,53 @@ final class SurfaceHostView: NSScrollView {
     /// snapshots the existing layer contents before posting `willEnter` or
     /// `willExit`; reacquiring CAMetalLayer drawables during that animation can
     /// prevent WindowServer from completing the swapchain handoff.
-    private func beginPresentationTransition() {
+    private func beginPresentationTransition(targetFullscreen: Bool) {
+        fullscreenTransitionGeneration &+= 1
+        let generation = fullscreenTransitionGeneration
         renderer.suspendPresentation()
+
+        // `didEnterFullScreen`/`didExitFullScreen` are normally authoritative,
+        // but AppKit occasionally omits one after the Space has already
+        // settled. Bound that suspension without resuming during the normal
+        // animation. The current style mask is the source of truth at expiry.
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(1_250)) { [weak self] in
+            guard let self, let window = self.window,
+                  self.fullscreenTransitionActive,
+                  self.fullscreenTransitionGeneration == generation else { return }
+            let enteredFullscreen = window.styleMask.contains(.fullScreen)
+            self.logger.error("""
+                fullscreen completion missing target=\(targetFullscreen) \
+                actual=\(enteredFullscreen); recovering presentation
+                """)
+            self.completePresentationTransition(
+                enteredFullscreen: enteredFullscreen,
+                adoptWindowState: enteredFullscreen == targetFullscreen
+            )
+        }
+    }
+
+    /// Finish from either AppKit's completion notification or the bounded
+    /// state-based fallback. Rebinding the settled layer also rotates the
+    /// direct-render lane so no drawable wait from the old Space can block it.
+    private func completePresentationTransition(enteredFullscreen: Bool,
+                                                adoptWindowState: Bool = true) {
+        fullscreenTransitionGeneration &+= 1
+        fullscreenTogglePending = false
+        fullscreenTransitionActive = false
+        surface.reapplyPresentationMode()
+        renderer.resumePresentation(view: surface)
+        // Track the completed window state locally before SwiftUI propagates
+        // the callback. Otherwise applyFullscreen can see the stale
+        // pre-transition intent and immediately undo a user action.
+        // If a timed-out transition never reached its target, keep the
+        // existing SwiftUI intent: app-initiated requests retry, while a
+        // cancelled native green-button action stays cancelled.
+        if adoptWindowState {
+            wantsFullscreen = enteredFullscreen
+            hasFullscreenIntent = true
+            reportFullscreen(enteredFullscreen)
+        }
+        applyFullscreen()
     }
 
     private func observe(_ name: Notification.Name, _ handler: @escaping (SurfaceHostView) -> Void) {

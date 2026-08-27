@@ -34,6 +34,15 @@ final class SessionSurfaceView: MTKView {
         }
     }
 
+    /// Per-surface swapchain depth selected by StreamSession's cadence tuner.
+    var lowLatencyDrawableCount = 2 {
+        didSet {
+            if oldValue != lowLatencyDrawableCount {
+                applyPresentationMode()
+            }
+        }
+    }
+
     /// Mirrors InputController's lock state so its transitions refresh the
     /// cursor rects; the rects themselves read the controller.
     var pointerLocked = false {
@@ -79,6 +88,10 @@ final class SessionSurfaceView: MTKView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        // Removal is not a new presentation target. Rebinding here would let
+        // an obsolete surface overwrite the renderer's newer weak layer just
+        // before this surface deallocates, leaving reconnect with no target.
+        guard window != nil else { return }
         // Configure the layer after it has moved into its window so AppKit's
         // backing layer is available and tied to the destination display.
         applyPresentationMode()
@@ -98,11 +111,10 @@ final class SessionSurfaceView: MTKView {
 
     private func applyPresentationMode() {
         guard let metalLayer = layer as? CAMetalLayer else { return }
-        // Keep one drawable scanning out and one drawable writable. The
-        // renderer opens its mailbox slot on GPU completion, so a third
-        // drawable only permits an obsolete frame to queue for another
-        // refresh (about 6.9 ms at 144 Hz) without increasing throughput.
-        metalLayer.maximumDrawableCount = 2
+        // Two drawables minimize queueing on a healthy layer. Cadence
+        // recovery may use three in any window mode so one remains writable
+        // while WindowServer retains the other two, including fullscreen.
+        metalLayer.maximumDrawableCount = lowLatencyPresentation ? lowLatencyDrawableCount : 2
         // Fullscreen Space transitions can temporarily make every drawable
         // unavailable. A bounded nextDrawable() wait lets the mailbox recover
         // after occlusion instead of pinning its serial render worker forever.
@@ -124,16 +136,15 @@ final class SessionSurfaceView: MTKView {
     }
 
     private func applyFrameRate() {
+        let screenMax = (window?.screen ?? NSScreen.main)?.maximumFramesPerSecond ?? 0
         let resolved: Int
         if targetFrameRate > 0 {
             resolved = targetFrameRate
         } else {
-            let maximum = (window?.screen ?? NSScreen.main)?.maximumFramesPerSecond ?? 0
-            resolved = maximum > 0 ? maximum : 60
+            resolved = screenMax > 0 ? screenMax : 60
         }
         if preferredFramesPerSecond != resolved {
             preferredFramesPerSecond = resolved
-            let screenMax = (window?.screen ?? NSScreen.main)?.maximumFramesPerSecond ?? 0
             logger.info("display link \(resolved) Hz (target \(self.targetFrameRate), screen max \(screenMax))")
         }
     }

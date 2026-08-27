@@ -53,12 +53,14 @@ struct SessionView: View {
         ZStack(alignment: .top) {
             MetalSurfaceView(frameRate: targetFrameRate,
                              lowLatency: gamingMode,
+                             drawablePoolDepth: session.drawablePoolDepth,
                              pointerLocked: session.pointerLockActive,
                              displayMode: displayMode,
                              videoSize: videoSize,
                              renderer: session.renderer,
                              input: session.input,
                              onFullscreenChanged: syncFullscreen)
+                .id(session.surfaceGeneration)
 
             if !exclusiveGamingSurface {
                 VStack(spacing: 8) {
@@ -161,6 +163,7 @@ struct SessionView: View {
     /// Fullscreen moves started by the window itself (green button, exit
     /// gesture) keep the mode picker and the per-machine setting true.
     private func syncFullscreen(_ entered: Bool) {
+        session.deferRenderCadenceRecovery()
         isNativeFullscreen = entered
         if entered != (displayMode == .fullscreen) {
             displayMode = entered ? .fullscreen : .fit

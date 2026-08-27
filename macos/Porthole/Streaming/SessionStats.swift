@@ -41,6 +41,10 @@ struct LatencyStats: Equatable {
 /// inline and drain one batch per stats window instead of enqueuing two jobs
 /// per frame onto the serial decode queue that the telemetry is measuring.
 final class RenderTelemetry {
+    /// A 16-frame window catches phase-locked drawable starvation in roughly
+    /// 100-150 ms without reacting to one delayed Metal callback.
+    private static let cadenceWindow = 16
+
     struct Batch {
         var rendered = 0
         var presented = 0
@@ -56,6 +60,38 @@ final class RenderTelemetry {
 
     private let lock = NSLock()
     private var batch = Batch()
+    private var targetRenderIntervalMicros: UInt64?
+    private var previousRenderMicros: UInt64?
+    private var cadenceIntervalMicros: UInt64 = 0
+    private var cadenceSamples = 0
+    private var cadenceRecoverySent = false
+    private var cadenceRecoveryNotBeforeMicros: UInt64 = 0
+
+    /// Invoked outside the telemetry lock after sustained high-rate render
+    /// starvation. StreamSession uses it to widen only the affected swapchain.
+    var onCadenceStarved: (() -> Void)?
+
+    func expect(frameRate: Int) {
+        let interval = frameRate >= 120 ? UInt64(1_000_000 / frameRate) : nil
+        lock.lock()
+        if targetRenderIntervalMicros != interval {
+            targetRenderIntervalMicros = interval
+            resetCadenceDetectorLocked()
+        }
+        lock.unlock()
+    }
+
+    /// Space transitions briefly run below steady cadence while WindowServer
+    /// rebuilds the swapchain. Start a fresh qualification window after that
+    /// warm-up instead of permanently widening a healthy fullscreen pool.
+    func deferCadenceRecovery(milliseconds: UInt64 = 750) {
+        let now = ClientClock.nowMicros()
+        lock.lock()
+        cadenceRecoveryNotBeforeMicros = max(cadenceRecoveryNotBeforeMicros,
+                                             now + milliseconds * 1_000)
+        resetCadenceDetectorLocked()
+        lock.unlock()
+    }
 
     func recordPresented(_ timing: MetalRenderer.PresentationTiming) {
         lock.lock()
@@ -88,7 +124,29 @@ final class RenderTelemetry {
         batch.submitToRendered.add(
             Int64(timing.completedMicros) - Int64(timing.submittedMicros)
         )
+        var recovery: (() -> Void)?
+        if let previous = previousRenderMicros,
+           let target = targetRenderIntervalMicros,
+           timing.completedMicros >= cadenceRecoveryNotBeforeMicros,
+           timing.completedMicros >= previous {
+            // Cap a one-off callback delay (Space animation, scheduler spike)
+            // so it cannot look like sustained phase drift by itself.
+            cadenceIntervalMicros += min(timing.completedMicros - previous, target * 2)
+            cadenceSamples += 1
+            if cadenceSamples == Self.cadenceWindow {
+                let targetWindow = target * UInt64(Self.cadenceWindow)
+                let starved = cadenceIntervalMicros * 25 >= targetWindow * 27
+                if starved, !cadenceRecoverySent {
+                    cadenceRecoverySent = true
+                    recovery = onCadenceStarved
+                }
+                cadenceIntervalMicros = 0
+                cadenceSamples = 0
+            }
+        }
+        previousRenderMicros = timing.completedMicros
         lock.unlock()
+        recovery?()
     }
 
     func drain() -> Batch {
@@ -102,7 +160,17 @@ final class RenderTelemetry {
     func reset() {
         lock.lock()
         batch = Batch()
+        targetRenderIntervalMicros = nil
+        cadenceRecoveryNotBeforeMicros = 0
+        resetCadenceDetectorLocked()
         lock.unlock()
+    }
+
+    private func resetCadenceDetectorLocked() {
+        previousRenderMicros = nil
+        cadenceIntervalMicros = 0
+        cadenceSamples = 0
+        cadenceRecoverySent = false
     }
 }
 
