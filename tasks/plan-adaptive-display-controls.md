@@ -43,26 +43,26 @@ composition-free fullscreen gaming path.
 
 ## Acceptance criteria
 
-- [ ] The display picker contains only Fit and Full; stored legacy 1:1 values
+- [x] The display picker contains only Fit and Full; stored legacy 1:1 values
       migrate safely to Fit.
-- [ ] In Fit, the Linux headless output settles to the Metal surface's backing-
+- [x] In Fit, the Linux headless output settles to the Metal surface's backing-
       pixel size after a window resize, without restart storms during dragging.
-- [ ] In Full, the Linux headless output settles to the fullscreen surface's
+- [x] In Full, the Linux headless output settles to the fullscreen surface's
       backing-pixel size after the native transition completes.
-- [ ] A live resize recreates capture and encode resources coherently, sends a
+- [x] A live resize recreates capture and encode resources coherently, sends a
       fresh hello/keyframe, and updates absolute-pointer geometry.
-- [ ] Gaming mode no longer silently forces Full; either supported display mode
+- [x] Gaming mode no longer silently forces Full; either supported display mode
       can be chosen explicitly.
-- [ ] UI labels call configured frame rates ceilings or local display rates,
+- [x] UI labels call configured frame rates ceilings or local display rates,
       while Stats separately shows measured source, encoded, decoded, and
       presented fps.
-- [ ] The status line does not claim a requested cap is an observed fps value.
-- [ ] Controls can be hidden with a button and restored with a compact top-edge
+- [x] The status line does not claim a requested cap is an observed fps value.
+- [x] Controls can be hidden with a button and restored with a compact top-edge
       handle. Native fullscreen gaming remains an unobstructed Metal surface,
       and Escape remains its route back to controls.
-- [ ] Rust tests, formatting, clippy, Swift tests, SwiftLint, and Debug/Release
+- [x] Rust tests, formatting, clippy, Swift tests, SwiftLint, and Debug/Release
       builds pass.
-- [ ] Changes are committed, pushed, deployed to `10.0.0.222`, and exercised
+- [x] Changes are committed, pushed, deployed to `10.0.0.222`, and exercised
       against its real Hyprland headless output.
 
 ## Technical approach
@@ -122,3 +122,21 @@ composition-free fullscreen gaming path.
 - Hiding all UI could trap the user. Windowed sessions keep a clickable reveal
   handle; exclusive fullscreen gaming keeps the established unmodified-Escape
   exit path and avoids composition overhead.
+
+## Live verification
+
+- A Fit resize settled once at `1374x648@288`, rebuilt capture and encode once
+  in 246 ms, emitted a fresh stream hello, and updated the Mac status to the
+  same geometry.
+- Full settled once at `2560x1440@288`; its exclusive surface exposed no
+  controls, and Escape returned to Fit with the complete control bar restored.
+- The Hide button removed all windowed chrome, leaving only the compact Show
+  Controls handle; the handle restored the complete bar while shortcut capture
+  remained enabled.
+- Full measured roughly 11-13 ms capture-to-present with about 1 ms encode,
+  1-2 ms decode, sub-millisecond LAN RTT, and zero packet loss. The smaller Fit
+  window measured roughly 16-22 ms because its WindowServer composition stage
+  was longer; source, encode, network, and decode timings remained low.
+- The capture controls are presented as ceilings. The HUD independently showed
+  measured source, encoded, decoded, and presented rates rather than relabeling
+  the requested cap as delivered throughput.

@@ -41,6 +41,10 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// IDRs sparse avoids a multi-hundred-datagram burst every two seconds while
 /// retaining a periodic safety net if a control request is ever missed.
 const GAMING_KEYFRAME_INTERVAL_SECS: u32 = 300;
+/// Avoid hammering Hyprland or the capture portal when a live display
+/// reconfiguration fails transiently. A newer client request bypasses the
+/// delay so the latest viewport is still applied immediately.
+const DISPLAY_RECONFIG_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Porthole Linux agent: screen capture, NVENC encode, LAN streaming.
 #[derive(Debug, Parser)]
@@ -550,6 +554,12 @@ fn capture_loop(
     // reader reports its disconnect after the new client connected; the
     // generation tells that stale event apart from a real disconnect.
     let mut client_generation: Option<u64> = None;
+    // Keep the requested geometry separate from the last geometry whose
+    // capture pipeline was rebuilt successfully. That lets a transient
+    // Hyprland/portal failure recover without waiting for the client to send
+    // the same resize again.
+    let mut desired_display = cfg.virtual_display;
+    let mut next_display_retry = Instant::now();
     let mut window_start = Instant::now();
     while !shutdown.load(Ordering::Relaxed) {
         // Settings and display-size frames are adjacent on the same TCP
@@ -618,8 +628,8 @@ fn capture_loop(
             };
         }
 
-        let mut desired_display = cfg.virtual_display;
         if requested_settings.is_some() || requested_resize.is_some() {
+            next_display_retry = Instant::now();
             if let Some(display) = desired_display.as_mut() {
                 // The headless output is the source clock; its refresh follows
                 // the capture ceiling while its pixels follow the viewport.
@@ -638,9 +648,8 @@ fn capture_loop(
         }
 
         let mut stream_reconfigured = false;
-        if desired_display != cfg.virtual_display {
+        if desired_display != cfg.virtual_display && Instant::now() >= next_display_retry {
             if let Some(output) = virtual_display::ensure(desired_display) {
-                cfg.virtual_display = desired_display;
                 stream_reconfigured = rebuild_capture_pipeline(
                     &mut encoder,
                     &cfg,
@@ -655,10 +664,14 @@ fn capture_loop(
                     &shutdown,
                 );
                 if stream_reconfigured {
+                    cfg.virtual_display = desired_display;
                     input_geometry.update(capture_format.width, capture_format.height);
+                } else {
+                    next_display_retry = Instant::now() + DISPLAY_RECONFIG_RETRY_INTERVAL;
                 }
             } else {
                 tracing::warn!("virtual display reconfiguration was not applied");
+                next_display_retry = Instant::now() + DISPLAY_RECONFIG_RETRY_INTERVAL;
             }
         }
 
