@@ -30,12 +30,9 @@ final class StreamSession: ObservableObject {
     /// Latest per-second latency figures for the session chrome.
     @Published private(set) var latency = LatencyStats.empty
     /// A connection attempt gets a fresh Metal surface identity. Core
-    /// Animation can retain the cadence of a previously drained two-drawable
-    /// pool; rebuilding the surface isolates reconnects from that old pool.
+    /// Animation can retain the cadence of a previously drained swapchain;
+    /// rebuilding the surface isolates reconnects from that old layer.
     @Published private(set) var surfaceGeneration: UInt64 = 0
-    /// Start with the two-drawable latency path. A cadence-starved connection
-    /// hot-swaps once to a fresh three-drawable surface for full throughput.
-    @Published private(set) var drawablePoolDepth = 2
 
     /// The surface's renderer; decoded frames replace the test pattern.
     let renderer = MetalRenderer()
@@ -110,7 +107,6 @@ final class StreamSession: ObservableObject {
 
     func connect(host: String, controlPort: UInt16 = WireProtocol.controlPort) {
         guard state == .disconnected else { return }
-        drawablePoolDepth = 2
         surfaceGeneration &+= 1
         lastError = nil
         state = .connecting
@@ -158,13 +154,6 @@ final class StreamSession: ObservableObject {
     /// touching the connection.
     func setClipboardSync(_ enabled: Bool) {
         peripherals.clipboardEnabled = enabled
-    }
-
-    /// Re-qualify cadence after AppKit finishes moving the surface between
-    /// Spaces; transition warm-up is not evidence that the settled pool is
-    /// too shallow.
-    func deferRenderCadenceRecovery() {
-        renderTelemetry.deferCadenceRecovery()
     }
 
     private func wireDialer() {
@@ -218,25 +207,12 @@ final class StreamSession: ObservableObject {
     }
 
     private func wireRendererTelemetry() {
-        renderTelemetry.onCadenceStarved = { [weak self] in
-            DispatchQueue.main.async { self?.recoverRenderCadence() }
-        }
         renderer.onFramePresented = { [weak self] timing in
             self?.renderTelemetry.recordPresented(timing)
         }
         renderer.onFrameRenderCompleted = { [weak self] timing in
             self?.renderTelemetry.recordRendered(timing)
         }
-    }
-
-    /// Replace, rather than mutate, a phase-locked CAMetalLayer. Core Animation
-    /// can accept a live pool-depth change while keeping the old swapchain's
-    /// cadence; a new identity makes the three-drawable pool effective at once.
-    private func recoverRenderCadence() {
-        guard state != .disconnected, drawablePoolDepth == 2 else { return }
-        logger.warning("render cadence starved; replacing surface with three drawables")
-        drawablePoolDepth = 3
-        surfaceGeneration &+= 1
     }
 
     /// Input flows to the control channel on the same connection (US-006).
@@ -379,6 +355,7 @@ final class StreamSession: ObservableObject {
         let rttMicros = clockOffset.latestRttMicros
         let line = stats.line(rttMicros: rttMicros, agentStats: latestAgentStats,
                               queueDepth: video.backlogDepth, audio: audio.perSecond())
+            + " " + renderer.drainGamingPacerMetrics()
         logger.info("\(line, privacy: .public)")
         statsLog.append(line)
 
@@ -432,7 +409,6 @@ extension StreamSession {
     private func handleHello(_ hello: Hello) {
         let previous = self.hello
         self.hello = hello
-        renderTelemetry.expect(frameRate: Int(hello.fps))
         // InputController is main-thread; hop for the size update.
         DispatchQueue.main.async { [weak self] in
             self?.input.videoSize = CGSize(width: Int(hello.width), height: Int(hello.height))
@@ -479,7 +455,7 @@ extension StreamSession {
         return true
     }
 
-    /// Gaming mode: 144 (or 120) fps HEVC at 60 Mbps with the encoder
+    /// Gaming mode: 120/144/180 fps HEVC at 60 Mbps with the encoder
     /// biased toward latency; off restores 60 fps H.264 at 40 Mbps. The
     /// decoder switches codec immediately rather than waiting for the
     /// reconfigured hello, which is advisory (docs/protocol.md "settings").

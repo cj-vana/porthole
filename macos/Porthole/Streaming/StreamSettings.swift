@@ -16,18 +16,19 @@ struct StreamSettings: Equatable {
     static let quality = StreamSettings(fps: 60, codec: .h264, bitrateMbps: 40, lowLatency: false)
 
     static func gaming(fps: Int) -> StreamSettings {
-        // 60 Mbps HEVC is ample for 1440p while keeping 144 Hz packet and IDR
-        // bursts below the client receive/decode saturation point. The former
-        // 80 Mbps CBR target spent bandwidth on filler and increased latency.
+        // 60 Mbps HEVC is ample for 1440p while keeping high-rate packet and
+        // IDR bursts below client receive/decode saturation. The former 80
+        // Mbps CBR target spent bandwidth on filler and increased latency.
         StreamSettings(fps: UInt16(clamping: fps), codec: .hevc, bitrateMbps: 60, lowLatency: true)
     }
 
     /// What the persisted chrome toggles ask for. SessionView owns the same
-    /// keys through @AppStorage; an unset rate means the 144 default.
+    /// keys through @AppStorage; an unset rate selects the 180 Hz temporal
+    /// oversampling profile.
     static func stored(defaults: UserDefaults = .standard) -> StreamSettings {
         guard defaults.bool(forKey: "gamingMode") else { return .quality }
         let fps = defaults.integer(forKey: "gamingFps")
-        return .gaming(fps: fps == 0 ? 144 : fps)
+        return .gaming(fps: fps == 0 ? 180 : fps)
     }
 
     /// Whether a hello already describes this configuration, so a matching

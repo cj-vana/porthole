@@ -17,11 +17,9 @@ struct MetalSurfaceView: NSViewRepresentable {
     /// Target rate for the view's display link: 60/120/144, or 0 for the
     /// screen's maximum. The system clamps it to what the display supports.
     let frameRate: Int
-    /// Gaming mode may present between display-link ticks to minimize the
-    /// decoded-frame-to-scanout delay. Quality mode remains synchronized.
+    /// Gaming mode late-latches against the physical display clock. Quality
+    /// mode remains decoded-frame driven and synchronized.
     let lowLatency: Bool
-    /// Two minimizes queueing; three is the adaptive cadence-recovery path.
-    let drawablePoolDepth: Int
     /// Pointer lock state, so the view can refresh its cursor rects on
     /// transitions (the cursor itself is decided in SessionSurfaceView).
     let pointerLocked: Bool
@@ -47,10 +45,9 @@ struct MetalSurfaceView: NSViewRepresentable {
         surface.delegate = context.coordinator
         surface.colorPixelFormat = MetalRenderer.pixelFormat
         surface.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
-        // Idle uses the display link; live streaming pauses it and presents on
-        // decoded-frame arrival (see MetalRenderer.display).
+        // Idle uses MTKView's display link. A live stream pauses it: quality
+        // presents on arrival, while gaming uses the renderer's late latch.
         surface.targetFrameRate = frameRate
-        surface.lowLatencyDrawableCount = drawablePoolDepth
         surface.lowLatencyPresentation = lowLatency
         surface.isPaused = false
         surface.enableSetNeedsDisplay = false
@@ -64,7 +61,6 @@ struct MetalSurfaceView: NSViewRepresentable {
     func updateNSView(_ nsView: SurfaceHostView, context: Context) {
         nsView.onFullscreenChanged = onFullscreenChanged
         nsView.surface.targetFrameRate = frameRate
-        nsView.surface.lowLatencyDrawableCount = drawablePoolDepth
         nsView.surface.lowLatencyPresentation = lowLatency
         renderer.setLowLatencyPresentation(lowLatency)
         nsView.surface.pointerLocked = pointerLocked

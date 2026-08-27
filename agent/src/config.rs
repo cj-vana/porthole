@@ -58,12 +58,13 @@ pub fn hostname() -> String {
     default_name()
 }
 
-/// Framerates the agent will stream at (PRD: 60 quality mode; 120 targeted by
-/// gaming mode US-013; 144 for high-refresh displays).
-pub const ALLOWED_FPS: [u16; 3] = [60, 120, 144];
+/// Framerates the agent will stream at. The 180 Hz mode intentionally
+/// oversamples 120/144 Hz clients so independent capture and scanout clocks
+/// cannot beat against each other and periodically bunch frames.
+pub const ALLOWED_FPS: [u16; 4] = [60, 120, 144, 180];
 
-/// A validated stream framerate. Only 60, 120, or 144 are accepted, from
-/// both the CLI (via `FromStr`) and the TOML file (via `Deserialize`).
+/// A validated stream framerate, accepted from both the CLI (via `FromStr`)
+/// and the TOML file (via `Deserialize`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fps(u16);
 
@@ -253,7 +254,7 @@ pub struct Config {
     /// Hardware encoder backend (default nvenc on the dGPU; vaapi offloads
     /// to the Ryzen iGPU so the dGPU stays free for gaming).
     pub encoder: EncoderBackend,
-    /// Stream framerate (default 60; gaming mode selects 120 or 144, US-013).
+    /// Stream framerate (default 60; gaming mode selects up to 180, US-013).
     pub fps: Fps,
     /// Virtual display geometry for headless operation (default unset;
     /// US-015). When set and no physical output is attached, a Hyprland
@@ -512,6 +513,7 @@ mod tests {
         assert_eq!("60".parse::<Fps>().unwrap().get(), 60);
         assert_eq!("120".parse::<Fps>().unwrap().get(), 120);
         assert_eq!("144".parse::<Fps>().unwrap().get(), 144);
+        assert_eq!("180".parse::<Fps>().unwrap().get(), 180);
     }
 
     #[test]

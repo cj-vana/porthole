@@ -84,7 +84,7 @@ struct Cli {
     #[arg(long, value_enum)]
     encoder: Option<encode::EncoderBackend>,
 
-    /// Stream framerate (60, 120, or 144) [default: 60]
+    /// Stream framerate (60, 120, 144, or 180) [default: 60]
     #[arg(long, value_name = "FPS")]
     fps: Option<config::Fps>,
 

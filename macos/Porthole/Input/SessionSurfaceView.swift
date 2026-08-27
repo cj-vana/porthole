@@ -23,21 +23,11 @@ final class SessionSurfaceView: MTKView {
         }
     }
 
-    /// Gaming presents each decoded frame immediately from the newest-only
-    /// mailbox with compositor synchronization disabled. Quality remains
-    /// synchronized to the display.
+    /// Gaming late-latches the newest decoded frame against the physical
+    /// display clock. Quality presents on decoded-frame arrival.
     var lowLatencyPresentation = false {
         didSet {
             if oldValue != lowLatencyPresentation {
-                applyPresentationMode()
-            }
-        }
-    }
-
-    /// Per-surface swapchain depth selected by StreamSession's cadence tuner.
-    var lowLatencyDrawableCount = 2 {
-        didSet {
-            if oldValue != lowLatencyDrawableCount {
                 applyPresentationMode()
             }
         }
@@ -103,6 +93,7 @@ final class SessionSurfaceView: MTKView {
                                                                     queue: .main) { [weak self] notification in
                 guard let self, let window = self.window,
                       (notification.object as? NSWindow) === window else { return }
+                self.applyPresentationMode()
                 self.applyFrameRate()
             }
         }
@@ -111,10 +102,10 @@ final class SessionSurfaceView: MTKView {
 
     private func applyPresentationMode() {
         guard let metalLayer = layer as? CAMetalLayer else { return }
-        // Two drawables minimize queueing on a healthy layer. Cadence
-        // recovery may use three in any window mode so one remains writable
-        // while WindowServer retains the other two, including fullscreen.
-        metalLayer.maximumDrawableCount = lowLatencyPresentation ? lowLatencyDrawableCount : 2
+        // Timed synchronized presentation needs one drawable scanning, one
+        // reserved for the imminent vblank, and one writable. Hardware-tick
+        // admission prevents the three slots from becoming a frame backlog.
+        metalLayer.maximumDrawableCount = lowLatencyPresentation ? 3 : 2
         // Fullscreen Space transitions can temporarily make every drawable
         // unavailable. A bounded nextDrawable() wait lets the mailbox recover
         // after occlusion instead of pinning its serial render worker forever.
@@ -122,9 +113,11 @@ final class SessionSurfaceView: MTKView {
         metalLayer.isOpaque = true
         metalLayer.backgroundColor = NSColor.black.cgColor
         metalLayer.presentsWithTransaction = false
-        metalLayer.displaySyncEnabled = !lowLatencyPresentation
+        // The renderer supplies the exact forecasted presentation timestamp;
+        // synchronization makes that reservation a tear-free scanout target.
+        metalLayer.displaySyncEnabled = true
         onPresentationLayerReady?()
-        logger.info("presentation sync \(self.lowLatencyPresentation ? "off (gaming)" : "on")")
+        logger.info("presentation sync on \(self.lowLatencyPresentation ? "(timed gaming)" : "(quality)")")
     }
 
     /// AppKit may rebuild the layer's swapchain while entering or leaving a

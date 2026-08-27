@@ -19,8 +19,9 @@ struct SessionView: View {
     @AppStorage("pointerLock") private var pointerLock = false
     /// Gaming mode (US-013): high-rate low-latency HEVC stream.
     @AppStorage("gamingMode") private var gamingMode = false
-    /// The gaming-mode stream rate: 120 or 144.
-    @AppStorage("gamingFps") private var gamingFps = 144
+    /// The gaming-mode stream rate. Ultra oversamples a 120/144 Hz panel to
+    /// prevent the remote capture clock from beating against local scanout.
+    @AppStorage("gamingFps") private var gamingFps = 180
     /// Latency HUD over the stream (US-013).
     @AppStorage("statsOverlay") private var statsOverlay = false
     /// Remote audio playback level, 0 to 1 (US-009).
@@ -53,7 +54,6 @@ struct SessionView: View {
         ZStack(alignment: .top) {
             MetalSurfaceView(frameRate: targetFrameRate,
                              lowLatency: gamingMode,
-                             drawablePoolDepth: session.drawablePoolDepth,
                              pointerLocked: session.pointerLockActive,
                              displayMode: displayMode,
                              videoSize: videoSize,
@@ -163,7 +163,6 @@ struct SessionView: View {
     /// Fullscreen moves started by the window itself (green button, exit
     /// gesture) keep the mode picker and the per-machine setting true.
     private func syncFullscreen(_ entered: Bool) {
-        session.deferRenderCadenceRecovery()
         isNativeFullscreen = entered
         if entered != (displayMode == .fullscreen) {
             displayMode = entered ? .fullscreen : .fit
@@ -240,10 +239,11 @@ struct SessionView: View {
                 Picker("Gaming frame rate", selection: $gamingFps) {
                     Text("120").tag(120)
                     Text("144").tag(144)
+                    Text("Ultra 180").tag(180)
                 }
                 .pickerStyle(.segmented)
                 .fixedSize()
-                .help("Stream rate while gaming mode is on")
+                .help("Ultra oversamples the display to minimize frame age and clock-beat stutter")
             }
             Toggle("Stats", isOn: $statsOverlay)
                 .toggleStyle(.switch)
