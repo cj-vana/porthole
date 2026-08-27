@@ -781,9 +781,10 @@ extension MetalRenderer {
                             targetPresentationMicros: targetPresentationMicros)
         commandBuffer.present(drawable)
         commandBuffer.commit()
-        // The work-item autorelease pool can otherwise recycle its wrapper
-        // before Metal has accepted the scheduled presentation.
-        commandBuffer.waitUntilScheduled()
+        // Committed command buffers are retained by Metal through completion.
+        // Waiting for `scheduled` here serializes the cadence wheel behind
+        // WindowServer's present handshake; at native 1440p that handshake can
+        // span a refresh and collapse an otherwise 144 Hz path to 60 Hz.
         frameLock.lock()
         gamingTicksCommitted += 1
         if let captureMicros = frame.captureClientMicros,
