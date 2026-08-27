@@ -204,6 +204,13 @@ struct SessionView: View {
                 store.activeSessionMachine = nil
             }
             .help("Return to the machine picker")
+            Button {
+                controlsHidden = true
+            } label: {
+                Label("Hide", systemImage: "chevron.up")
+            }
+            .buttonStyle(.borderless)
+            .help("Hide Porthole controls")
             Spacer()
             if session.pointerLockActive {
                 Label("pointer locked", systemImage: "lock.fill")
@@ -223,10 +230,11 @@ struct SessionView: View {
                     .foregroundStyle(.secondary)
                     .help("Capture to pixels on screen, and control round trip; n/a until the agent answers a ping")
             }
-            TextField("host", text: $host)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 120)
-                .disabled(session.isConnected)
+            if !session.isConnected {
+                TextField("host", text: $host)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 120)
+            }
             Button(session.isConnected ? "Disconnect" : "Connect") {
                 if session.isConnected {
                     session.disconnect()
@@ -235,13 +243,6 @@ struct SessionView: View {
                 }
             }
             .disabled(host.isEmpty)
-            Button {
-                controlsHidden = true
-            } label: {
-                Label("Hide controls", systemImage: "chevron.up")
-            }
-            .buttonStyle(.borderless)
-            .help("Hide Porthole controls")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
@@ -250,66 +251,74 @@ struct SessionView: View {
     }
 
     private var controlBar: some View {
-        HStack(spacing: 10) {
-            Picker("Display mode", selection: $displayMode) {
-                ForEach(DisplayMode.allCases) { mode in
-                    Text(mode.label).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-            .fixedSize()
-            .help("Fit adapts the Linux display to this window; Full adapts it to native fullscreen")
-            Picker("Local display", selection: $targetFrameRate) {
-                Text("Auto").tag(0)
-                Text("60 Hz").tag(60)
-                Text("120 Hz").tag(120)
-                Text("144 Hz").tag(144)
-            }
-            .pickerStyle(.segmented)
-            .fixedSize()
-            .help("Auto follows the screen; Gaming phase-locks presentation to its native cadence")
-            Toggle("Gaming", isOn: $gamingMode)
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .help("High-rate HEVC with the encoder biased toward latency; off returns to a 60 fps H.264 ceiling")
-            if gamingMode {
-                Picker("Capture ceiling", selection: $gamingFps) {
-                    Text("Max 120").tag(120)
-                    Text("Max 144").tag(144)
-                    Text("Max 180").tag(180)
-                    Text("Max 288").tag(288)
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                Picker("Display mode", selection: $displayMode) {
+                    ForEach(DisplayMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
+                    }
                 }
                 .pickerStyle(.segmented)
+                .labelsHidden()
                 .fixedSize()
-                .help("A ceiling, not a promise: VFR sends only real compositor frames; Stats shows delivered rates")
-            }
-            Toggle("Stats", isOn: $statsOverlay)
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .help("Latency HUD over the stream")
-            Toggle("Shortcuts", isOn: $sendSystemShortcuts)
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .help("Capture keyboard shortcuts for the remote machine (requires Accessibility)")
-            Toggle("Pointer lock", isOn: $pointerLock)
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .help("Relative mouse mode for games; Esc releases")
-            Toggle("Clipboard", isOn: $clipboardSync)
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .help("Sync copied text with the remote machine")
-            if session.desktopBarState != .unavailable {
-                Toggle("Remote bar", isOn: desktopBarVisible)
+                .help("Fit adapts the Linux display to this window; Full uses native fullscreen")
+                Picker("Local display", selection: $targetFrameRate) {
+                    Text("Auto").tag(0)
+                    Text("60 Hz").tag(60)
+                    Text("120 Hz").tag(120)
+                    Text("144 Hz").tag(144)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+                .help("Local presentation: Auto follows this screen's native refresh rate")
+                Toggle("Gaming", isOn: $gamingMode)
                     .toggleStyle(.switch)
                     .controlSize(.small)
-                    .help("Hide or restore the Linux desktop bar without stopping its shell")
+                    .fixedSize()
+                    .help("High-rate HEVC with the encoder biased toward latency")
+                if gamingMode {
+                    Picker("Capture ceiling", selection: $gamingFps) {
+                        Text("Max 120").tag(120)
+                        Text("Max 144").tag(144)
+                        Text("Max 180").tag(180)
+                        Text("Max 288").tag(288)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .fixedSize()
+                    .help("Capture ceiling, not delivered fps; Stats reports the measured rates")
+                }
+                if session.desktopBarState != .unavailable {
+                    Toggle("Remote bar", isOn: desktopBarVisible)
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .fixedSize()
+                        .help("Hide or restore the Linux desktop bar without stopping its shell")
+                }
+                audioControls
+                sessionOptionsMenu
             }
-            audioControls
+            .padding(.horizontal, 10)
         }
-        .padding(.horizontal, 14)
         .padding(.vertical, 6)
-        .background(.ultraThinMaterial, in: Capsule())
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .padding(.horizontal, 8)
+    }
+
+    private var sessionOptionsMenu: some View {
+        Menu {
+            Toggle("Stats overlay", isOn: $statsOverlay)
+            Toggle("Send shortcuts", isOn: $sendSystemShortcuts)
+            Toggle("Pointer lock", isOn: $pointerLock)
+            Toggle("Clipboard sync", isOn: $clipboardSync)
+        } label: {
+            Label("Options", systemImage: "slider.horizontal.3")
+        }
+        .menuStyle(.button)
+        .controlSize(.small)
+        .fixedSize()
+        .help("Stats, keyboard, pointer, and clipboard controls")
     }
 
     /// Remote audio (US-009): mute plus a compact volume slider.
@@ -325,7 +334,7 @@ struct SessionView: View {
             .help(audioMuted ? "Unmute remote audio" : "Mute remote audio")
             Slider(value: $audioVolume, in: 0...1)
                 .controlSize(.mini)
-                .frame(width: 70)
+                .frame(width: 55)
                 .disabled(audioMuted)
                 .help("Remote audio volume")
         }
