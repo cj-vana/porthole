@@ -32,14 +32,14 @@ It is two programs that share one wire protocol:
 - A Maximum gaming mode that requests a 288 Hz VFR source and late-latches the
   freshest real frame onto the physical display. On the fixed-144 Hz test
   panel, Gaming + Auto now phase-locks to the native 144 Hz cadence. A clean
-  60-second soak with a deliberately slower 179.28 fps real source averaged
-  142.48 actual presentations/s; 54 of 60 windows delivered at least 143.
-  Local temporal holds recycle the swapchain without duplicating network
-  frames. The per-window capture-to-present mean averaged 13.10 ms, ranged
-  from 11.9 to 18.6 ms, and held 0.00% loss. Presentation time is reported by
-  the Metal drawable; it is a compositor timestamp, not an optical
-  glass-to-glass measurement. The latter needs a high-speed camera or
-  photodiode rig.
+  60-second soak with a deliberately slower 179.22 fps real source averaged
+  142.67 actual presentations/s; 54 of 60 windows delivered at least 143.
+  One hundred ten local temporal holds recycled the swapchain without
+  duplicating network frames. The per-window capture-to-present mean averaged
+  13.19 ms, ranged from 11.6 to 20.1 ms during one isolated compositor-pressure
+  trough, and held 0.00% loss. Presentation time is reported by the Metal
+  drawable; it is a compositor timestamp, not an optical glass-to-glass
+  measurement. The latter needs a high-speed camera or photodiode rig.
 - Native Mac input: pixel-precise trackpad scrolling, modifier keys and
   shortcuts, a pointer-lock mode for games, and a single on-screen cursor.
 - Display modes: fit, 1:1 native pixels (razor-sharp text, scrollable), and

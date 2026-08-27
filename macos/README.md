@@ -222,12 +222,13 @@ already acquired. The pixels would be held either way; presenting the hold
 prevents that drawable from starving the next real frame.
 
 On the tested fixed-144 Hz panel, Gaming + Auto stays at native 144 Hz. A
-clean 60-second soak with a deliberately slower 179.28 fps real source
-averaged 142.48 compositor-reported presentations/s; 54 windows delivered at
-least 143. Fifty-five local temporal holds kept the two-buffer cadence alive
-without synthesizing network frames. The per-window capture-to-present mean
-averaged 13.10 ms (11.9-18.6 ms range) with 0.00% stream loss. Those are
-software timestamps, not an optical measurement.
+clean 60-second soak with a deliberately slower 179.22 fps real source
+averaged 142.67 compositor-reported presentations/s; 54 windows delivered at
+least 143. One hundred ten local temporal holds kept the two-buffer cadence
+alive without synthesizing network frames. The per-window capture-to-present
+mean averaged 13.19 ms (11.6-20.1 ms range; one isolated
+compositor-pressure trough) and stream loss remained 0.00%. Those are software
+timestamps, not an optical measurement.
 
 ## Audio (US-009)
 
