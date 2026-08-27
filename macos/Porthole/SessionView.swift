@@ -238,7 +238,7 @@ struct SessionView: View {
             Button {
                 controlsHidden = true
             } label: {
-                Image(systemName: "chevron.up")
+                Label("Hide controls", systemImage: "chevron.up")
             }
             .buttonStyle(.borderless)
             .help("Hide Porthole controls")
@@ -299,6 +299,12 @@ struct SessionView: View {
                 .toggleStyle(.switch)
                 .controlSize(.small)
                 .help("Sync copied text with the remote machine")
+            if session.desktopBarState != .unavailable {
+                Toggle("Remote bar", isOn: desktopBarVisible)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .help("Hide or restore the Linux desktop bar without stopping its shell")
+            }
             audioControls
         }
         .padding(.horizontal, 14)
@@ -332,8 +338,8 @@ struct SessionView: View {
         Button {
             controlsHidden = false
         } label: {
-            Image(systemName: "chevron.down")
-                .font(.headline)
+            Label("Controls", systemImage: "chevron.down")
+                .font(.callout.weight(.semibold))
                 .padding(.horizontal, 18)
                 .padding(.vertical, 4)
                 .background(.ultraThinMaterial, in: Capsule())
@@ -341,6 +347,14 @@ struct SessionView: View {
         .buttonStyle(.plain)
         .padding(.top, 4)
         .help("Show Porthole controls")
+    }
+
+    private var desktopBarVisible: Binding<Bool> {
+        Binding {
+            session.desktopBarState != .hidden
+        } set: { visible in
+            session.setDesktopBarVisible(visible)
+        }
     }
 
     /// Files dropped on the session window transfer to the connected

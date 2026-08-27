@@ -1,6 +1,7 @@
 // swiftlint:disable file_length
 import CoreVideo
 import Darwin
+import Foundation
 import MetalKit
 import QuartzCore
 
@@ -16,7 +17,16 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     static let pixelFormat: MTLPixelFormat = .bgra8Unorm
     /// Leave enough time for this single-triangle pass and Metal scheduling,
     /// while keeping the mailbox open for almost the entire refresh period.
-    private static let gamingLatchLeadSeconds = 0.0030
+    /// Four milliseconds is an intentionally conservative direct-scanout
+    /// guard: the tested 144 Hz path stays on the current refresh instead of
+    /// occasionally paying a full 6.94 ms miss. Hidden microsecond overrides
+    /// keep future on-device A/B tests reproducible without turning them into
+    /// UI claims.
+    private static let gamingLatchLeadSeconds = tunedSeconds(
+        key: "gamingLatchLeadMicros",
+        defaultMicros: 4_000,
+        allowedMicros: 1_000...5_000
+    )
     /// A drawable that arrives inside this measured render margin is retained
     /// for the next tick instead of being submitted across a scanout boundary.
     private static let gamingMinimumTargetLeadSeconds = 0.0010
@@ -30,7 +40,20 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     /// Core Video's output phase precedes the compositor-reported presentation
     /// slot on the tested direct-display path. Advance the cadence toward the
     /// observed slot while retaining a complete render margin.
-    private static let gamingOutputPhaseOffsetSeconds = 0.0025
+    private static let gamingOutputPhaseOffsetSeconds = tunedSeconds(
+        key: "gamingOutputPhaseMicros",
+        defaultMicros: 2_500,
+        allowedMicros: 0...6_000
+    )
+
+    private static func tunedSeconds(key: String,
+                                     defaultMicros: Int,
+                                     allowedMicros: ClosedRange<Int>) -> Double {
+        let stored = UserDefaults.standard.object(forKey: key) as? NSNumber
+        let micros = stored.map { Int(truncating: $0) } ?? defaultMicros
+        return Double(min(max(micros, allowedMicros.lowerBound), allowedMicros.upperBound))
+            / 1_000_000
+    }
     struct PresentationTiming {
         let captureClientMicros: UInt64?
         let decodedMicros: UInt64
@@ -150,6 +173,8 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     private var gamingDeadlineMaximumDeficitTicks: UInt64 = 0
     private var gamingCaptureTargetMicros: UInt64 = 0
     private var gamingCaptureTargetSamples = 0
+    private var gamingPresentationPhaseMicros: Int64 = 0
+    private var gamingPresentationPhaseSamples = 0
     private var gamingStaleRetries = 0
     private var gamingStaleRecoveries = 0
     private var lowLatencyPresentation = false
@@ -678,6 +703,25 @@ extension MetalRenderer {
             gamingDeadlineMaximumDeficitTicks = max(gamingDeadlineMaximumDeficitTicks, deficit)
             frameLock.unlock()
         }
+        let presentationTime = Double(outputHostTime) / CVGetHostClockFrequency()
+        submitGamingDrawable(drawable,
+                             layer: layer,
+                             pacerGeneration: pacerGeneration,
+                             targetPresentationMicros: UInt64(presentationTime * 1_000_000))
+    }
+}
+
+// MARK: Shared gaming drawable submission
+
+extension MetalRenderer {
+    // swiftlint:disable function_body_length
+    /// Encode one newest-mailbox frame into a drawable already admitted by the
+    /// active presentation driver. No caller may queue more than its one
+    /// driver-owned drawable.
+    private func submitGamingDrawable(_ drawable: CAMetalDrawable,
+                                      layer: CAMetalLayer,
+                                      pacerGeneration: UInt64,
+                                      targetPresentationMicros: UInt64) {
         guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
 
         frameLock.lock()
@@ -710,7 +754,6 @@ extension MetalRenderer {
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPass) else {
             return
         }
-
         guard drawVideo(frame: frame,
                         colors: colors,
                         drawableSize: drawableSize,
@@ -734,27 +777,23 @@ extension MetalRenderer {
 
         armGamingCompletion(commandBuffer: commandBuffer,
                             drawable: drawable,
-                            frame: frame)
-        // The phase-locked wheel places this commit immediately before the
-        // selected output phase. Immediate asynchronous presentation avoids adding
-        // the extra queued frame imposed by an absolute presentation request.
-        let presentationTime = Double(outputHostTime) / CVGetHostClockFrequency()
+                            frame: frame,
+                            targetPresentationMicros: targetPresentationMicros)
         commandBuffer.present(drawable)
         commandBuffer.commit()
-        // Keep the Objective-C command wrapper alive until Metal explicitly
-        // owns the work; otherwise the work-item autorelease pool can recycle
-        // drawable state before the scheduled presentation has been accepted.
+        // The work-item autorelease pool can otherwise recycle its wrapper
+        // before Metal has accepted the scheduled presentation.
         commandBuffer.waitUntilScheduled()
-        let targetMicros = UInt64(presentationTime * 1_000_000)
         frameLock.lock()
         gamingTicksCommitted += 1
         if let captureMicros = frame.captureClientMicros,
-           targetMicros >= captureMicros {
-            gamingCaptureTargetMicros &+= targetMicros - captureMicros
+           targetPresentationMicros >= captureMicros {
+            gamingCaptureTargetMicros &+= targetPresentationMicros - captureMicros
             gamingCaptureTargetSamples += 1
         }
         frameLock.unlock()
     }
+    // swiftlint:enable function_body_length
 }
 
 // MARK: Gaming tick lifetime
@@ -918,6 +957,8 @@ extension MetalRenderer {
         let deadlineMaximumDeficit = gamingDeadlineMaximumDeficitTicks
         let captureTarget = gamingCaptureTargetMicros
         let captureTargetSamples = gamingCaptureTargetSamples
+        let presentationPhase = gamingPresentationPhaseMicros
+        let presentationPhaseSamples = gamingPresentationPhaseSamples
         let staleRetries = gamingStaleRetries
         let staleRecoveries = gamingStaleRecoveries
         gamingTickCallbacks = 0
@@ -941,6 +982,8 @@ extension MetalRenderer {
         gamingDeadlineMaximumDeficitTicks = 0
         gamingCaptureTargetMicros = 0
         gamingCaptureTargetSamples = 0
+        gamingPresentationPhaseMicros = 0
+        gamingPresentationPhaseSamples = 0
         gamingStaleRetries = 0
         gamingStaleRecoveries = 0
         frameLock.unlock()
@@ -954,7 +997,12 @@ extension MetalRenderer {
             guard samples > 0 else { return "n/a" }
             return String(format: "%.2f", Double(micros) / Double(samples) / 1_000)
         }
-        return "pacer=\(callbacks)/\(scheduled)/\(committed)/\(busy)"
+        func averageSignedMicroseconds(_ micros: Int64, _ samples: Int) -> String {
+            guard samples > 0 else { return "n/a" }
+            return String(format: "%.2f", Double(micros) / Double(samples) / 1_000)
+        }
+        return "present_driver=core_video_latch"
+            + " pacer=\(callbacks)/\(scheduled)/\(committed)/\(busy)"
             + " hold=\(held)"
             + " lookahead_ms=\(averageMilliseconds(lookahead, callbacks))"
             + " latch_wait_ms=\(averageMilliseconds(wait, scheduled))"
@@ -964,6 +1012,9 @@ extension MetalRenderer {
             + " prefetch_latch=\(prefetchRecoveries)/\(prefetchTimeouts)"
             + "/\(averageMilliseconds(prefetchLatchWait, prefetchRecoveries + prefetchTimeouts))"
             + " cap_target_ms=\(averageMicroseconds(captureTarget, captureTargetSamples))"
+            + " present_phase_ms=\(averageSignedMicroseconds(presentationPhase, presentationPhaseSamples))"
+            + " latch_lead_ms=\(String(format: "%.2f", Self.gamingLatchLeadSeconds * 1_000))"
+            + " phase_offset_ms=\(String(format: "%.2f", Self.gamingOutputPhaseOffsetSeconds * 1_000))"
             + " deadline_resync=\(deadlineResyncs)"
             + " deadline_deficit_ms=\(averageMilliseconds(deadlineDeficit, deadlineResyncs))"
             + "/\(averageMilliseconds(deadlineMaximumDeficit, 1))"
@@ -1199,18 +1250,27 @@ extension MetalRenderer {
     /// keeps the source IOSurface alive until Metal has finished sampling it.
     private func armGamingCompletion(commandBuffer: MTLCommandBuffer,
                                      drawable: CAMetalDrawable,
-                                     frame: StreamFrame) {
+                                     frame: StreamFrame,
+                                     targetPresentationMicros: UInt64) {
         let submittedMicros = ClientClock.nowMicros()
         let captureClientMicros = frame.captureClientMicros
         let decodedMicros = frame.decodedMicros
         drawable.addPresentedHandler { [weak self] presented in
             guard let self, presented.presentedTime > 0 else { return }
+            let presentedMicros = UInt64(presented.presentedTime * 1_000_000)
+            let phaseMicros = Int64(presentedMicros) - Int64(targetPresentationMicros)
+            if abs(phaseMicros) < 100_000 {
+                self.frameLock.lock()
+                self.gamingPresentationPhaseMicros += phaseMicros
+                self.gamingPresentationPhaseSamples += 1
+                self.frameLock.unlock()
+            }
             self.onFramePresented?(
                 PresentationTiming(captureClientMicros: captureClientMicros,
                                    decodedMicros: decodedMicros,
                                    drawStartedMicros: submittedMicros,
                                    submittedMicros: submittedMicros,
-                                   presentedMicros: UInt64(presented.presentedTime * 1_000_000))
+                                   presentedMicros: presentedMicros)
             )
         }
         commandBuffer.addCompletedHandler { [weak self] completed in

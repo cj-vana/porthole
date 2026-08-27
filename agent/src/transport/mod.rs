@@ -80,6 +80,13 @@ type WriterSlot = Arc<Mutex<Option<(u64, mpsc::SyncSender<Vec<u8>>)>>>;
 /// (US-013) updates what later clients are told, not just the connected one.
 type HelloSlot = Arc<Mutex<Hello>>;
 
+/// Bar operations can launch a desktop helper, so they live on one bounded
+/// worker instead of ever blocking the latency-sensitive control reader.
+struct DesktopBarRequest {
+    command: protocol::DesktopBarCommand,
+    writer: mpsc::SyncSender<Vec<u8>>,
+}
+
 /// Handle for agent -> client messages outside the control listener (the
 /// pipeline's `agent_stats`). Cloneable; sends never block.
 #[derive(Clone)]
@@ -125,6 +132,7 @@ pub fn spawn_control_listener(
     })?;
     tracing::info!(addr = %cfg.control_addr(), "control channel listening");
     let (tx, rx) = mpsc::channel();
+    let desktop_bar_tx = spawn_desktop_bar_worker()?;
     let slot: WriterSlot = Arc::default();
     let hello_slot: HelloSlot = Arc::new(Mutex::new(hello));
     let control = ControlSender {
@@ -141,6 +149,7 @@ pub fn spawn_control_listener(
                 input_tx,
                 clipboard_tx,
                 gamepad_tx,
+                desktop_bar_tx,
                 slot,
                 pipeline_start,
             })
@@ -155,6 +164,7 @@ struct AcceptArgs {
     input_tx: Option<mpsc::Sender<InputEvent>>,
     clipboard_tx: Option<mpsc::Sender<String>>,
     gamepad_tx: Option<mpsc::Sender<protocol::GamepadState>>,
+    desktop_bar_tx: mpsc::SyncSender<DesktopBarRequest>,
     slot: WriterSlot,
     pipeline_start: Instant,
 }
@@ -167,6 +177,7 @@ fn accept_loop(args: AcceptArgs) {
         input_tx,
         clipboard_tx,
         gamepad_tx,
+        desktop_bar_tx,
         slot,
         pipeline_start,
     } = args;
@@ -242,12 +253,29 @@ fn accept_loop(args: AcceptArgs) {
             input_tx: input_tx.clone(),
             clipboard_tx: clipboard_tx.clone(),
             gamepad_tx: gamepad_tx.clone(),
+            desktop_bar_tx: desktop_bar_tx.clone(),
             writer_tx,
             slot: slot.clone(),
             pipeline_start,
         });
         current = Some(stream);
     }
+}
+
+fn spawn_desktop_bar_worker() -> io::Result<mpsc::SyncSender<DesktopBarRequest>> {
+    let (tx, rx) = mpsc::sync_channel::<DesktopBarRequest>(8);
+    thread::Builder::new()
+        .name("desktop-bar".into())
+        .spawn(move || {
+            for request in rx {
+                let state = crate::desktop_bar::apply(request.command);
+                let _ = request.writer.try_send(protocol::encode_control_message(
+                    protocol::CONTROL_MSG_DESKTOP_BAR,
+                    &state.encode(),
+                ));
+            }
+        })?;
+    Ok(tx)
 }
 
 /// Writer thread: the only place that writes to this connection. Exits when
@@ -288,6 +316,7 @@ struct ReaderArgs {
     input_tx: Option<mpsc::Sender<InputEvent>>,
     clipboard_tx: Option<mpsc::Sender<String>>,
     gamepad_tx: Option<mpsc::Sender<protocol::GamepadState>>,
+    desktop_bar_tx: mpsc::SyncSender<DesktopBarRequest>,
     writer_tx: mpsc::SyncSender<Vec<u8>>,
     slot: WriterSlot,
     pipeline_start: Instant,
@@ -311,6 +340,7 @@ fn read_loop(args: ReaderArgs) {
         input_tx,
         clipboard_tx,
         gamepad_tx,
+        desktop_bar_tx,
         writer_tx,
         slot,
         pipeline_start,
@@ -366,6 +396,24 @@ fn read_loop(args: ReaderArgs) {
                         %peer,
                         len = payload.len(),
                         "malformed display resize, ignored"
+                    ),
+                }
+            }
+            Ok(Some((protocol::CONTROL_MSG_DESKTOP_BAR, payload))) => {
+                match protocol::DesktopBarCommand::decode(&payload) {
+                    Some(command) => {
+                        let request = DesktopBarRequest {
+                            command,
+                            writer: writer_tx.clone(),
+                        };
+                        if desktop_bar_tx.try_send(request).is_err() {
+                            tracing::debug!(%peer, "desktop bar worker busy, dropping request");
+                        }
+                    }
+                    None => tracing::debug!(
+                        %peer,
+                        len = payload.len(),
+                        "malformed desktop bar command, ignored"
                     ),
                 }
             }

@@ -223,6 +223,15 @@ from the client is not sent straight back. Install `wl-clipboard`
 runs without clipboard sync. Clipboard rides the control channel (message
 type 0x07, either direction); see `../docs/protocol.md`.
 
+### Remote desktop bar
+
+On Omarchy, the Mac session's Remote bar switch uses message 0x0A to query,
+hide, or restore the Quickshell panel. The agent calls the supported
+`omarchy-toggle-bar` helper, which changes Quickshell's watched `bar-off`
+state instead of stopping the shell. A dedicated bounded worker performs the
+operation so it never blocks the control reader that carries input. Other
+desktops are reported as unavailable and remain untouched.
+
 ## Configuration
 
 Single TOML file (PRD FR-11); every field is optional. Precedence:

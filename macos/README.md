@@ -289,10 +289,13 @@ device) is logged and costs sound only; the session stays up on video.
   chrome with status text and the latency readout, captured/lock indicators,
   Fit/Full sizing, the Auto/60/120/144 Hz local-display control, the
   Max 120/144/180/288 capture-ceiling control, measured-rate Stats, collapsible
-  controls, input toggles, audio controls, host field, and connect button.
+  controls, input toggles, acknowledged remote desktop-bar control, audio
+  controls, host field, and connect button. Hide controls collapses both
+  chrome rows to an explicit Controls tab; Full + Gaming stays entirely clean
+  and Escape returns to Fit and the controls.
 - `Porthole/Streaming/WireProtocol.swift` implements the v1 wire format:
   length-prefixed TCP control frames, `hello`, `pong`, and `agent_stats`
-  parsing, `ping`, settings, and display-resize encoding, the message type
+  parsing, `ping`, settings, display-resize, and desktop-bar encoding, the message type
   table including the 0x10-0x15 input types, the 25-byte video datagram header, and the 16-byte audio
   datagram header.
 - `Porthole/Streaming/ControlChannel.swift` is the TCP client

@@ -56,6 +56,9 @@ final class StreamSession: ObservableObject {
     /// Animation can retain the cadence of a previously drained swapchain;
     /// rebuilding the surface isolates reconnects from that old layer.
     @Published private(set) var surfaceGeneration: UInt64 = 0
+    /// A supported remote panel is reported after the initial control query.
+    /// `unavailable` also covers older agents that do not implement it.
+    @Published private(set) var desktopBarState: DesktopBarState = .unavailable
 
     /// The surface's renderer; decoded frames replace the test pattern.
     let renderer = MetalRenderer()
@@ -137,6 +140,7 @@ final class StreamSession: ObservableObject {
         guard state == .disconnected else { return }
         surfaceGeneration &+= 1
         lastError = nil
+        desktopBarState = .unavailable
         state = .connecting
         needsKeyframe = true
         appliedStoredSettings = false
@@ -183,6 +187,7 @@ final class StreamSession: ObservableObject {
         hello = nil
         connectedHost = nil
         latency = .empty
+        desktopBarState = .unavailable
         state = .disconnected
     }
 
@@ -190,6 +195,12 @@ final class StreamSession: ObservableObject {
     /// touching the connection.
     func setClipboardSync(_ enabled: Bool) {
         peripherals.clipboardEnabled = enabled
+    }
+
+    /// Reversible remote panel control. The published state changes only
+    /// after the agent acknowledges what the desktop actually applied.
+    func setDesktopBarVisible(_ visible: Bool) {
+        control.sendDesktopBar(visible ? .show : .hide)
     }
 
     /// AppKit reports every layout change; exact deduplication plus a short
@@ -289,12 +300,17 @@ final class StreamSession: ObservableObject {
         case .ready:
             // Connected to a candidate; stop the fallback walk.
             dialer.cancel()
+            control.sendDesktopBar(.query)
         case .hello(let hello):
             handleHello(hello)
         case .pong(let pong):
             clockOffset.addPong(pong, receivedMicros: receivedMicros)
         case .agentStats(let agentStats):
             latestAgentStats = agentStats
+        case .desktopBar(let barState):
+            DispatchQueue.main.async { [weak self] in
+                self?.desktopBarState = barState
+            }
         case .clipboard(let text):
             peripherals.applyClipboard(fromPeer: text)
         case .disconnected(let reason):

@@ -46,6 +46,9 @@ It is two programs that share one wire protocol:
 - Display modes: adaptive Fit and native Full. The Linux headless output
   follows the settled Mac viewport in backing pixels instead of encoding a
   fixed source only to rescale it locally.
+- The session controls can collapse to a small reopen tab. On Omarchy hosts,
+  a separately acknowledged Remote bar switch hides and restores the Linux
+  panel without killing or restarting Quickshell.
 - Two-way clipboard sync, desktop audio (Opus), file drag and drop, and
   gamepad passthrough.
 

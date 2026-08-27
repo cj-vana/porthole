@@ -89,6 +89,8 @@ pub const CONTROL_MSG_AGENT_STATS: u8 = 5;
 pub const CONTROL_MSG_SETTINGS: u8 = 6;
 /// Control message type: client -> agent virtual-display geometry.
 pub const CONTROL_MSG_DISPLAY_RESIZE: u8 = 9;
+/// Reversible desktop-bar query/control, with an acknowledged state reply.
+pub const CONTROL_MSG_DESKTOP_BAR: u8 = 10;
 
 /// settings payload length.
 pub const SETTINGS_PAYLOAD_LEN: usize = 6;
@@ -99,6 +101,50 @@ pub const MIN_DISPLAY_WIDTH: u32 = 320;
 pub const MIN_DISPLAY_HEIGHT: u32 = 180;
 /// Bound remote allocation and Hyprland mode requests to a practical 8K box.
 pub const MAX_DISPLAY_DIMENSION: u32 = 8192;
+
+/// Client request carried by [`CONTROL_MSG_DESKTOP_BAR`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DesktopBarCommand {
+    Query = 0,
+    Show = 1,
+    Hide = 2,
+}
+
+impl DesktopBarCommand {
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        match payload {
+            [0] => Some(Self::Query),
+            [1] => Some(Self::Show),
+            [2] => Some(Self::Hide),
+            _ => None,
+        }
+    }
+}
+
+/// Agent reply carried by [`CONTROL_MSG_DESKTOP_BAR`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DesktopBarState {
+    Unavailable = 0,
+    Visible = 1,
+    Hidden = 2,
+}
+
+impl DesktopBarState {
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        match payload {
+            [0] => Some(Self::Unavailable),
+            [1] => Some(Self::Visible),
+            [2] => Some(Self::Hidden),
+            _ => None,
+        }
+    }
+
+    pub fn encode(self) -> [u8; 1] {
+        [self as u8]
+    }
+}
 
 /// Stream reconfiguration a client asks for at runtime (gaming mode,
 /// US-013): a different framerate, codec, or bitrate, and whether to bias
@@ -1374,6 +1420,33 @@ mod tests {
         assert!(DisplayResize::new(1921, 1080).is_none());
         assert!(DisplayResize::new(1920, 1081).is_none());
         assert!(DisplayResize::decode(&payload[..7]).is_none());
+    }
+
+    #[test]
+    fn desktop_bar_commands_and_states_are_one_byte() {
+        assert_eq!(
+            DesktopBarCommand::decode(&[0]),
+            Some(DesktopBarCommand::Query)
+        );
+        assert_eq!(
+            DesktopBarCommand::decode(&[1]),
+            Some(DesktopBarCommand::Show)
+        );
+        assert_eq!(
+            DesktopBarCommand::decode(&[2]),
+            Some(DesktopBarCommand::Hide)
+        );
+        assert_eq!(DesktopBarCommand::decode(&[]), None);
+        assert_eq!(DesktopBarCommand::decode(&[3]), None);
+        assert_eq!(DesktopBarCommand::decode(&[1, 2]), None);
+
+        for state in [
+            DesktopBarState::Unavailable,
+            DesktopBarState::Visible,
+            DesktopBarState::Hidden,
+        ] {
+            assert_eq!(DesktopBarState::decode(&state.encode()), Some(state));
+        }
     }
 
     #[test]

@@ -264,6 +264,15 @@ func runLocalTests() {
                    0, 0, 0x08, 0xBA
                ])
 
+    checkBytes("hide remote desktop bar",
+               Array(WireProtocol.encodeDesktopBar(.hide)), [
+                   0, 0, 0, 2, 0x0A, 2
+               ])
+    checkTrue("desktop bar visible reply parses",
+              DesktopBarState(payload: Data([1])) == .visible)
+    checkTrue("desktop bar reply rejects extra bytes",
+              DesktopBarState(payload: Data([1, 2])) == nil)
+
     // 10. A thumbnail fetched over a Tailscale/CGNAT endpoint must not teach
     //    the session to bypass a simultaneously advertised physical LAN
     //    address. The preference still wins among equally ranked paths.
@@ -300,7 +309,7 @@ func runLive(host: String, command: [String]) -> Never {
         case .hello(let hello):
             print("hello: \(hello.width)x\(hello.height), cap \(hello.fps) fps from \(host)")
             helloReceived.signal()
-        case .pong, .agentStats:
+        case .pong, .agentStats, .desktopBar:
             break // latency probes are the app's concern, not this gate's
         case .clipboard:
             break // clipboard sync is the app's concern, not this gate's

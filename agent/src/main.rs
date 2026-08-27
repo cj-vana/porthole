@@ -14,6 +14,7 @@ mod audio;
 mod capture;
 mod clipboard;
 mod config;
+mod desktop_bar;
 mod discovery;
 mod encode;
 mod gamepad;

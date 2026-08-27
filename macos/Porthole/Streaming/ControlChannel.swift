@@ -13,6 +13,7 @@ final class ControlChannel {
         case hello(Hello)
         case pong(Pong)
         case agentStats(AgentStats)
+        case desktopBar(DesktopBarState)
         /// Text the agent's clipboard picked up (US-008).
         case clipboard(String)
         case disconnected(reason: String)
@@ -101,6 +102,13 @@ final class ControlChannel {
         connection?.send(content: frame, completion: .contentProcessed { _ in })
     }
 
+    /// Query or change the remote desktop bar without involving the video
+    /// pipeline. Unsupported agents safely ignore the new message type.
+    func sendDesktopBar(_ command: DesktopBarCommand) {
+        let frame = WireProtocol.encodeDesktopBar(command)
+        connection?.send(content: frame, completion: .contentProcessed { _ in })
+    }
+
     /// Clipboard text sync (US-008): UTF-8 payload, no trailing NUL. An
     /// empty string clears the remote selection.
     func sendClipboard(_ text: String) {
@@ -175,6 +183,19 @@ final class ControlChannel {
             } else {
                 logger.warning("ignoring malformed agent_stats (\(payload.count) bytes)")
             }
+        default:
+            handleAuxiliaryFrame(type: type, payload: payload)
+        }
+    }
+
+    private func handleAuxiliaryFrame(type: ControlMessageType, payload: Data) {
+        switch type {
+        case .desktopBar:
+            guard let state = DesktopBarState(payload: payload) else {
+                logger.warning("ignoring malformed desktop_bar (\(payload.count) bytes)")
+                return
+            }
+            onEvent?(.desktopBar(state))
         case .clipboard:
             if let text = String(data: payload, encoding: .utf8) {
                 onEvent?(.clipboard(text))

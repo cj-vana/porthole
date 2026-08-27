@@ -152,6 +152,34 @@ Clients should deduplicate and debounce interactive window resizing. When a
 settings change and resize are part of one action, send them consecutively so
 the agent can coalesce them into one pipeline rebuild.
 
+### desktop_bar (type 0x0A, either direction)
+
+Query, hide, or restore a supported remote desktop bar without restarting the
+desktop shell. The payload is exactly one byte. Client-to-agent values are:
+
+```
+value   command
+0       query current state
+1       show
+2       hide
+```
+
+The agent answers every valid request on the same message type after applying
+it:
+
+```
+value   state
+0       unavailable on this desktop
+1       visible
+2       hidden
+```
+
+The reference agent supports Omarchy's Quickshell bar through its idempotent
+`omarchy-toggle-bar` helper. It changes the shell's watched state flag rather
+than killing Quickshell. The operation runs off the control-reader thread so
+desktop tooling cannot delay input messages. Older agents ignore 0x0A; clients
+should omit or disable the control until an acknowledgement arrives.
+
 ### Input messages (client -> agent, US-006)
 
 One control connection carries hello + keyframe_request + input for one

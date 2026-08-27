@@ -41,6 +41,8 @@ enum ControlMessageType: UInt8 {
     case gamepad = 0x08
     /// client -> agent: resize the owned virtual display, 8-byte payload.
     case displayResize = 0x09
+    /// either direction: desktop-bar command or acknowledged state, 1 byte.
+    case desktopBar = 0x0A
     // Input messages (client -> agent, US-006). Layouts in docs/protocol.md.
     case pointerMotionAbs = 0x10
     case pointerMotionRel = 0x11
@@ -48,6 +50,26 @@ enum ControlMessageType: UInt8 {
     case pointerAxis = 0x13
     case key = 0x14
     case keyModifiers = 0x15
+}
+
+/// Client request for the remote desktop's supported status bar.
+enum DesktopBarCommand: UInt8 {
+    case query = 0
+    case show = 1
+    case hide = 2
+}
+
+/// Agent-confirmed remote desktop bar state. Unavailable agents/desktops do
+/// not surface a dead control in the session chrome.
+enum DesktopBarState: UInt8, Equatable {
+    case unavailable = 0
+    case visible = 1
+    case hidden = 2
+
+    init?(payload: Data) {
+        guard payload.count == 1 else { return nil }
+        self.init(rawValue: payload[0])
+    }
 }
 
 /// Parsed `hello` message (agent -> client).
@@ -176,6 +198,12 @@ extension WireProtocol {
         payload.appendUInt32BE(width)
         payload.appendUInt32BE(height)
         return encodeControlMessage(.displayResize, payload: payload)
+    }
+
+    /// Query, show, or hide the supported remote desktop bar. The agent
+    /// answers on the same message type with a `DesktopBarState` byte.
+    static func encodeDesktopBar(_ command: DesktopBarCommand) -> Data {
+        encodeControlMessage(.desktopBar, payload: Data([command.rawValue]))
     }
 
     /// Encode a `gamepad_state` control frame (US-014):
