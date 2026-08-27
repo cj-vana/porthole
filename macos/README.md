@@ -96,7 +96,7 @@ Once per second while connected, one line goes to os_log (subsystem
 `/tmp/porthole-mac-stats.log`:
 
 ```
-stats fps=214 gpu_fps=144 present_fps=144 prep_ms=0.01 decode_ms=1.88 rtt_ms=0.93 enc_ms=1.00 cap_arrive_ms=2.4 cap_decoded_ms=4.1 cap_present_ms=12.4 cap_gpu_ms=7.7 decoded_draw_ms=2.59 draw_present_ms=5.69 submit_present_ms=5.69 submit_gpu_ms=1.03 jitter_ms=0.01/0.23/0.30/0.31/0.80 max_gap_ms=4.7/5.5/5.5/7.8/13.0 loss=0.00% queue=0 agent_fps=214/214 tx_kbps=50195 pacer=144/144/144/0 hold=0 lookahead_ms=9.82 latch_wait_ms=6.24 drawable_wait_ms=0.80 prefetch=144/0 prefetch_wait_ms=6.91 prefetch_latch=144/0/0.80 cap_target_ms=9.29 deadline_resync=0 deadline_deficit_ms=0.00/0.00 stale_retry=0/0
+stats fps=215 gpu_fps=144 present_fps=144 prep_ms=0.01 decode_ms=1.52 rtt_ms=0.55 enc_ms=1.00 cap_arrive_ms=1.5 cap_decoded_ms=2.9 cap_present_ms=10.3 cap_gpu_ms=6.2 decoded_draw_ms=2.33 draw_present_ms=4.98 submit_present_ms=4.98 submit_gpu_ms=0.90 jitter_ms=0.01/0.15/0.22/0.21/0.58 max_gap_ms=4.7/5.1/5.3/7.5/8.2 loss=0.00% queue=0 agent_fps=215/215 tx_kbps=50430 audio_buf_ms=118 audio_pkts=50 audio_lost=0 audio_drop_ms=0 audio_underrun=0 present_driver=core_video_latch pacer=145/144/144/0 hold=0 lookahead_ms=9.73 latch_wait_ms=6.78 drawable_wait_ms=6.00 prefetch=144/0 prefetch_wait_ms=6.92 prefetch_latch=144/0/5.99 cap_target_ms=9.14 present_phase_ms=1.11 latch_lead_ms=4.00 phase_offset_ms=2.50 deadline_resync=0 deadline_deficit_ms=0.00/0.00 stale_retry=0/0
 ```
 
 - `fps`: frames decoded this second. `gpu_fps` is successful Metal command
@@ -132,6 +132,10 @@ stats fps=214 gpu_fps=144 present_fps=144 prep_ms=0.01 decode_ms=1.88 rtt_ms=0.9
   source misses a tick, without adding a network frame or video queue.
   `stale_retry` is ticks recovered / ticks retried by the bounded final late
   latch.
+- `present_driver=core_video_latch` identifies the active presentation path.
+  `present_phase_ms` is actual compositor presentation minus the nominal
+  target. `latch_lead_ms` and `phase_offset_ms` record the two timing constants
+  used for that run, so an A/B result remains reproducible.
 - `audio_*`: the audio channel's second (US-009): jitter buffer depth, Opus
   packets received, packets lost to sequence gaps, milliseconds dropped to
   keep the buffer under its cap, and playback underruns. All zeros until
@@ -237,14 +241,18 @@ the final latch, the renderer redraws the last real frame into the drawable it
 already acquired. The pixels would be held either way; presenting the hold
 prevents that drawable from starving the next real frame.
 
+Metal submission remains asynchronous after each command-buffer commit.
+Waiting synchronously for the command buffer to become scheduled places the
+cadence worker behind WindowServer's present handshake; at native 1440p that
+handshake can cross a refresh boundary and collapse an otherwise 144 Hz path
+to 60 Hz.
+
 On the tested fixed-144 Hz panel, Gaming + Auto stays at native 144 Hz. A
-clean 60-second soak with a deliberately slower 179.22 fps real source
-averaged 142.67 compositor-reported presentations/s; 54 windows delivered at
-least 143. One hundred ten local temporal holds kept the two-buffer cadence
-alive without synthesizing network frames. The per-window capture-to-present
-mean averaged 13.19 ms (11.6-20.1 ms range; one isolated
-compositor-pressure trough) and stream loss remained 0.00%. Those are software
-timestamps, not an optical measurement.
+clean 67-second native-Full 2560x1440 soak with a 214-215 fps real VFR source
+averaged 141.4 compositor-reported presentations/s with a 144 fps median.
+Capture-to-present latency averaged 10.49 ms, with a 10.50 ms median, 11.50 ms
+p95, and 9.70-12.70 ms range. Stream loss and deadline resynchronizations were
+both zero. Those are software timestamps, not an optical measurement.
 
 ## Audio (US-009)
 
@@ -358,9 +366,9 @@ device) is logged and costs sound only; the session stays up on video.
   a separate high-priority queue, but the layer has only two buffers and the
   video mailbox never becomes a queue. A local hold redraw prevents a source
   gap from abandoning an acquired surface. Immediate asynchronous presentation
-  avoids adding another refresh of timed-present latency. Presented and
-  GPU-completed handlers produce `cap_present_ms` and `cap_gpu_ms`; with no
-  stream, it draws the test pattern.
+  avoids both another refresh of timed-present latency and a synchronous
+  WindowServer scheduling fence. Presented and GPU-completed handlers produce
+  `cap_present_ms` and `cap_gpu_ms`; with no stream, it draws the test pattern.
 - `Porthole/Rendering/Shaders.metal` has the test pattern shaders (SMPTE-style
   bars, frame-pacing ticker sized to the selected rate, time-derived marker)
   and the video shaders (letterboxed fullscreen triangle, NV12 to RGB).
