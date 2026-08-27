@@ -31,11 +31,12 @@
 # Video codec: "h264" (default) or "hevc".
 # codec = "h264"
 
-# Hardware encoder backend: "nvenc" (default, NVIDIA dGPU) or "vaapi"
-# (Ryzen iGPU; keeps the dGPU free for gaming).
+# Hardware encoder backend: "nvenc" (default), "vaapi", or "gsr" for
+# GPU-resident PipeWire/dma-buf capture through gpu-screen-recorder.
 # encoder = "nvenc"
 
-# Stream framerate: 60 (default), 120, or 144.
+# Stream framerate: 60 (default), 120, 144, 180, or 288. High-rate modes
+# oversample client scanout; VFR emits only real frames if hardware is slower.
 # fps = 60
 
 # Virtual display for headless operation (US-015, Hyprland only): when set

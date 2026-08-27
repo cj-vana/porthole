@@ -26,12 +26,18 @@ It is two programs that share one wire protocol:
 - One-click connect from a machine picker with live thumbnails; no typing an
   IP address on the LAN. Off-LAN machines (over Tailscale) are added by
   address once.
-- 1440p H.264 or HEVC over the LAN with hardware encode and hardware decode.
-  Measured over a 2.5 GbE link: 1440p60 at 0.00% packet loss, about 53 ms
-  capture to pixels on screen, control round trip under a millisecond.
-- A gaming mode that switches to 144 fps HEVC with the encoder biased toward
-  latency: encode latency drops from about 23 ms to about 13 ms, and a
-  heads-up overlay shows fps, glass-to-glass, encode, network, and decode.
+- 1440p H.264 or HEVC over the LAN with GPU-resident capture/encode and
+  VideoToolbox decode. Direct private-LAN traffic is paced for 2.5 GbE;
+  tunnel/public peers retain a conservative 1 Gb/s burst ceiling.
+- A Maximum gaming mode that requests a 288 Hz VFR source and late-latches the
+  freshest real frame onto the physical display. On the fixed-144 Hz test
+  panel, Gaming + Auto now phase-locks to the native 144 Hz cadence. A clean
+  60-second high-motion soak averaged 142.43 actual presentations/s; 55 of 60
+  windows delivered at least 143, with brief drawable-availability troughs.
+  The per-window capture-to-present mean averaged 12.78 ms, ranged from 11.1
+  to 19.6 ms, and held 0.00% loss. Presentation time is reported by the Metal
+  drawable; it is a compositor timestamp, not an optical glass-to-glass
+  measurement. The latter needs a high-speed camera or photodiode rig.
 - Native Mac input: pixel-precise trackpad scrolling, modifier keys and
   shortcuts, a pointer-lock mode for games, and a single on-screen cursor.
 - Display modes: fit, 1:1 native pixels (razor-sharp text, scrollable), and

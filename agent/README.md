@@ -1,8 +1,9 @@
 # porthole-agent
 
-Linux agent for **Porthole**. It captures the desktop, hardware-encodes it on
-the machine's NVIDIA dGPU (NVENC) or on the Ryzen iGPU (VAAPI, selectable via
-`--encoder`), and streams it over LAN to the native Mac client. See
+Linux agent for **Porthole**. It captures the desktop, hardware-encodes it with
+NVENC, VAAPI, or a GPU-resident PipeWire/dma-buf path through
+gpu-screen-recorder (`--encoder gsr`), and streams it over LAN to the native
+Mac client. See
 `tasks/prd-porthole.md` for the full PRD.
 
 Current state: screen capture (US-001) works on Wayland via
@@ -27,8 +28,9 @@ requirement on Linux: `ffmpeg` with the `h264_nvenc`/`hevc_nvenc` and
 `h264_vaapi`/`hevc_vaapi` encoders, plus `libxkbcommon` (input injection,
 already present wherever Hyprland runs). Later stories will need:
 
-- An NVIDIA GPU with NVENC and the proprietary driver (default encoder), or a
-  Ryzen iGPU with VAAPI support for the `--encoder vaapi` path
+- An NVIDIA GPU with NVENC and the proprietary driver (default encoder), a
+  GPU with VAAPI support for `--encoder vaapi`, or gpu-screen-recorder for
+  the zero-copy `--encoder gsr` path
 
 ## Run
 
@@ -43,19 +45,19 @@ the capture/encode pipeline, logging a combined stats line once per second
 (capture fps, encode in/out fps, encoded kbps, keyframes, and
 `enc_latency_ms`: the mean time from frame submit to access unit ready).
 The same numbers go to the connected client once per second as an
-`agent_stats` control message, so the client can split its glass-to-glass
-measurement into encode and transport. Ctrl+C triggers a clean shutdown.
+`agent_stats` control message, so the client can split its compositor-reported
+end-to-end measurement into encode and transport. Ctrl+C triggers a clean shutdown.
 Set `PORTHOLE_DUMP_VIDEO=/path/out.h264` to write the encoded Annex B
 stream to a file for inspection with ffprobe.
 
 ### Encoder architecture (US-002)
 
-Encoding runs in an ffmpeg subprocess per session: raw bgra frames are piped
-to stdin, Annex B access units are read from stdout and cut at access unit
-delimiters (`-aud 1`). Chosen over linking libavcodec (via the ffmpeg-next
-crate) because the target box runs FFmpeg 9, far newer than those bindings
-support, and a subprocess needs no new system packages and survives FFmpeg
-upgrades. NVENC takes bgra input and converts on-GPU; VAAPI uses
+The NVENC and VAAPI paths run an ffmpeg subprocess per session: raw BGRA
+frames are piped to stdin, Annex B access units are read from stdout and cut
+at access unit delimiters (`-aud 1`). Chosen over linking libavcodec (via the
+ffmpeg-next crate) because the target box runs FFmpeg 9, far newer than those
+bindings support, and a subprocess needs no new system packages and survives
+FFmpeg upgrades. NVENC takes bgra input and converts on-GPU; VAAPI uses
 `hwupload,scale_vaapi=format=nv12` on the iGPU's render node, so no CPU
 pixel conversion runs on either backend. The VAAPI node is picked at
 encoder start unless `--vaapi-device` names one: the agent lists
@@ -72,6 +74,16 @@ the encoder before the first one comes out, so NVENC gets `-delay 0` with
 VAAPI gets `-bf 0`, `-async_depth 1` (one frame in flight instead of two),
 and `-rc_mode CBR`. No B-frames means no frame ever waits on a later one,
 and constant bitrate keeps per-frame size, and so transmit time, steady.
+
+The GSR path restores a one-time portal grant, imports PipeWire dma-bufs
+directly into the GPU encoder, and receives access-unit-framed RTP on a
+loopback-only socket. It avoids the 14.7 MiB 1440p CPU copy and GPU upload on
+every frame. VFR mode forwards real compositor frames immediately instead of
+manufacturing duplicate catch-up frames. Maximum mode requests 288 Hz from
+the compositor and encoder so a 120/144 Hz client can select a fresh source
+frame on every display tick without adding a jitter buffer. VFR reports the
+real delivered cadence when the host cannot reach the request (about 214 Hz
+on the 2560x1440 test host).
 
 ### Transport (US-003)
 
@@ -97,14 +109,13 @@ new control connection replaces the old one. Video goes to the control
 peer's IP at the negotiated port, so anything LAN-like (including
 Tailscale) works.
 
-A keyframe is several hundred datagrams, and firing them at NIC speed
-loses the tail of the burst two ways: macOS charges 2 KB of mbuf per
-received datagram regardless of size, so 400 datagrams overflow the default
-786 KB UDP socket buffer before the client reads any, and a userspace
-tunnel's ring between the kernel and its own thread overruns at line rate.
-The sender therefore paces each access unit's burst at 400 Mbit/s, sleeping
-only once the deficit reaches 50 microseconds, so a 500 KB IDR takes about
-10 ms to leave instead of a fraction of one.
+The sender chooses its burst ceiling by frame and destination: normal frames
+use 2.5 Gb/s for private/link-local peers and 1 Gb/s for overlay/public peers;
+keyframes and frames above 256 KiB use 400 Mb/s. The lower large-frame ceiling
+prevents a several-hundred-datagram IDR from overflowing macOS mbufs or a
+userspace tunnel ring, while ordinary direct-LAN frames no longer pay an
+unnecessary pacing delay. Sleeps shorter than 50 microseconds accumulate
+rather than disappearing into scheduler overhead.
 
 Gaming mode keeps routine IDRs five minutes apart and asks the app-owned GSR
 helper for an in-process IDR on join or unrepaired loss. The helper contract
@@ -224,8 +235,8 @@ Without `--config`, the agent loads
 | `--name`            | hostname | Machine name for mDNS and the picker      |
 | `--bitrate-mbps`    | 40      | Encoder target bitrate                     |
 | `--codec`           | h264    | `h264` or `hevc`                           |
-| `--encoder`         | nvenc   | `nvenc` (dGPU) or `vaapi` (iGPU)           |
-| `--fps`             | 60      | `60`, `120`, or `144`                      |
+| `--encoder`         | nvenc   | `nvenc`, `vaapi`, or zero-copy `gsr`       |
+| `--fps`             | 60      | `60`, `120`, `144`, `180`, or `288`        |
 | `--keyframe-interval-secs` | 2 | Seconds between IDR keyframes        |
 | `--virtual-display` | off     | `WxH@Hz`, e.g. `2560x1440@144` (see below) |
 | `--mtu`             | 1280    | Path MTU video datagrams are sized for (576 to 9000); 1500 on plain Ethernet |

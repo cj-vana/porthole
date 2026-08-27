@@ -7,11 +7,12 @@ window. See `../tasks/prd-porthole.md` for the full PRD.
 
 Status: PRD stories US-004 through US-007 work. The picker finds agents over
 mDNS, the app connects to a running porthole-agent over the wire protocol in
-`../docs/protocol.md`, decodes the H.264 stream with VideoToolbox, renders it
+`../docs/protocol.md`, decodes H.264 or HEVC with VideoToolbox, renders it
 letterboxed at the drawable's native resolution, forwards input over the same
-control connection, and measures capture-to-glass latency against the agent's
-clock. When disconnected, the surface shows a procedural test pattern with
-Auto/60/120/144 fps pacing.
+control connection, and correlates capture, arrival, decode, GPU, presentation,
+and nominal output-target timestamps against the agent's clock. When
+disconnected, the surface shows a procedural test pattern with Auto/60/120/144
+fps pacing.
 
 ## Requirements
 
@@ -57,9 +58,10 @@ files, `hyprctl activewindow`).
 
 ## Connecting
 
-The picker window lists machines found over mDNS (`_porthole._tcp`) plus
+The picker screen lists machines found over mDNS (`_porthole._tcp`) plus
 pinned and manually added ones, each with a thumbnail polled every 10 s from
-the agent's thumb port. Clicking a card opens the session window and dials.
+the agent's thumb port. Clicking a card switches the app's single window to
+the session and dials.
 
 Dialing walks the machine's addresses in order, one second per attempt: the
 host that most recently answered a thumbnail poll first (remembered per
@@ -68,9 +70,9 @@ not cost a timeout on every connect), then the mDNS-resolved LAN addresses,
 then the machine name as a bare host name, which is what reaches a Tailscale
 machine through MagicDNS. The first address to bring the control channel up
 wins and the walk stops. The session chrome keeps a host field as the manual
-escape hatch: edit it and Connect dials exactly what was typed. The agent
-must stream h264 (the default); hevc is rejected with an error until a later
-story adds it.
+escape hatch: edit it and Connect dials exactly what was typed. The client
+accepts both protocol codecs and switches its VideoToolbox decoder as soon as
+gaming mode requests HEVC.
 
 The control connection sets TCP_NODELAY. Input and probe messages are a few
 bytes each, and with Nagle on the kernel held each one for the peer's delayed
@@ -90,38 +92,52 @@ Once per second while connected, one line goes to os_log (subsystem
 `/tmp/porthole-mac-stats.log`:
 
 ```
-stats fps=143 decode_ms=1.84 rtt_ms=0.81 enc_ms=3.20 cap_arrive_ms=9.4 cap_decoded_ms=11.6 cap_present_ms=19.8 loss=0.00% queue=0 agent_fps=144/143 tx_kbps=38210 audio_buf_ms=41 audio_pkts=50 audio_lost=0 audio_drop_ms=0 audio_underrun=0
+stats fps=214 gpu_fps=144 present_fps=144 prep_ms=0.01 decode_ms=1.88 rtt_ms=0.93 enc_ms=1.00 cap_arrive_ms=2.4 cap_decoded_ms=4.1 cap_present_ms=12.4 cap_gpu_ms=7.7 decoded_draw_ms=2.59 draw_present_ms=5.69 submit_present_ms=5.69 submit_gpu_ms=1.03 jitter_ms=0.01/0.23/0.30/0.31/0.80 max_gap_ms=4.7/5.5/5.5/7.8/13.0 loss=0.00% queue=0 agent_fps=214/214 tx_kbps=50195 pacer=144/144/144/0 lookahead_ms=9.82 latch_wait_ms=6.24 drawable_wait_ms=0.80 prefetch=144/0 prefetch_wait_ms=6.91 prefetch_latch=144/0/0.80 cap_target_ms=9.29 deadline_resync=0 deadline_deficit_ms=0.00/0.00 stale_retry=0/0
 ```
 
-- `fps`: frames decoded this second. `decode_ms`: mean VideoToolbox decode
-  time per frame.
+- `fps`: frames decoded this second. `gpu_fps` is successful Metal command
+  completion; `present_fps` counts drawables with a compositor-reported
+  presentation time. `decode_ms`: mean VideoToolbox decode time per frame.
 - `rtt_ms`: control-channel round trip of the most recent ping/pong.
 - `enc_ms`, `agent_fps`, `tx_kbps`: the agent's side, from its most recent
   `agent_stats` message: mean encode latency, capture/encoded fps, and
   transmit rate.
 - `cap_arrive_ms`: agent capture to the access unit completing reassembly
-  here. `cap_decoded_ms`: capture to decode finished. `cap_present_ms`:
-  capture to the pixels presented on this display, taken from the Metal
-  drawable's presented time. All three are means over the second on the
-  client clock: each frame's agent timestamp is mapped through the offset
+  here. `cap_decoded_ms`: capture to decode finished. `cap_gpu_ms`: capture
+  to successful Metal completion. `cap_present_ms` is capture to the
+  `CAMetalDrawable.presentedTime` reported by the compositor and is the best
+  non-optical end-to-end measurement here. `cap_target_ms` is capture to the
+  pacer's nominal output target; it diagnoses scheduling but is not proof that
+  the drawable appeared then. Capture fields are means on the client clock:
+  each frame's agent timestamp is mapped through the offset
   estimated from pongs (`agent - (send + rtt/2)`, from the lowest-RTT pong of
   the last 60; a sliding window rather than an all-time minimum because the
   two clocks drift apart by tens of ppm, and an all-time minimum would show
   that drift as latency growing over hours).
+- `prefetch` reports ready/missed drawable reservations; its wait is resource
+  lookahead and does not freeze the newest decoded-frame mailbox.
+  `prefetch_latch` is reservations recovered at the latch / timed out / mean
+  bounded latch wait.
 - `loss`: lost frames as a percentage of frames seen (reassembly gaps, stale
   partials, backlog drops). `queue`: datagrams waiting for the decode queue.
+- `pacer` is hardware callbacks / phase-locked cadence ticks / committed
+  frames / ticks skipped after a late wake. The following fields expose
+  forecast horizon, late-latch wait, drawable acquisition, deadline recovery,
+  and capture-to-nominal-target. `stale_retry` is ticks recovered / ticks
+  retried by the bounded final late latch.
 - `audio_*`: the audio channel's second (US-009): jitter buffer depth, Opus
   packets received, packets lost to sequence gaps, milliseconds dropped to
   keep the buffer under its cap, and playback underruns. All zeros until
   audio packets flow.
 
 Until the first pong arrives, or against an agent that predates ping, `rtt_ms`
-and the three `cap_*` fields print `n/a` rather than a guess; the agent fields
+and the ordinary `cap_*` fields print `n/a` rather than a guess; the agent fields
 do the same until the first `agent_stats`. Read the line as a chain:
 `cap_arrive_ms` minus `enc_ms` is roughly transport, `cap_decoded_ms` minus
-`cap_arrive_ms` is queueing plus decode, and `cap_present_ms` minus
-`cap_decoded_ms` is the wait for the next display refresh. The session header
-shows the short form ("31 ms to glass, rtt 0.8 ms") while live.
+`cap_arrive_ms` is queueing plus decode. In gaming mode `cap_present_ms` is the
+end-to-end result reported by the compositor. It still is not an optical
+glass-to-glass measurement; validating photons requires a high-speed camera
+or photodiode.
 
 ## Input (US-006)
 
@@ -185,6 +201,25 @@ above the panel's maximum is clamped by the display link, and the test
 pattern's ticker shows it: cells advance at the selected rate while only 60
 draws happen per second, so the clamp appears as skipped cells.
 
+Gaming has a separate source-rate control. Maximum requests 288 Hz HEVC even
+on a 120/144 Hz client panel; VFR sends only real frames (about 214 Hz on the
+2560x1440 test host). The deliberate oversampling prevents independent
+capture and scanout clocks from slowly beating into doubled and missed frames.
+Core Video supplies the physical display's phase and period once; an
+independent mach-time cadence wheel then remains evenly phase-locked even when
+display-link callbacks bunch under WindowServer load. A high-priority worker
+reserves the next two-buffer drawable ahead of time, while the newest decoded
+frame is selected only at the late latch. A reservation that misses its
+acquisition deadline remains available for the next tick instead of forcing a
+late blocking submission.
+
+On the tested fixed-144 Hz panel, Gaming + Auto stays at native 144 Hz. A
+clean 60-second high-motion soak averaged 142.43 compositor-reported
+presentations/s; 55 windows delivered at least 143, and brief drawable
+availability throttling accounted for the remaining five. The per-window
+capture-to-present mean averaged 12.78 ms (11.1-19.6 ms range) with 0.00%
+stream loss. Those are software timestamps, not an optical measurement.
+
 ## Audio (US-009)
 
 Desktop audio arrives as Opus over UDP, 48 kHz stereo in 20 ms packets, on
@@ -214,8 +249,9 @@ device) is logged and costs sound only; the session stays up on video.
 
 ## What exists
 
-- `Porthole/PortholeApp.swift` holds the `@main` app: the picker window and
-  the single session window, both dark with hidden title bars.
+- `Porthole/PortholeApp.swift` holds the `@main` app: one dark root window that
+  switches between picker and session content, avoiding hidden restored
+  windows that compete with fullscreen presentation.
 - `Porthole/PickerView.swift` is the machine picker: a card grid of discovered
   and pinned machines with live thumbnails, manual add by address, rename,
   pin, remove, and auto-reconnect to the last session.
@@ -225,8 +261,8 @@ device) is logged and costs sound only; the session stays up on video.
   (`ThumbnailFetcher`).
 - `Porthole/SessionView.swift` is the session screen: Metal surface, floating
   chrome with status text and the latency readout, captured/lock indicators,
-  the Auto/60/120/144 frame rate control, the two input toggles, the audio
-  mute and volume controls, host field, and connect button.
+  the Auto/60/120/144 display control, the 120/144/180/Maximum 288 gaming source
+  control, the two input toggles, audio controls, host field, and connect button.
 - `Porthole/Streaming/WireProtocol.swift` implements the v1 wire format:
   length-prefixed TCP control frames, `hello`, `pong`, and `agent_stats`
   parsing, `ping` encoding, the message type table including the 0x10-0x15
@@ -283,11 +319,14 @@ device) is logged and costs sound only; the session stays up on video.
   cursor rect while captured.
 - `Porthole/Rendering/MetalRenderer.swift` wraps `MTKView`. Live frames are
   converted to Metal textures via CVMetalTextureCache and drawn aspect-fit;
-  YCbCr to RGB conversion runs in the fragment shader. Gaming mode bypasses
-  the main thread, late-selects the newest decoded frame after drawable
-  acquisition, and uses a two-drawable pool so stale pixels cannot queue a
-  third refresh. Presented and GPU-completed handlers produce
-  `cap_present_ms` and `cap_gpu_ms`; with no stream, it draws the test pattern.
+  YCbCr to RGB conversion runs in the fragment shader. Gaming mode seeds a
+  mach-time cadence wheel from the physical display, then late-selects the
+  newest decoded frame on each fixed tick. Drawable reservation runs ahead on
+  a separate high-priority queue, but the layer has only two buffers and the
+  video mailbox never becomes a queue. Immediate asynchronous presentation
+  avoids adding another refresh of timed-present latency. Presented and
+  GPU-completed handlers produce `cap_present_ms` and `cap_gpu_ms`; with no
+  stream, it draws the test pattern.
 - `Porthole/Rendering/Shaders.metal` has the test pattern shaders (SMPTE-style
   bars, frame-pacing ticker sized to the selected rate, time-derived marker)
   and the video shaders (letterboxed fullscreen triangle, NV12 to RGB).
