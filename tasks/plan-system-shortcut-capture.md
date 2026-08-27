@@ -37,7 +37,7 @@ existing local safety path for pointer lock and native fullscreen.
 ## Acceptance criteria
 
 - [x] Command-Space arrives remotely as Super down, Space down/up, Super up.
-- [ ] Command-Space does not open Spotlight while Shortcuts is enabled and the
+- [x] Command-Space does not open Spotlight while Shortcuts is enabled and the
       session surface is captured.
 - [x] Command-Tab, Command-Q, Control-arrow, function-key shortcuts, and normal
       keys use the same remote-only capture path.
@@ -80,6 +80,10 @@ existing local safety path for pointer lock and native fullscreen.
   Super-Space. Then disable Shortcuts and confirm Spotlight opens locally.
 - Regression: verify unmodified Escape still releases pointer lock or exits
   native fullscreen.
+
+Live acceptance passed on 2026-08-27 using the Developer-ID-signed
+`/Applications/Porthole.app`: physical Command-Space stayed out of Spotlight
+and opened the remote Super-Space action while the surface was captured.
 
 ## Risks and mitigations
 
