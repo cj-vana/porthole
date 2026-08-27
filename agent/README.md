@@ -85,6 +85,14 @@ frame on every display tick without adding a jitter buffer. VFR reports the
 real delivered cadence when the host cannot reach the request (about 214 Hz
 on the 2560x1440 test host).
 
+Hyprland's desktop portal has an independent screencopy ceiling. Add
+`max_fps = 288` inside the existing `screencopy` block in
+`~/.config/hypr/xdph.conf`; otherwise GSR's `-f 288` request can still be
+silently capped by the portal. Restart `xdg-desktop-portal-hyprland.service`
+and the agent after changing it. Keep any existing picker/token settings in
+that block. A lower-rate application still produces only its real VFR damage;
+this raises the ceiling for games that can render faster.
+
 ### Transport (US-003)
 
 The wire format is specified in `../docs/protocol.md` and implemented once

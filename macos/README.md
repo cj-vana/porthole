@@ -92,7 +92,7 @@ Once per second while connected, one line goes to os_log (subsystem
 `/tmp/porthole-mac-stats.log`:
 
 ```
-stats fps=214 gpu_fps=144 present_fps=144 prep_ms=0.01 decode_ms=1.88 rtt_ms=0.93 enc_ms=1.00 cap_arrive_ms=2.4 cap_decoded_ms=4.1 cap_present_ms=12.4 cap_gpu_ms=7.7 decoded_draw_ms=2.59 draw_present_ms=5.69 submit_present_ms=5.69 submit_gpu_ms=1.03 jitter_ms=0.01/0.23/0.30/0.31/0.80 max_gap_ms=4.7/5.5/5.5/7.8/13.0 loss=0.00% queue=0 agent_fps=214/214 tx_kbps=50195 pacer=144/144/144/0 lookahead_ms=9.82 latch_wait_ms=6.24 drawable_wait_ms=0.80 prefetch=144/0 prefetch_wait_ms=6.91 prefetch_latch=144/0/0.80 cap_target_ms=9.29 deadline_resync=0 deadline_deficit_ms=0.00/0.00 stale_retry=0/0
+stats fps=214 gpu_fps=144 present_fps=144 prep_ms=0.01 decode_ms=1.88 rtt_ms=0.93 enc_ms=1.00 cap_arrive_ms=2.4 cap_decoded_ms=4.1 cap_present_ms=12.4 cap_gpu_ms=7.7 decoded_draw_ms=2.59 draw_present_ms=5.69 submit_present_ms=5.69 submit_gpu_ms=1.03 jitter_ms=0.01/0.23/0.30/0.31/0.80 max_gap_ms=4.7/5.5/5.5/7.8/13.0 loss=0.00% queue=0 agent_fps=214/214 tx_kbps=50195 pacer=144/144/144/0 hold=0 lookahead_ms=9.82 latch_wait_ms=6.24 drawable_wait_ms=0.80 prefetch=144/0 prefetch_wait_ms=6.91 prefetch_latch=144/0/0.80 cap_target_ms=9.29 deadline_resync=0 deadline_deficit_ms=0.00/0.00 stale_retry=0/0
 ```
 
 - `fps`: frames decoded this second. `gpu_fps` is successful Metal command
@@ -123,8 +123,11 @@ stats fps=214 gpu_fps=144 present_fps=144 prep_ms=0.01 decode_ms=1.88 rtt_ms=0.9
 - `pacer` is hardware callbacks / phase-locked cadence ticks / committed
   frames / ticks skipped after a late wake. The following fields expose
   forecast horizon, late-latch wait, drawable acquisition, deadline recovery,
-  and capture-to-nominal-target. `stale_retry` is ticks recovered / ticks
-  retried by the bounded final late latch.
+  and capture-to-nominal-target. `hold` is local redraws of the previous real
+  source frame: they keep an acquired two-buffer drawable recycling when the
+  source misses a tick, without adding a network frame or video queue.
+  `stale_retry` is ticks recovered / ticks retried by the bounded final late
+  latch.
 - `audio_*`: the audio channel's second (US-009): jitter buffer depth, Opus
   packets received, packets lost to sequence gaps, milliseconds dropped to
   keep the buffer under its cap, and playback underruns. All zeros until
@@ -211,14 +214,20 @@ display-link callbacks bunch under WindowServer load. A high-priority worker
 reserves the next two-buffer drawable ahead of time, while the newest decoded
 frame is selected only at the late latch. A reservation that misses its
 acquisition deadline remains available for the next tick instead of forcing a
-late blocking submission.
+late blocking submission. The wheel advances 2.5 ms from Core Video's nominal
+phase to account for the repeatable gap to the compositor-reported presentation
+slot while retaining the measured render margin. If no new generation lands by
+the final latch, the renderer redraws the last real frame into the drawable it
+already acquired. The pixels would be held either way; presenting the hold
+prevents that drawable from starving the next real frame.
 
 On the tested fixed-144 Hz panel, Gaming + Auto stays at native 144 Hz. A
-clean 60-second high-motion soak averaged 142.43 compositor-reported
-presentations/s; 55 windows delivered at least 143, and brief drawable
-availability throttling accounted for the remaining five. The per-window
-capture-to-present mean averaged 12.78 ms (11.1-19.6 ms range) with 0.00%
-stream loss. Those are software timestamps, not an optical measurement.
+clean 60-second soak with a deliberately slower 179.28 fps real source
+averaged 142.48 compositor-reported presentations/s; 54 windows delivered at
+least 143. Fifty-five local temporal holds kept the two-buffer cadence alive
+without synthesizing network frames. The per-window capture-to-present mean
+averaged 13.10 ms (11.9-18.6 ms range) with 0.00% stream loss. Those are
+software timestamps, not an optical measurement.
 
 ## Audio (US-009)
 
@@ -323,7 +332,8 @@ device) is logged and costs sound only; the session stays up on video.
   mach-time cadence wheel from the physical display, then late-selects the
   newest decoded frame on each fixed tick. Drawable reservation runs ahead on
   a separate high-priority queue, but the layer has only two buffers and the
-  video mailbox never becomes a queue. Immediate asynchronous presentation
+  video mailbox never becomes a queue. A local hold redraw prevents a source
+  gap from abandoning an acquired surface. Immediate asynchronous presentation
   avoids adding another refresh of timed-present latency. Presented and
   GPU-completed handlers produce `cap_present_ms` and `cap_gpu_ms`; with no
   stream, it draws the test pattern.
