@@ -152,7 +152,7 @@ extension WireProtocol {
     ///
     /// ```
     /// offset  size  field
-    /// 0       2     fps (BE u16): 60, 120, 144, or 180
+    /// 0       2     fps (BE u16): 60, 120, 144, 180, or 288
     /// 2       1     codec: 0 = h264, 1 = hevc
     /// 3       2     bitrate in Mbps (BE u16)
     /// 5       1     low_latency: 1 biases the encoder toward latency

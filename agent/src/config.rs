@@ -58,10 +58,10 @@ pub fn hostname() -> String {
     default_name()
 }
 
-/// Framerates the agent will stream at. The 180 Hz mode intentionally
-/// oversamples 120/144 Hz clients so independent capture and scanout clocks
-/// cannot beat against each other and periodically bunch frames.
-pub const ALLOWED_FPS: [u16; 4] = [60, 120, 144, 180];
+/// Framerates the agent will stream at. The 180 and 288 Hz modes oversample
+/// high-refresh clients; VFR output may deliver less when the compositor or
+/// encoder reaches its hardware limit.
+pub const ALLOWED_FPS: [u16; 5] = [60, 120, 144, 180, 288];
 
 /// A validated stream framerate, accepted from both the CLI (via `FromStr`)
 /// and the TOML file (via `Deserialize`).
@@ -254,7 +254,7 @@ pub struct Config {
     /// Hardware encoder backend (default nvenc on the dGPU; vaapi offloads
     /// to the Ryzen iGPU so the dGPU stays free for gaming).
     pub encoder: EncoderBackend,
-    /// Stream framerate (default 60; gaming mode selects up to 180, US-013).
+    /// Stream framerate (default 60; gaming mode selects up to 288, US-013).
     pub fps: Fps,
     /// Virtual display geometry for headless operation (default unset;
     /// US-015). When set and no physical output is attached, a Hyprland
@@ -514,6 +514,7 @@ mod tests {
         assert_eq!("120".parse::<Fps>().unwrap().get(), 120);
         assert_eq!("144".parse::<Fps>().unwrap().get(), 144);
         assert_eq!("180".parse::<Fps>().unwrap().get(), 180);
+        assert_eq!("288".parse::<Fps>().unwrap().get(), 288);
     }
 
     #[test]

@@ -23,12 +23,12 @@ struct StreamSettings: Equatable {
     }
 
     /// What the persisted chrome toggles ask for. SessionView owns the same
-    /// keys through @AppStorage; an unset rate selects the 180 Hz temporal
+    /// keys through @AppStorage; an unset rate selects the 288 Hz temporal
     /// oversampling profile.
     static func stored(defaults: UserDefaults = .standard) -> StreamSettings {
         guard defaults.bool(forKey: "gamingMode") else { return .quality }
         let fps = defaults.integer(forKey: "gamingFps")
-        return .gaming(fps: fps == 0 ? 180 : fps)
+        return .gaming(fps: fps == 0 ? 288 : fps)
     }
 
     /// Whether a hello already describes this configuration, so a matching

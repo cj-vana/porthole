@@ -210,6 +210,7 @@ final class SurfaceHostView: NSScrollView {
             // has still replaced the layer's drawable pool, so repair the
             // renderer binding once before reporting the restored state.
             if reportedFullscreen != isFullscreen {
+                surface.setFullscreenPresentationSettled(isFullscreen)
                 surface.reapplyPresentationMode()
                 renderer.resumePresentation(view: surface)
             }
@@ -221,6 +222,7 @@ final class SurfaceHostView: NSScrollView {
             // Suspending Metal before this call can leave that snapshot
             // transaction waiting forever after `willEnter`; the notification
             // handler below suspends presentation at the safe boundary.
+            NSApp.activate(ignoringOtherApps: true)
             window.makeKeyAndOrderFront(nil)
             DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(35)) { [weak self, weak window] in
                 guard let self, let window,
@@ -262,7 +264,13 @@ final class SurfaceHostView: NSScrollView {
 
     private func reportFullscreen(_ entered: Bool) {
         guard reportedFullscreen != entered else { return }
+        let hadReportedWindowState = reportedFullscreen != nil
         reportedFullscreen = entered
+        // A newly attached window is normally not fullscreen. SwiftUI already
+        // owns that initial state, and echoing it can race an on-appear gaming
+        // request back to Fit before AppKit starts the transition. Real exits
+        // still follow a previously reported fullscreen state.
+        guard entered || hadReportedWindowState else { return }
         onFullscreenChanged?(entered)
     }
 
@@ -358,6 +366,7 @@ final class SurfaceHostView: NSScrollView {
         fullscreenTransitionGeneration &+= 1
         fullscreenTogglePending = false
         fullscreenTransitionActive = false
+        surface.setFullscreenPresentationSettled(enteredFullscreen)
         surface.reapplyPresentationMode()
         renderer.resumePresentation(view: surface)
         // Track the completed window state locally before SwiftUI propagates

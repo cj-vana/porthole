@@ -5,7 +5,6 @@ import SwiftUI
 /// opens a session and connects immediately.
 struct PickerView: View {
     @EnvironmentObject private var store: MachineStore
-    @Environment(\.openWindow) private var openWindow
 
     /// Auto-reconnect to the last session on launch (US-012 preview).
     @AppStorage("autoReconnect") private var autoReconnect = true
@@ -48,8 +47,7 @@ struct PickerView: View {
             guard autoReconnect, !didAttemptAutoReconnect,
                   let machine = MachineStore.lastSessionMachine() else { return }
             didAttemptAutoReconnect = true
-            store.activeSessionMachine = machine
-            openWindow(id: "session")
+            store.openSession(to: machine)
         }
     }
 
@@ -108,8 +106,6 @@ struct PickerView: View {
 
     private func connect(to machine: Machine) {
         store.openSession(to: machine)
-        // Single session window: focuses the existing one when already open.
-        openWindow(id: "session")
     }
 }
 

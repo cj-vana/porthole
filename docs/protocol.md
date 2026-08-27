@@ -116,7 +116,7 @@ low-latency encoder bias, and optionally HEVC.
 
 ```
 offset  size  field
-0       2     fps (BE u16): 60, 120, 144, or 180
+0       2     fps (BE u16): 60, 120, 144, 180, or 288
 2       1     codec: 0 = h264, 1 = hevc
 3       2     bitrate in Mbps (BE u16)
 5       1     low_latency: 1 biases the encoder toward latency over quality
@@ -337,7 +337,7 @@ name=<machine name>                    picker display name
 control_port=52801                     TCP control channel
 video_port=52800                       UDP video datagrams
 thumb_port=52803                       TCP thumbnail endpoint (see below)
-caps=<encoder>,h264,hevc,180           capabilities, e.g. "gsr,h264,hevc,180"
+caps=<encoder>,h264,hevc,288           capabilities, e.g. "gsr,h264,hevc,288"
 ```
 
 The announcement is withdrawn when the agent exits.

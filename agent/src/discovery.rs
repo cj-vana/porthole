@@ -46,7 +46,7 @@ pub fn announce(cfg: &Config) -> Option<Announcement> {
 
 fn announce_inner(cfg: &Config) -> anyhow::Result<Announcement> {
     let daemon = ServiceDaemon::new().context("failed to start mDNS daemon")?;
-    let caps = format!("{},h264,hevc,180", cfg.encoder);
+    let caps = format!("{},h264,hevc,288", cfg.encoder);
     let properties: Vec<TxtProperty> = vec![
         ("v".to_string(), "1".to_string()),
         ("name".to_string(), cfg.name.clone()),

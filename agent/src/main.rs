@@ -84,7 +84,7 @@ struct Cli {
     #[arg(long, value_enum)]
     encoder: Option<encode::EncoderBackend>,
 
-    /// Stream framerate (60, 120, 144, or 180) [default: 60]
+    /// Stream framerate (60, 120, 144, 180, or 288) [default: 60]
     #[arg(long, value_name = "FPS")]
     fps: Option<config::Fps>,
 
@@ -519,6 +519,10 @@ fn capture_loop(
                     // request immediately, so a dropped hello does not strand
                     // it on the old codec.
                     if let Ok(fps) = config::Fps::new(settings.fps) {
+                        // A configured headless output is part of the capture
+                        // clock. Retiming it with the encoder avoids sampling
+                        // one cadence only to resample it again for the client.
+                        virtual_display::match_stream_refresh(cfg.virtual_display, settings.fps);
                         cfg.fps = fps;
                         frame_interval = Duration::from_secs_f64(1.0 / f64::from(fps.get()));
                     } else {

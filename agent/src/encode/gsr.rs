@@ -31,10 +31,16 @@ const MAX_ENCODED_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(4);
 const SOCKET_READ_TIMEOUT: Duration = Duration::from_millis(100);
 /// GSR's 90 kHz RTP clock identifies frame cadence but not the portal's
-/// monotonic-clock epoch. Anchor it just before the first completed packet.
-/// The estimate only affects telemetry/timestamps, never scheduling.
+/// monotonic-clock epoch. Keep its phase near the completed-packet clock with
+/// a conservative one-millisecond capture-to-RTP estimate. This only affects
+/// telemetry/timestamps, never scheduling.
 const CAPTURE_TO_RTP_ESTIMATE: Duration = Duration::from_micros(1_000);
 const RTP_CLOCK_HZ: u64 = 90_000;
+/// A slow phase-locked correction removes media-clock/host-clock drift without
+/// turning per-packet arrival jitter into capture-timestamp jitter.
+const RTP_CLOCK_PHASE_GAIN: i64 = 256;
+const RTP_CLOCK_MAX_CORRECTION_NS: i64 = 50_000;
+const RTP_CLOCK_REANCHOR_NS: i64 = 20_000_000;
 /// The optional Porthole helper is upstream GSR 6.0.1 plus the small patch in
 /// `agent/patches`: SIGRTMIN+7 atomically marks the next frame as an IDR.
 /// Keep it app-owned so a distro package update cannot silently replace the
@@ -593,7 +599,7 @@ fn append_aggregation(output: &mut Vec<u8>, mut payload: &[u8]) -> anyhow::Resul
 
 #[derive(Default)]
 struct RtpClock {
-    anchor: Option<(u32, Instant)>,
+    previous: Option<(u32, Instant)>,
 }
 
 impl RtpClock {
@@ -601,28 +607,47 @@ impl RtpClock {
         let fallback = ready_at
             .checked_sub(CAPTURE_TO_RTP_ESTIMATE)
             .unwrap_or(ready_at);
-        let Some((anchor_timestamp, anchor_capture)) = self.anchor else {
-            self.anchor = Some((timestamp, fallback));
+        let Some((previous_timestamp, previous_capture)) = self.previous else {
+            self.previous = Some((timestamp, fallback));
             return fallback;
         };
 
-        let ticks = u64::from(timestamp.wrapping_sub(anchor_timestamp));
+        let ticks = u64::from(timestamp.wrapping_sub(previous_timestamp));
         // Re-anchor well before the 32-bit 90 kHz clock wraps (~13.3 hours).
         // This also treats a discontinuity/restarted RTP clock conservatively.
         if ticks > RTP_CLOCK_HZ * 60 * 60 {
-            self.anchor = Some((timestamp, fallback));
+            self.previous = Some((timestamp, fallback));
             return fallback;
         }
-        let micros = ticks.saturating_mul(1_000_000) / RTP_CLOCK_HZ;
-        let predicted = anchor_capture + Duration::from_micros(micros);
-        if predicted > ready_at {
-            // CFR timestamps can lead packet availability by a fraction of a
-            // frame. Never claim capture occurred in the future.
-            self.anchor = Some((timestamp, fallback));
+        let nanos = ticks.saturating_mul(1_000_000_000) / RTP_CLOCK_HZ;
+        let predicted = previous_capture + Duration::from_nanos(nanos);
+        let phase_error = instant_difference_nanos(fallback, predicted);
+        let captured_at = if predicted > ready_at || phase_error.abs() > RTP_CLOCK_REANCHOR_NS {
+            // A restarted media clock or long suspend is not useful history.
             fallback
         } else {
-            predicted
-        }
+            let correction = (phase_error / RTP_CLOCK_PHASE_GAIN)
+                .clamp(-RTP_CLOCK_MAX_CORRECTION_NS, RTP_CLOCK_MAX_CORRECTION_NS);
+            if correction >= 0 {
+                predicted
+                    .checked_add(Duration::from_nanos(correction as u64))
+                    .unwrap_or(fallback)
+            } else {
+                predicted
+                    .checked_sub(Duration::from_nanos(correction.unsigned_abs()))
+                    .unwrap_or(fallback)
+            }
+        };
+        self.previous = Some((timestamp, captured_at));
+        captured_at
+    }
+}
+
+fn instant_difference_nanos(left: Instant, right: Instant) -> i64 {
+    if left >= right {
+        left.duration_since(right).as_nanos().min(i64::MAX as u128) as i64
+    } else {
+        -(right.duration_since(left).as_nanos().min(i64::MAX as u128) as i64)
     }
 }
 
@@ -720,5 +745,46 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recovered.data, [0, 0, 0, 1, 0x02, 1, 0xcc]);
+    }
+
+    #[test]
+    fn rtp_clock_tracks_host_drift_without_latency_walk() {
+        let mut clock = RtpClock::default();
+        let base = Instant::now();
+        let mut previous_capture = None;
+        let mut final_latency = Duration::ZERO;
+
+        // The host advances 151 ns more per 180 Hz frame than the nominal RTP
+        // clock. An immutable first-frame anchor would accumulate 4.5 ms of
+        // false encode latency over this run.
+        for frame in 0..30_000u64 {
+            let timestamp = (frame * 500) as u32;
+            let ready_at =
+                base + Duration::from_nanos(frame * 5_555_706) + Duration::from_micros(400);
+            let capture = clock.capture_time(timestamp, ready_at);
+            if let Some(previous) = previous_capture {
+                assert!(capture > previous);
+            }
+            previous_capture = Some(capture);
+            final_latency = ready_at.duration_since(capture);
+        }
+
+        assert!(final_latency >= Duration::from_micros(950));
+        assert!(final_latency <= Duration::from_micros(1_050));
+    }
+
+    #[test]
+    fn rtp_clock_reanchors_after_timestamp_discontinuity() {
+        let mut clock = RtpClock::default();
+        let base = Instant::now();
+        let first = clock.capture_time(1_000, base);
+        let ready = base + Duration::from_millis(10);
+        let reset = clock.capture_time(
+            1_000u32.wrapping_add((RTP_CLOCK_HZ * 60 * 60 + 1) as u32),
+            ready,
+        );
+
+        assert_eq!(first, base - CAPTURE_TO_RTP_ESTIMATE);
+        assert_eq!(reset, ready - CAPTURE_TO_RTP_ESTIMATE);
     }
 }

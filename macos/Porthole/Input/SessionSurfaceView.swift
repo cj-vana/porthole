@@ -1,4 +1,5 @@
 import AppKit
+import CoreGraphics
 import MetalKit
 import os
 
@@ -29,6 +30,7 @@ final class SessionSurfaceView: MTKView {
         didSet {
             if oldValue != lowLatencyPresentation {
                 applyPresentationMode()
+                applyFrameRate()
             }
         }
     }
@@ -44,6 +46,10 @@ final class SessionSurfaceView: MTKView {
     }
 
     private var screenObserver: NSObjectProtocol?
+    private var terminationObserver: NSObjectProtocol?
+    private var savedDisplayMode: (displayID: CGDirectDisplayID, mode: CGDisplayMode)?
+    private var displayModeChangeInFlight = false
+    private var fullscreenPresentationSettled = false
     private let logger = Logger(subsystem: "com.porthole.mac", category: "surface")
 
     /// Top-left origin, matching remote output pixels and the letterbox math.
@@ -61,6 +67,10 @@ final class SessionSurfaceView: MTKView {
         if let screenObserver {
             NotificationCenter.default.removeObserver(screenObserver)
         }
+        if let terminationObserver {
+            NotificationCenter.default.removeObserver(terminationObserver)
+        }
+        restoreGamingDisplayMode()
     }
 
     override func updateTrackingAreas() {
@@ -97,15 +107,27 @@ final class SessionSurfaceView: MTKView {
                 self.applyFrameRate()
             }
         }
+        if terminationObserver == nil {
+            terminationObserver = NotificationCenter.default.addObserver(
+                forName: NSApplication.willTerminateNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.restoreGamingDisplayMode()
+            }
+        }
         applyFrameRate()
     }
 
     private func applyPresentationMode() {
         guard let metalLayer = layer as? CAMetalLayer else { return }
-        // Timed synchronized presentation needs one drawable scanning, one
-        // reserved for the imminent vblank, and one writable. Hardware-tick
-        // admission prevents the three slots from becoming a frame backlog.
-        metalLayer.maximumDrawableCount = lowLatencyPresentation ? 3 : 2
+        // Keep the swapchain at the minimum depth. A third writable surface
+        // lets Core Animation retain another complete frame even though the
+        // cadence wheel submits only once per tick.
+        let drawableCount = 2
+        if metalLayer.maximumDrawableCount != drawableCount {
+            metalLayer.maximumDrawableCount = drawableCount
+        }
         // Fullscreen Space transitions can temporarily make every drawable
         // unavailable. A bounded nextDrawable() wait lets the mailbox recover
         // after occlusion instead of pinning its serial render worker forever.
@@ -113,11 +135,13 @@ final class SessionSurfaceView: MTKView {
         metalLayer.isOpaque = true
         metalLayer.backgroundColor = NSColor.black.cgColor
         metalLayer.presentsWithTransaction = false
-        // The renderer supplies the exact forecasted presentation timestamp;
-        // synchronization makes that reservation a tear-free scanout target.
-        metalLayer.displaySyncEnabled = true
+        // Gaming commits exactly once from the physical display link. Let that
+        // be the only pacing clock: synchronized Core Animation presentation
+        // otherwise retains two extra frames behind the manual late latch.
+        // Quality mode keeps the ordinary tear-free synchronized path.
+        metalLayer.displaySyncEnabled = !lowLatencyPresentation
         onPresentationLayerReady?()
-        logger.info("presentation sync on \(self.lowLatencyPresentation ? "(timed gaming)" : "(quality)")")
+        logger.info("presentation sync \(self.lowLatencyPresentation ? "off (gaming wheel)" : "on (quality)")")
     }
 
     /// AppKit may rebuild the layer's swapchain while entering or leaving a
@@ -128,18 +152,118 @@ final class SessionSurfaceView: MTKView {
         applyFrameRate()
     }
 
+    /// Native fullscreen replaces the drawable pool while its Space is still
+    /// animating. Delay the gaming-only panel cadence change until AppKit has
+    /// completed that replacement so the new swapchain inherits the final
+    /// display clock instead of the transient one.
+    func setFullscreenPresentationSettled(_ settled: Bool) {
+        fullscreenPresentationSettled = settled
+    }
+
     private func applyFrameRate() {
-        let screenMax = (window?.screen ?? NSScreen.main)?.maximumFramesPerSecond ?? 0
+        let screen = window?.screen ?? NSScreen.main
+        let screenMax = screen?.maximumFramesPerSecond ?? 0
         let resolved: Int
         if targetFrameRate > 0 {
             resolved = targetFrameRate
         } else {
             resolved = screenMax > 0 ? screenMax : 60
         }
-        if preferredFramesPerSecond != resolved {
-            preferredFramesPerSecond = resolved
-            logger.info("display link \(resolved) Hz (target \(self.targetFrameRate), screen max \(screenMax))")
+        let presentationRate = resolved
+        // MTKView is paused in gaming mode, but its rate hint still controls
+        // CAMetalLayer recycling. Keep it on the cadence wheel's clock.
+        let layerRateHint = presentationRate
+        applyGamingDisplayMode(screen: screen, refreshRate: presentationRate)
+        if preferredFramesPerSecond != layerRateHint {
+            preferredFramesPerSecond = layerRateHint
+            logger.info(
+                "layer \(layerRateHint) Hz; gaming \(presentationRate) Hz; screen \(screenMax) Hz"
+            )
         }
+    }
+
+    private func applyGamingDisplayMode(screen: NSScreen?, refreshRate: Int) {
+        guard !displayModeChangeInFlight else { return }
+        guard lowLatencyPresentation, fullscreenPresentationSettled, let screen,
+              let displayID = screen.deviceDescription[
+                  NSDeviceDescriptionKey("NSScreenNumber")
+              ] as? NSNumber else {
+            restoreGamingDisplayMode()
+            return
+        }
+        let targetID = CGDirectDisplayID(displayID.uint32Value)
+        if let savedDisplayMode, savedDisplayMode.displayID != targetID {
+            restoreGamingDisplayMode()
+        }
+        guard let currentMode = CGDisplayCopyDisplayMode(targetID),
+              abs(currentMode.refreshRate - Double(refreshRate)) >= 0.5,
+              let targetMode = displayMode(screen: screen, refreshRate: refreshRate) else { return }
+
+        if savedDisplayMode == nil {
+            savedDisplayMode = (targetID, currentMode)
+        }
+        displayModeChangeInFlight = true
+        let changed = Self.configureDisplay(targetID, mode: targetMode)
+        displayModeChangeInFlight = false
+        if changed {
+            logger.info(
+                "gaming display cadence \(Int(currentMode.refreshRate)) -> \(refreshRate) Hz"
+            )
+            // CoreGraphics completes the mode transaction synchronously, but
+            // AppKit publishes the replacement drawable pool shortly after.
+            // Rebind once that pool exists; the second pass sees the desired
+            // mode and therefore cannot trigger another display transaction.
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(200)) { [weak self] in
+                self?.reapplyPresentationMode()
+            }
+        } else {
+            savedDisplayMode = nil
+            logger.error("could not apply gaming display cadence \(refreshRate) Hz")
+        }
+    }
+
+    private func displayMode(screen: NSScreen, refreshRate: Int) -> CGDisplayMode? {
+        guard let displayNumber = screen.deviceDescription[
+            NSDeviceDescriptionKey("NSScreenNumber")
+        ] as? NSNumber else { return nil }
+        let displayID = CGDirectDisplayID(displayNumber.uint32Value)
+        guard let current = CGDisplayCopyDisplayMode(displayID),
+              let modes = CGDisplayCopyAllDisplayModes(displayID, nil) as? [CGDisplayMode] else {
+            return nil
+        }
+        return modes.first {
+            $0.width == current.width
+                && $0.height == current.height
+                && $0.pixelWidth == current.pixelWidth
+                && $0.pixelHeight == current.pixelHeight
+                && abs($0.refreshRate - Double(refreshRate)) < 0.5
+        }
+    }
+
+    private func restoreGamingDisplayMode() {
+        guard !displayModeChangeInFlight, let savedDisplayMode else { return }
+        displayModeChangeInFlight = true
+        let restored = Self.configureDisplay(savedDisplayMode.displayID,
+                                             mode: savedDisplayMode.mode)
+        displayModeChangeInFlight = false
+        if restored {
+            logger.info("restored display cadence \(Int(savedDisplayMode.mode.refreshRate)) Hz")
+            self.savedDisplayMode = nil
+        } else {
+            logger.error("could not restore original display cadence")
+        }
+    }
+
+    private static func configureDisplay(_ displayID: CGDirectDisplayID,
+                                         mode: CGDisplayMode) -> Bool {
+        var configuration: CGDisplayConfigRef?
+        guard CGBeginDisplayConfiguration(&configuration) == .success,
+              let configuration else { return false }
+        guard CGConfigureDisplayWithDisplayMode(configuration, displayID, mode, nil) == .success else {
+            CGCancelDisplayConfiguration(configuration)
+            return false
+        }
+        return CGCompleteDisplayConfiguration(configuration, .forSession) == .success
     }
 
     // MARK: Cursor

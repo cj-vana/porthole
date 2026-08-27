@@ -7,6 +7,7 @@ import UniformTypeIdentifiers
 /// as the manual escape hatch (mDNS is link-local, so a Tailscale-only
 /// machine still needs an address typed).
 struct SessionView: View {
+    @EnvironmentObject private var store: MachineStore
     /// Target frame rate for the render surface, persisted across launches:
     /// 0 is Auto (the screen's maximum refresh rate), else 60/120/144.
     @AppStorage("targetFrameRate") private var targetFrameRate = 0
@@ -19,9 +20,9 @@ struct SessionView: View {
     @AppStorage("pointerLock") private var pointerLock = false
     /// Gaming mode (US-013): high-rate low-latency HEVC stream.
     @AppStorage("gamingMode") private var gamingMode = false
-    /// The gaming-mode stream rate. Ultra oversamples a 120/144 Hz panel to
+    /// The gaming-mode stream rate. Maximum oversamples a 120/144 Hz panel to
     /// prevent the remote capture clock from beating against local scanout.
-    @AppStorage("gamingFps") private var gamingFps = 180
+    @AppStorage("gamingFps") private var gamingFps = 288
     /// Latency HUD over the stream (US-013).
     @AppStorage("statsOverlay") private var statsOverlay = false
     /// Remote audio playback level, 0 to 1 (US-009).
@@ -91,6 +92,9 @@ struct SessionView: View {
         .preferredColorScheme(.dark)
         .navigationTitle(machine.name)
         .onAppear {
+            if gamingMode, displayMode != .fullscreen {
+                displayMode = .fullscreen
+            }
             session.input.sendSystemShortcuts = sendSystemShortcuts
             session.input.wantsPointerLock = pointerLock
             session.audio.setVolume(Float(audioVolume))
@@ -99,6 +103,9 @@ struct SessionView: View {
             if !session.isConnected, !host.isEmpty {
                 connect()
             }
+        }
+        .onDisappear {
+            session.disconnect()
         }
         .onChange(of: clipboardSync) { _, enabled in
             session.setClipboardSync(enabled)
@@ -116,6 +123,9 @@ struct SessionView: View {
             session.input.wantsPointerLock = newValue
         }
         .onChange(of: gamingMode) { _, enabled in
+            if enabled, displayMode != .fullscreen {
+                displayMode = .fullscreen
+            }
             session.setGamingMode(enabled, fps: gamingFps)
         }
         .onChange(of: gamingFps) { _, fps in
@@ -174,6 +184,10 @@ struct SessionView: View {
             Image(systemName: "dot.radiowaves.left.and.right")
             Text(machine.name)
                 .font(.headline)
+            Button("Machines") {
+                store.activeSessionMachine = nil
+            }
+            .help("Return to the machine picker")
             Spacer()
             if session.pointerLockActive {
                 Label("pointer locked", systemImage: "lock.fill")
@@ -230,7 +244,7 @@ struct SessionView: View {
             }
             .pickerStyle(.segmented)
             .fixedSize()
-            .help("Display link rate; Auto follows the screen the window is on")
+            .help("Auto follows the screen; Gaming phase-locks presentation to its native cadence")
             Toggle("Gaming", isOn: $gamingMode)
                 .toggleStyle(.switch)
                 .controlSize(.small)
@@ -240,10 +254,11 @@ struct SessionView: View {
                     Text("120").tag(120)
                     Text("144").tag(144)
                     Text("Ultra 180").tag(180)
+                    Text("Maximum 288").tag(288)
                 }
                 .pickerStyle(.segmented)
                 .fixedSize()
-                .help("Ultra oversamples the display to minimize frame age and clock-beat stutter")
+                .help("Maximum requests 288 Hz; VFR sends only real compositor frames")
             }
             Toggle("Stats", isOn: $statsOverlay)
                 .toggleStyle(.switch)
@@ -343,7 +358,7 @@ private struct StatsHUD: View {
     var body: some View {
         Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 3) {
             row("fps", stats.decodedFps.map(String.init))
-            row("glass", milliseconds(stats.capturePresentMs))
+            row("present", milliseconds(stats.capturePresentMs))
             row("encode", milliseconds(stats.encodeMs))
             row("network", milliseconds(stats.networkMs))
             row("decode", milliseconds(stats.decodeMs))

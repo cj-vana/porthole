@@ -23,10 +23,7 @@ final class MachineStore: ObservableObject {
     }
 
     @Published private(set) var cards: [Card] = []
-    /// The machine shown in the single session window; set by the picker on
-    /// connect. One window by design: openWindow(id:) focuses the existing
-    /// window instead of spawning duplicates, and the control channel is
-    /// single-client per agent anyway.
+    /// The machine shown in the single root window; nil shows the picker.
     @Published var activeSessionMachine: Machine?
 
     /// Open a session to a machine: pins it, remembers it for

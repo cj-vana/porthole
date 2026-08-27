@@ -5,7 +5,7 @@ import Foundation
 /// (older agent, or the first second of a session) leaves every
 /// offset-based field nil, and agent-side figures wait for agent_stats.
 struct LatencyStats: Equatable {
-    /// Capture on the agent to pixels presented on this display.
+    /// Capture on the agent to the drawable's compositor-reported presentation.
     var capturePresentMs: Double?
     var rttMs: Double?
     /// Frames decoded in the last second.
@@ -28,7 +28,7 @@ struct LatencyStats: Equatable {
     var summary: String {
         var parts: [String] = []
         if let capturePresentMs {
-            parts.append(String(format: "%.0f ms to glass", capturePresentMs))
+            parts.append(String(format: "%.0f ms to present", capturePresentMs))
         }
         if let rttMs {
             parts.append(String(format: "rtt %.1f ms", rttMs))

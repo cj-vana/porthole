@@ -12,7 +12,8 @@ import os
 /// Threading: control callbacks arrive on the control queue and datagrams
 /// on the receive thread; everything session-stateful (reassembly, decode,
 /// stats counters, the clock offset) runs on the serial decode queue.
-/// Published properties are set on the main queue.
+/// Published properties are set on the main queue. One instance belongs to
+/// one session screen and is disconnected when that screen disappears.
 final class StreamSession: ObservableObject {
     enum State: Equatable {
         case disconnected
@@ -455,7 +456,7 @@ extension StreamSession {
         return true
     }
 
-    /// Gaming mode: 120/144/180 fps HEVC at 60 Mbps with the encoder
+    /// Gaming mode: up to 288 fps HEVC at 60 Mbps with the encoder
     /// biased toward latency; off restores 60 fps H.264 at 40 Mbps. The
     /// decoder switches codec immediately rather than waiting for the
     /// reconfigured hello, which is advisory (docs/protocol.md "settings").
