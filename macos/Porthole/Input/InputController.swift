@@ -18,11 +18,9 @@ final class InputController {
 
     /// Remote output size from the hello handshake.
     var videoSize = CGSize(width: 2560, height: 1440)
-    /// When false, Cmd chords (Cmd+Space, Cmd+Tab, ...) are not forwarded and
-    /// macOS keeps them. When true they are forwarded best effort; note that
-    /// Cmd+Tab and friends are intercepted by the Window Server before the
-    /// app ever sees them, so "on" cannot forward those particular chords.
-    var sendSystemShortcuts = false
+    /// When false, macOS keeps system shortcuts. When true, an active session
+    /// event tap sends captured keyboard input exclusively to the remote.
+    private(set) var sendSystemShortcuts = false
     /// Chrome toggle intent. The lock engages only while the surface has
     /// focus; Esc releases it.
     var wantsPointerLock = false {
@@ -39,6 +37,11 @@ final class InputController {
     // redundant key_modifiers frame; only real changes do.
     private var lastSentDepressed: UInt32 = 0
     private var lastSentLocked: UInt32 = 0
+    private var systemShortcutCapture: SystemShortcutCapture?
+
+    deinit {
+        systemShortcutCapture?.stop()
+    }
 
     /// Mouse buttons the protocol understands.
     enum MouseButton {
@@ -73,17 +76,67 @@ final class InputController {
 
     // MARK: Keyboard
 
+    /// Transactionally enable system shortcut capture. A failed event-tap
+    /// installation leaves the mode off so the UI never promises interception
+    /// while Spotlight and other local shortcuts remain active.
+    @discardableResult
+    func setSystemShortcutCaptureEnabled(_ enabled: Bool) -> Bool {
+        if !enabled {
+            sendSystemShortcuts = false
+            systemShortcutCapture?.stop()
+            systemShortcutCapture = nil
+            return true
+        }
+        if sendSystemShortcuts, systemShortcutCapture?.isRunning == true {
+            return true
+        }
+
+        let capture = SystemShortcutCapture(input: self)
+        sendSystemShortcuts = true
+        guard capture.start() else {
+            sendSystemShortcuts = false
+            return false
+        }
+        systemShortcutCapture = capture
+        capture.setCaptureActive(isCaptured)
+        return true
+    }
+
+    /// Shared by the Core Graphics event tap and the byte-exact input harness.
+    /// True means the keyboard event was translated and must not reach macOS.
+    @discardableResult
+    func handleCapturedKeyboardEvent(_ event: NSEvent) -> Bool {
+        switch event.type {
+        case .keyDown:
+            return handleKeyDown(event, capturedBySystemTap: true)
+        case .keyUp:
+            handleKeyUp(event, capturedBySystemTap: true)
+            return true
+        case .flagsChanged:
+            handleFlagsChanged(event)
+            return true
+        default:
+            return false
+        }
+    }
+
     /// Returns true when the event was consumed (forwarded or deliberately
     /// handled); false means the caller should pass it up the responder chain.
     @discardableResult
     func handleKeyDown(_ event: NSEvent) -> Bool {
+        handleKeyDown(event, capturedBySystemTap: false)
+    }
+
+    private func handleKeyDown(_ event: NSEvent, capturedBySystemTap: Bool) -> Bool {
         // Pointer lock: Esc releases the lock and is not forwarded.
         if isPointerLocked, event.keyCode == 0x35 { // kVK_Escape
             wantsPointerLock = false
             return true
         }
         // System-shortcut chords stay local unless the toggle says otherwise.
-        if event.modifierFlags.contains(.command), !sendSystemShortcuts {
+        if event.modifierFlags.contains(.command),
+           !sendSystemShortcuts,
+           !capturedBySystemTap {
             return false
         }
         guard let code = KeyMap.evdevCode(forKeyCode: event.keyCode) else {
@@ -101,7 +154,13 @@ final class InputController {
     }
 
     func handleKeyUp(_ event: NSEvent) {
-        if event.modifierFlags.contains(.command), !sendSystemShortcuts {
+        handleKeyUp(event, capturedBySystemTap: false)
+    }
+
+    private func handleKeyUp(_ event: NSEvent, capturedBySystemTap: Bool) {
+        if event.modifierFlags.contains(.command),
+           !sendSystemShortcuts,
+           !capturedBySystemTap {
             return
         }
         guard let code = KeyMap.evdevCode(forKeyCode: event.keyCode) else { return }
@@ -204,6 +263,7 @@ final class InputController {
     func setCaptured(_ captured: Bool) {
         guard captured != isCaptured else { return }
         isCaptured = captured
+        systemShortcutCapture?.setCaptureActive(captured && sendSystemShortcuts)
         if !captured {
             releaseModifiers()
         }

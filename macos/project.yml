@@ -62,6 +62,7 @@ targets:
       - path: Porthole/Input/KeyMap.swift
       - path: Porthole/Input/InputMessages.swift
       - path: Porthole/Input/InputController.swift
+      - path: Porthole/Input/SystemShortcutCapture.swift
     settings:
       base:
         PRODUCT_NAME: porthole-input-test

@@ -209,7 +209,53 @@ func runLocalTests() {
     checkBytes("typeText Hello!\\n", wire, expected)
     wire.removeAll()
 
-    // 8. A thumbnail fetched over a Tailscale/CGNAT endpoint must not teach
+    // 8. The system event-tap path forwards Command+Space as Super+Space in
+    //    exact modifier/key order. This is the chord macOS otherwise consumes
+    //    for Spotlight before the focused view receives it.
+    let localCommandSpace = keyEvent(.keyDown,
+                                     keyCode: 0x31,
+                                     modifiers: [.command],
+                                     characters: " ")
+    checkTrue("Command+Space stays local outside event tap",
+              !controller.handleKeyDown(localCommandSpace) && wire.isEmpty)
+    checkTrue("shortcut filter owns active captured input",
+              SystemShortcutCapture.shouldFilter(event: localCommandSpace,
+                                                 enabled: true,
+                                                 captured: true,
+                                                 applicationIsActive: true))
+    checkTrue("shortcut filter releases input when app is inactive",
+              !SystemShortcutCapture.shouldFilter(event: localCommandSpace,
+                                                  enabled: true,
+                                                  captured: true,
+                                                  applicationIsActive: false))
+    let plainEscape = keyEvent(.keyDown, keyCode: 0x35)
+    checkTrue("shortcut filter reserves plain Escape locally",
+              !SystemShortcutCapture.shouldFilter(event: plainEscape,
+                                                  enabled: true,
+                                                  captured: true,
+                                                  applicationIsActive: true))
+    let shortcutEvents = [
+        keyEvent(.flagsChanged, keyCode: 0x37, modifiers: [.command]),
+        keyEvent(.keyDown, keyCode: 0x31, modifiers: [.command], characters: " "),
+        keyEvent(.keyUp, keyCode: 0x31, modifiers: [.command], characters: " "),
+        keyEvent(.flagsChanged, keyCode: 0x37, modifiers: [])
+    ]
+    var shortcutConsumed = true
+    for event in shortcutEvents {
+        shortcutConsumed = controller.handleCapturedKeyboardEvent(event) && shortcutConsumed
+    }
+    checkTrue("captured Command+Space events consumed", shortcutConsumed)
+    checkBytes("captured Command+Space -> Super+Space", wire, [
+        0, 0, 0, 4, 0x14, 0, 125, 1, // KEY_LEFTMETA down
+        0, 0, 0, 17, 0x15, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // Super modifier
+        0, 0, 0, 4, 0x14, 0, 57, 1, // KEY_SPACE down
+        0, 0, 0, 4, 0x14, 0, 57, 0, // KEY_SPACE up
+        0, 0, 0, 4, 0x14, 0, 125, 0, // KEY_LEFTMETA up
+        0, 0, 0, 17, 0x15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 // modifiers clear
+    ])
+    wire.removeAll()
+
+    // 9. A thumbnail fetched over a Tailscale/CGNAT endpoint must not teach
     //    the session to bypass a simultaneously advertised physical LAN
     //    address. The preference still wins among equally ranked paths.
     let txt = ["v": Data("1".utf8)]

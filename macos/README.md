@@ -22,6 +22,10 @@ fps pacing.
   (`swiftlint lint --strict` from this directory is a gate)
 - Deployment target: macOS 14.0
 - VideoToolbox works headless, so the decode gate below runs fine in CI.
+- The optional Shortcuts mode needs Accessibility access so its active event
+  tap can prevent macOS from consuming remote keyboard chords. Porthole asks
+  only when Shortcuts is first enabled and links directly to the correct
+  Privacy & Security pane if access is missing.
 
 ## Build & run
 
@@ -183,11 +187,15 @@ Mapping and behavior:
 
 Chrome toggles (both persisted):
 
-- "Shortcuts" sends Cmd chords to the remote machine instead of keeping them
-  local. Limits: Cmd+Tab is intercepted by the Window Server before any app
-  sees it, Spotlight's Cmd+Space is eaten system-wide when enabled, and menu
-  equivalents like Cmd+Q act locally first. On means best effort, not full
-  interception.
+- "Shortcuts" installs an Accessibility-authorized, head-insert session event
+  tap. While Porthole is active and the stream surface has focus, key down,
+  key up, and modifier events go exclusively through `InputController` and do
+  not reach macOS. Command-Space becomes remote Super-Space instead of local
+  Spotlight; Command-Tab, Command-Q, Control-arrow, function-key shortcuts,
+  normal typing, and their key-up events use the same path. Turning the toggle
+  off, moving focus to Porthole's chrome, or deactivating the app restores
+  ordinary local input immediately. Unmodified Escape remains local as the
+  pointer-lock and native-fullscreen safety key.
 - "Pointer lock" hides the local cursor and switches motion to
   pointer_motion_rel deltas (NSEvent deltaX/deltaY, 1/256 px units) for games
   and 3D apps. It engages only while the surface has focus and Esc releases it.
@@ -323,6 +331,9 @@ device) is logged and costs sound only; the session stays up on video.
 - `Porthole/Input/InputController.swift` translates NSEvents to wire messages:
   modifier tracking with key_modifiers ordering, pointer lock, scroll source
   and sign conventions, focus capture state, and release-on-focus-loss.
+- `Porthole/Input/SystemShortcutCapture.swift` owns the active Core Graphics
+  session event tap, permission gate, focus checks, system-event suppression,
+  and automatic recovery if macOS disables a slow tap.
 - `Porthole/Input/SessionSurfaceView.swift` is the MTKView subclass that takes
   first responder on click, forwards NSEvents to the controller, resolves the
   Auto frame rate against its window's screen, and installs the transparent

@@ -40,8 +40,9 @@ It is two programs that share one wire protocol:
   trough, and held 0.00% loss. Presentation time is reported by the Metal
   drawable; it is a compositor timestamp, not an optical glass-to-glass
   measurement. The latter needs a high-speed camera or photodiode rig.
-- Native Mac input: pixel-precise trackpad scrolling, modifier keys and
-  shortcuts, a pointer-lock mode for games, and a single on-screen cursor.
+- Native Mac input: pixel-precise trackpad scrolling, modifier keys, exclusive
+  remote shortcut capture (including Command-Space and Command-Tab), a
+  pointer-lock mode for games, and a single on-screen cursor.
 - Display modes: fit, 1:1 native pixels (razor-sharp text, scrollable), and
   fullscreen in its own Space.
 - Two-way clipboard sync, desktop audio (Opus), file drag and drop, and

@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -11,9 +12,8 @@ struct SessionView: View {
     /// Target frame rate for the render surface, persisted across launches:
     /// 0 is Auto (the screen's maximum refresh rate), else 60/120/144.
     @AppStorage("targetFrameRate") private var targetFrameRate = 0
-    /// When off, Cmd chords stay with macOS; when on, they forward to the
-    /// remote machine best effort (Cmd+Tab and Spotlight's Cmd+Space are
-    /// intercepted by macOS before the app sees them regardless).
+    /// When off, shortcuts stay with macOS. When on, an Accessibility-backed
+    /// event tap captures the focused surface's keyboard before system hotkeys.
     @AppStorage("sendSystemShortcuts") private var sendSystemShortcuts = false
     /// Pointer lock: hides the local cursor and sends relative motion for
     /// games and 3D apps. Esc releases it.
@@ -41,6 +41,7 @@ struct SessionView: View {
     /// not actually fullscreen; hiding chrome from preference alone would
     /// leave no local escape hatch.
     @State private var isNativeFullscreen = false
+    @State private var shortcutCapturePermissionRequired = false
     @StateObject private var session = StreamSession()
     /// Drag-and-drop file transfers to the connected machine (US-011).
     @StateObject private var transfers = FileTransferList()
@@ -95,7 +96,7 @@ struct SessionView: View {
             if gamingMode, displayMode != .fullscreen {
                 displayMode = .fullscreen
             }
-            session.input.sendSystemShortcuts = sendSystemShortcuts
+            applySystemShortcutSetting(sendSystemShortcuts)
             session.input.wantsPointerLock = pointerLock
             session.audio.setVolume(Float(audioVolume))
             session.audio.setMuted(audioMuted)
@@ -117,7 +118,7 @@ struct SessionView: View {
             session.audio.setMuted(muted)
         }
         .onChange(of: sendSystemShortcuts) { _, newValue in
-            session.input.sendSystemShortcuts = newValue
+            applySystemShortcutSetting(newValue)
         }
         .onChange(of: pointerLock) { _, newValue in
             session.input.wantsPointerLock = newValue
@@ -150,6 +151,15 @@ struct SessionView: View {
             displayMode = DisplayMode.stored(forMachine: newMachine.id)
             connect()
         }
+        .alert("Allow Shortcut Capture",
+               isPresented: $shortcutCapturePermissionRequired) {
+            Button("Open System Settings") {
+                openAccessibilitySettings()
+            }
+            Button("Not Now", role: .cancel) {}
+        } message: {
+            Text("Enable Porthole in Privacy & Security > Accessibility, then turn Shortcuts on again.")
+        }
     }
 
     /// Remote video size in pixels once known; .zero keeps one-to-one on
@@ -177,6 +187,21 @@ struct SessionView: View {
         if entered != (displayMode == .fullscreen) {
             displayMode = entered ? .fullscreen : .fit
         }
+    }
+
+    private func applySystemShortcutSetting(_ enabled: Bool) {
+        guard session.input.setSystemShortcutCaptureEnabled(enabled) else {
+            sendSystemShortcuts = false
+            shortcutCapturePermissionRequired = true
+            return
+        }
+    }
+
+    private func openAccessibilitySettings() {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        ) else { return }
+        NSWorkspace.shared.open(url)
     }
 
     private var statusBar: some View {
@@ -267,7 +292,7 @@ struct SessionView: View {
             Toggle("Shortcuts", isOn: $sendSystemShortcuts)
                 .toggleStyle(.switch)
                 .controlSize(.small)
-                .help("Forward Cmd chords to the remote machine (best effort; macOS keeps Cmd+Tab)")
+                .help("Capture keyboard shortcuts for the remote machine (requires Accessibility)")
             Toggle("Pointer lock", isOn: $pointerLock)
                 .toggleStyle(.switch)
                 .controlSize(.small)
