@@ -21,12 +21,21 @@ targets:
         MACOSX_DEPLOYMENT_TARGET: "14.0"
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
-        CODE_SIGN_STYLE: Automatic
-        # Ad hoc ("Sign to Run Locally"): no developer cert needed for LAN dev builds.
-        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
         # App sandbox deliberately OFF for now; see README (raw UDP/TCP + GameController).
         ENABLE_APP_SANDBOX: NO
         ENABLE_HARDENED_RUNTIME: NO
+      configs:
+        Debug:
+          # Fast local iteration remains certificate-free.
+          CODE_SIGN_IDENTITY: "-"
+        Release:
+          # A stable designated requirement lets macOS Accessibility trust
+          # survive app updates instead of binding to one ad-hoc code hash.
+          CODE_SIGN_IDENTITY: "Developer ID Application"
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+          DEVELOPMENT_TEAM: 3JMVY5B37V
+          ENABLE_HARDENED_RUNTIME: YES
   porthole-decode-test:
     type: tool
     platform: macOS
