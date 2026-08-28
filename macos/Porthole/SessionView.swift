@@ -74,6 +74,7 @@ struct SessionView: View {
                     statusBar
                     controlBar
                 }
+                .frame(maxWidth: .infinity, alignment: .top)
                 .padding(.top, 12)
             }
         }
@@ -93,7 +94,7 @@ struct SessionView: View {
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
             handleDrop(providers)
         }
-        .frame(minWidth: 1100, minHeight: 600)
+        .frame(minWidth: 760, minHeight: 480)
         .background(Color.black)
         .preferredColorScheme(.dark)
         .navigationTitle(machine.name)
@@ -196,10 +197,44 @@ struct SessionView: View {
     }
 
     private var statusBar: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) {
+                sessionIdentityControls
+                    .fixedSize(horizontal: true, vertical: true)
+                Spacer(minLength: 8)
+                sessionStatusDetails
+                    .fixedSize(horizontal: true, vertical: true)
+                connectionButton
+                    .fixedSize(horizontal: true, vertical: true)
+            }
+
+            VStack(spacing: 6) {
+                HStack(spacing: 10) {
+                    sessionIdentityControls
+                    Spacer(minLength: 8)
+                    connectionButton
+                }
+                HStack(spacing: 8) {
+                    sessionStatusDetails
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .padding(.horizontal, 16)
+    }
+
+    private var sessionIdentityControls: some View {
         HStack(spacing: 10) {
             Image(systemName: "dot.radiowaves.left.and.right")
             Text(machine.name)
                 .font(.headline)
+                .lineLimit(1)
+                .truncationMode(.middle)
             Button("Machines") {
                 store.activeSessionMachine = nil
             }
@@ -211,7 +246,11 @@ struct SessionView: View {
             }
             .buttonStyle(.borderless)
             .help("Hide Porthole controls")
-            Spacer()
+        }
+    }
+
+    private var sessionStatusDetails: some View {
+        HStack(spacing: 8) {
             if session.pointerLockActive {
                 Label("pointer locked", systemImage: "lock.fill")
                     .font(.callout)
@@ -230,6 +269,12 @@ struct SessionView: View {
                     .foregroundStyle(.secondary)
                     .help("Capture to pixels on screen, and control round trip; n/a until the agent answers a ping")
             }
+        }
+        .lineLimit(1)
+    }
+
+    private var connectionButton: some View {
+        HStack(spacing: 8) {
             if !session.isConnected {
                 TextField("host", text: $host)
                     .textFieldStyle(.roundedBorder)
@@ -244,66 +289,103 @@ struct SessionView: View {
             }
             .disabled(host.isEmpty)
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .background(.ultraThinMaterial, in: Capsule())
-        .padding(.horizontal, 16)
     }
 
     private var controlBar: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
+        ViewThatFits(in: .horizontal) {
             HStack(spacing: 8) {
-                Picker("Display mode", selection: $displayMode) {
-                    ForEach(DisplayMode.allCases) { mode in
-                        Text(mode.label).tag(mode)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .fixedSize()
-                .help("Fit adapts the Linux display to this window; Full uses native fullscreen")
-                Picker("Local display", selection: $targetFrameRate) {
-                    Text("Auto").tag(0)
-                    Text("60 Hz").tag(60)
-                    Text("120 Hz").tag(120)
-                    Text("144 Hz").tag(144)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .fixedSize()
-                .help("Local presentation: Auto follows this screen's native refresh rate")
-                Toggle("Gaming", isOn: $gamingMode)
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                    .fixedSize()
-                    .help("High-rate HEVC with the encoder biased toward latency")
-                if gamingMode {
-                    Picker("Capture ceiling", selection: $gamingFps) {
-                        Text("Max 120").tag(120)
-                        Text("Max 144").tag(144)
-                        Text("Max 180").tag(180)
-                        Text("Max 288").tag(288)
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .fixedSize()
-                    .help("Capture ceiling, not delivered fps; Stats reports the measured rates")
-                }
-                if session.desktopBarState != .unavailable {
-                    Toggle("Remote bar", isOn: desktopBarVisible)
-                        .toggleStyle(.switch)
-                        .controlSize(.small)
-                        .fixedSize()
-                        .help("Hide or restore the Linux desktop bar without stopping its shell")
-                }
+                displayModeControl
+                localDisplayControl
+                gamingControl
+                captureCeilingControl
+                remoteBarControl
                 audioControls
                 sessionOptionsMenu
             }
-            .padding(.horizontal, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            VStack(spacing: 6) {
+                HStack(spacing: 8) {
+                    displayModeControl
+                    gamingControl
+                    captureCeilingControl
+                    Spacer(minLength: 0)
+                }
+                HStack(spacing: 8) {
+                    localDisplayControl
+                    remoteBarControl
+                    Spacer(minLength: 0)
+                    audioControls
+                    sessionOptionsMenu
+                }
+            }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
         .padding(.horizontal, 8)
+    }
+
+    private var displayModeControl: some View {
+        Picker("Display mode", selection: $displayMode) {
+            ForEach(DisplayMode.allCases) { mode in
+                Text(mode.label).tag(mode)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .fixedSize()
+        .help("Fit adapts the Linux display to this window; Full uses native fullscreen")
+    }
+
+    private var localDisplayControl: some View {
+        Picker("Local display", selection: $targetFrameRate) {
+            Text("Auto").tag(0)
+            Text("60 Hz").tag(60)
+            Text("120 Hz").tag(120)
+            Text("144 Hz").tag(144)
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .fixedSize()
+        .help("Local presentation: Auto follows this screen's native refresh rate")
+    }
+
+    private var gamingControl: some View {
+        Toggle("Gaming", isOn: $gamingMode)
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            .fixedSize()
+            .help("High-rate HEVC with the encoder biased toward latency")
+    }
+
+    @ViewBuilder
+    private var captureCeilingControl: some View {
+        if gamingMode {
+            Picker("Capture ceiling", selection: $gamingFps) {
+                Text("Max 120").tag(120)
+                Text("Max 144").tag(144)
+                Text("Max 180").tag(180)
+                Text("Max 288").tag(288)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
+            .help("Capture ceiling, not delivered fps; Stats reports the measured rates")
+        }
+    }
+
+    @ViewBuilder
+    private var remoteBarControl: some View {
+        if session.desktopBarState != .unavailable {
+            Toggle("Remote bar", isOn: desktopBarVisible)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .fixedSize()
+                .help("Hide or restore the Linux desktop bar without stopping its shell")
+        }
     }
 
     private var sessionOptionsMenu: some View {
