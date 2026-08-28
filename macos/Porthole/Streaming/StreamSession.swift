@@ -415,6 +415,7 @@ final class StreamSession: ObservableObject {
     }
 
     private func emitStats() {
+        renderer.refreshPresentationEnvironment()
         stats.apply(renderTelemetry.drain())
         let rttMicros = clockOffset.latestRttMicros
         let line = stats.line(rttMicros: rttMicros, agentStats: latestAgentStats,

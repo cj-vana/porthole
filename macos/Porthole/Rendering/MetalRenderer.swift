@@ -1,4 +1,5 @@
 // swiftlint:disable file_length
+import AppKit
 import CoreVideo
 import Darwin
 import Foundation
@@ -11,24 +12,31 @@ import QuartzCore
 /// Presentation timing: quality mode asks MTKView for a draw on arrival.
 /// Gaming seeds a phase-locked mach-time cadence wheel from CVDisplayLink's
 /// hardware period, then latches the newest mailbox frame immediately before
-/// each scanout and renders directly into CAMetalLayer. Callback jitter cannot
-/// perturb the established cadence.
+/// each scanout and renders directly into CAMetalLayer. A bounded phase servo
+/// corrects drift without letting individual callback jitter become the clock.
 final class MetalRenderer: NSObject, MTKViewDelegate {
     static let pixelFormat: MTLPixelFormat = .bgra8Unorm
     /// Leave enough time for this single-triangle pass and Metal scheduling,
     /// while keeping the mailbox open for almost the entire refresh period.
-    /// Four milliseconds is an intentionally conservative direct-scanout
-    /// guard: the tested 144 Hz path stays on the current refresh instead of
-    /// occasionally paying a full 6.94 ms miss. Hidden microsecond overrides
-    /// keep future on-device A/B tests reproducible without turning them into
-    /// UI claims.
+    /// Four milliseconds keeps the mailbox open while leaving enough time for
+    /// the measured Metal pass. A short feedback-controlled recovery window
+    /// adds one millisecond only after a drawable or presentation outlier; the
+    /// steady path does not permanently pay that latency tax. Hidden overrides
+    /// keep future on-device A/B tests reproducible without becoming UI claims.
     private static let gamingLatchLeadSeconds = tunedSeconds(
         key: "gamingLatchLeadMicros",
         defaultMicros: 4_000,
         allowedMicros: 1_000...5_000
     )
-    /// A drawable that arrives inside this measured render margin is retained
-    /// for the next tick instead of being submitted across a scanout boundary.
+    private static let gamingRecoveryLeadSeconds = 0.0010
+    private static let gamingRecoveryFrameCount = 6
+    private static let gamingDrawableRecoveryThresholdSeconds = 0.00075
+    /// Follow genuine display-phase movement without importing callback jitter
+    /// into the independent wheel. At 144 Hz this converges a 3 ms step in
+    /// about 12 frames while moving any one latch by at most a quarter ms.
+    private static let gamingServoMaximumStepSeconds = 0.00025
+    /// Flag submissions that leave less than the measured Metal scheduling
+    /// margin, so cadence regressions remain visible in per-second telemetry.
     private static let gamingMinimumTargetLeadSeconds = 0.0010
     /// Only a stale tick spends this extra 0.5 ms waiting for a frame that
     /// landed just across the independent source/display clock boundary.
@@ -42,7 +50,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     /// observed slot while retaining a complete render margin.
     private static let gamingOutputPhaseOffsetSeconds = tunedSeconds(
         key: "gamingOutputPhaseMicros",
-        defaultMicros: 2_500,
+        defaultMicros: 1_500,
         allowedMicros: 0...6_000
     )
 
@@ -86,12 +94,6 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         let generation: UInt64
     }
 
-    private struct GamingDrawableReservation {
-        let drawable: CAMetalDrawable?
-        let pending: Bool
-        let ready: DispatchSemaphore
-    }
-
     /// A plane texture plus the cache entry that keeps it valid.
     private struct PlaneTexture {
         let reference: CVMetalTexture
@@ -116,10 +118,6 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
                                                   qos: .userInteractive,
                                                   autoreleaseFrequency: .workItem)
     private var gamingRenderQueueGeneration: UInt64 = 0
-    private var gamingPrefetchQueue = DispatchQueue(label: "com.porthole.mac.drawable-prefetch.0",
-                                                    qos: .userInteractive,
-                                                    autoreleaseFrequency: .workItem)
-    private var gamingPrefetchQueueGeneration: UInt64 = 0
     private let presentationWatchdogQueue = DispatchQueue(
         label: "com.porthole.mac.presentation-watchdog",
         qos: .userInteractive
@@ -141,33 +139,28 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     private var nextRenderToken: UInt64 = 0
     /// Tracks whether the late latch found a new decoded generation. When the
     /// source misses a tick, gaming redraws this generation to keep the
-    /// two-buffer swapchain recycling instead of abandoning its drawable.
+    /// swapchain recycling instead of abandoning its drawable.
     private var lastGamingGeneration: UInt64?
     private var gamingPacerGeneration: UInt64 = 0
     private var gamingCadenceRunning = false
+    private var gamingLatestForecastHostTime: UInt64 = 0
     private var gamingTickCallbacks = 0
     private var gamingTicksScheduled = 0
     private var gamingTicksCommitted = 0
     private var gamingTicksBusy = 0
     private var gamingFrameHolds = 0
-    /// Reserve the next writable two-buffer swapchain surface after submitting
-    /// N, then bind the newest decoded surface only at N+1's latch. Resource
-    /// acquisition no longer consumes the content-latch budget.
-    private var prefetchedGamingDrawable: CAMetalDrawable?
-    private var prefetchedGamingGeneration: UInt64 = 0
-    private var gamingDrawablePrefetchPending = false
-    private var gamingDrawablePrefetchReady = DispatchSemaphore(value: 0)
-    private var gamingDrawablePrefetchHits = 0
-    private var gamingDrawablePrefetchMisses = 0
-    private var gamingDrawablePrefetchRecoveries = 0
-    private var gamingDrawablePrefetchTimeouts = 0
-    private var gamingDrawablePrefetchLatchWaitTicks: UInt64 = 0
-    private var gamingDrawablePrefetchTicks: UInt64 = 0
-    private var gamingDrawablePrefetchSamples = 0
     private var gamingLookaheadTicks: UInt64 = 0
     private var gamingWaitTicks: UInt64 = 0
     private var gamingDrawableTicks: UInt64 = 0
     private var gamingDrawableSamples = 0
+    private var gamingRecoveryTicks = 0
+    private var gamingRecoveryFrames = 0
+    private var gamingRecoveryActivations = 0
+    private var gamingDrawableRecoverySignals = 0
+    private var gamingServoSignedTicks: Int64 = 0
+    private var gamingServoAbsoluteTicks: UInt64 = 0
+    private var gamingServoMaximumTicks: UInt64 = 0
+    private var gamingServoSamples = 0
     private var gamingDeadlineResyncs = 0
     private var gamingDeadlineDeficitTicks: UInt64 = 0
     private var gamingDeadlineMaximumDeficitTicks: UInt64 = 0
@@ -177,6 +170,10 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     private var gamingPresentationPhaseSamples = 0
     private var gamingStaleRetries = 0
     private var gamingStaleRecoveries = 0
+    /// AppKit and CAMetalLayer state sampled on the main thread. The stats
+    /// worker only reads this cached string, avoiding cross-thread window API
+    /// access while making silent 60 Hz/occlusion fallbacks diagnosable.
+    private var presentationEnvironment = "surface=unbound"
     private var lowLatencyPresentation = false
     /// AppKit replaces or re-homes the drawable swapchain during native
     /// fullscreen transitions. Do not acquire from the disappearing layer;
@@ -254,6 +251,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
             ? reserveRenderTokenLocked()
             : nil
         frameLock.unlock()
+        capturePresentationEnvironment(view: view)
         view.isPaused = hasFrame
         if gaming, hasFrame, !suspended, layer != nil {
             startGamingPacer()
@@ -290,6 +288,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
             ? reserveRenderTokenLocked()
             : nil
         frameLock.unlock()
+        capturePresentationEnvironment(view: view)
         view.isPaused = hasFrame
         if gaming, hasFrame, layer != nil {
             startGamingPacer()
@@ -297,6 +296,39 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
             stopGamingPacer()
         }
         if let token { scheduleRender(token: token) }
+    }
+
+    /// Queue a main-thread snapshot for the next per-second stats line.
+    /// Environment state changes far less often than the rendering counters,
+    /// so a one-line, one-tick-delayed sample is sufficient and nonblocking.
+    func refreshPresentationEnvironment() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let view = self.view else { return }
+            self.capturePresentationEnvironment(view: view)
+        }
+    }
+
+    private func capturePresentationEnvironment(view: MTKView) {
+        precondition(Thread.isMainThread)
+        let window = view.window
+        let layer = view.layer as? CAMetalLayer
+        let flag: (Bool) -> String = { $0 ? "1" : "0" }
+        let nativeFullscreen = window?.styleMask.contains(.fullScreen) == true
+        let environment = "surface="
+            + "active\(flag(NSApp.isActive))"
+            + ",visible\(flag(window?.occlusionState.contains(.visible) == true))"
+            + ",window\(flag(window?.isVisible == true))"
+            + ",key\(flag(window?.isKeyWindow == true))"
+            + ",space\(flag(window?.isOnActiveSpace == true))"
+            + ",full\(flag(nativeFullscreen))"
+            + ",screen\(window?.screen?.maximumFramesPerSecond ?? 0)"
+            + ",view\(view.preferredFramesPerSecond)"
+            + ",sync\(flag(layer?.displaySyncEnabled == true))"
+            + ",buf\(layer?.maximumDrawableCount ?? 0)"
+            + ",hidden\(flag(view.isHidden || layer?.isHidden == true))"
+        frameLock.lock()
+        presentationEnvironment = environment
+        frameLock.unlock()
     }
 
     /// A blocked drawable belongs to an obsolete presentation generation.
@@ -308,14 +340,6 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         gamingRenderQueue = DispatchQueue(label: label,
                                           qos: .userInteractive,
                                           autoreleaseFrequency: .workItem)
-    }
-
-    private func rotateGamingPrefetchQueueLocked() {
-        gamingPrefetchQueueGeneration &+= 1
-        let label = "com.porthole.mac.drawable-prefetch.\(gamingPrefetchQueueGeneration)"
-        gamingPrefetchQueue = DispatchQueue(label: label,
-                                            qos: .userInteractive,
-                                            autoreleaseFrequency: .workItem)
     }
 
     /// Switch between MTKView's quality path and hardware-paced gaming mode.
@@ -438,7 +462,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
 extension MetalRenderer {
     /// Bind Core Video's forecast clock to the screen that owns the stream.
     /// Its nominal period and initial phase seed the independent cadence wheel
-    /// below; callback delivery jitter cannot move an established latch.
+    /// below; later forecasts may only apply the servo's bounded correction.
     private func startGamingPacer() {
         stopGamingPacer()
 
@@ -500,20 +524,17 @@ extension MetalRenderer {
         frameLock.lock()
         gamingPacerGeneration &+= 1
         gamingCadenceRunning = false
-        let retiredPrefetch = prefetchedGamingDrawable
-        prefetchedGamingDrawable = nil
-        gamingDrawablePrefetchPending = false
-        gamingDrawablePrefetchReady = DispatchSemaphore(value: 0)
+        gamingLatestForecastHostTime = 0
+        gamingRecoveryTicks = 0
         rotateGamingRenderQueueLocked()
-        rotateGamingPrefetchQueueLocked()
         frameLock.unlock()
-        withExtendedLifetime(retiredPrefetch) {}
     }
 
     /// Core Video supplies the display phase and nominal period, but its
     /// callback delivery can bunch under WindowServer load. Seed one
     /// mach-clocked cadence wheel from that phase and let it issue evenly
-    /// spaced latches; later callbacks are diagnostics, not a second clock.
+    /// spaced latches; later callbacks supply bounded phase-error samples,
+    /// not per-frame deadlines.
     private func scheduleGamingTick(outputHostTime: UInt64,
                                     refreshTicks: UInt64) {
         let now = CVGetCurrentHostTime()
@@ -521,6 +542,7 @@ extension MetalRenderer {
         frameLock.lock()
         gamingTickCallbacks += 1
         gamingLookaheadTicks &+= outputHostTime > now ? outputHostTime - now : 0
+        gamingLatestForecastHostTime = outputHostTime
         guard lowLatencyPresentation,
               !presentationSuspended,
               latestFrame != nil,
@@ -545,30 +567,50 @@ extension MetalRenderer {
         }
     }
 
+    // swiftlint:disable:next function_body_length
     private func runGamingCadence(pacerGeneration: UInt64,
                                   forecastHostTime: UInt64,
                                   refreshTicks: UInt64) {
-        let latchLeadTicks = UInt64(
+        let baseLatchLeadTicks = UInt64(
             CVGetHostClockFrequency() * Self.gamingLatchLeadSeconds
+        )
+        let recoveryLeadTicks = UInt64(
+            CVGetHostClockFrequency() * Self.gamingRecoveryLeadSeconds
         )
         let outputPhaseTicks = UInt64(
             CVGetHostClockFrequency() * Self.gamingOutputPhaseOffsetSeconds
         )
-        var outputHostTime = forecastHostTime &+ outputPhaseTicks
-        var now = CVGetCurrentHostTime()
-        while outputHostTime > refreshTicks,
-              outputHostTime - refreshTicks > now + latchLeadTicks {
-            outputHostTime -= refreshTicks
-        }
-        while outputHostTime <= now + latchLeadTicks {
-            outputHostTime &+= refreshTicks
-        }
+        var outputHostTime = Self.firstGamingOutputHostTime(
+            forecastHostTime: forecastHostTime,
+            outputPhaseTicks: outputPhaseTicks,
+            refreshTicks: refreshTicks,
+            maximumLeadTicks: baseLatchLeadTicks + recoveryLeadTicks
+        )
 
         while true {
+            outputHostTime = servoedGamingOutputHostTime(
+                outputHostTime,
+                outputPhaseTicks: outputPhaseTicks,
+                refreshTicks: refreshTicks
+            )
+            frameLock.lock()
+            guard gamingPacerGeneration == pacerGeneration,
+                  gamingCadenceRunning,
+                  lowLatencyPresentation,
+                  !presentationSuspended,
+                  latestFrame != nil,
+                  streamLayer != nil else {
+                frameLock.unlock()
+                return
+            }
+            let recovering = gamingRecoveryTicks > 0
+            frameLock.unlock()
+
+            let latchLeadTicks = baseLatchLeadTicks + (recovering ? recoveryLeadTicks : 0)
             let latchHostTime = outputHostTime > latchLeadTicks
                 ? outputHostTime - latchLeadTicks
                 : outputHostTime
-            now = CVGetCurrentHostTime()
+            let now = CVGetCurrentHostTime()
             if latchHostTime <= now {
                 frameLock.lock()
                 guard gamingPacerGeneration == pacerGeneration,
@@ -583,14 +625,9 @@ extension MetalRenderer {
             }
 
             frameLock.lock()
-            guard gamingPacerGeneration == pacerGeneration,
-                  gamingCadenceRunning,
-                  lowLatencyPresentation,
-                  !presentationSuspended,
-                  latestFrame != nil,
-                  streamLayer != nil else {
-                frameLock.unlock()
-                return
+            if recovering, gamingRecoveryTicks > 0 {
+                gamingRecoveryTicks -= 1
+                gamingRecoveryFrames += 1
             }
             gamingTicksScheduled += 1
             gamingWaitTicks &+= latchHostTime - now
@@ -603,6 +640,73 @@ extension MetalRenderer {
         }
     }
 
+    private static func firstGamingOutputHostTime(
+        forecastHostTime: UInt64,
+        outputPhaseTicks: UInt64,
+        refreshTicks: UInt64,
+        maximumLeadTicks: UInt64
+    ) -> UInt64 {
+        var outputHostTime = forecastHostTime &+ outputPhaseTicks
+        let now = CVGetCurrentHostTime()
+        while outputHostTime > refreshTicks,
+              outputHostTime - refreshTicks > now + maximumLeadTicks {
+            outputHostTime -= refreshTicks
+        }
+        while outputHostTime <= now + maximumLeadTicks {
+            outputHostTime &+= refreshTicks
+        }
+        return outputHostTime
+    }
+
+    private func servoedGamingOutputHostTime(
+        _ outputHostTime: UInt64,
+        outputPhaseTicks: UInt64,
+        refreshTicks: UInt64
+    ) -> UInt64 {
+        frameLock.lock()
+        let forecastHostTime = gamingLatestForecastHostTime
+        frameLock.unlock()
+        guard forecastHostTime > 0, refreshTicks > 0 else { return outputHostTime }
+        // A stopped or occluded display link must not make this mapping walk a
+        // progressively older forecast forward one refresh at a time. The
+        // independent wheel remains authoritative until fresh forecasts resume.
+        let now = CVGetCurrentHostTime()
+        guard forecastHostTime &+ (refreshTicks &* 4) >= now else {
+            return outputHostTime
+        }
+
+        var desiredHostTime = forecastHostTime &+ outputPhaseTicks
+        let halfRefresh = refreshTicks / 2
+        while desiredHostTime + halfRefresh < outputHostTime {
+            desiredHostTime &+= refreshTicks
+        }
+        while desiredHostTime > outputHostTime + halfRefresh,
+              desiredHostTime >= refreshTicks {
+            desiredHostTime -= refreshTicks
+        }
+
+        let error = Int64(desiredHostTime) - Int64(outputHostTime)
+        let maximumStep = Int64(
+            CVGetHostClockFrequency() * Self.gamingServoMaximumStepSeconds
+        )
+        let correction = min(max(error, -maximumStep), maximumStep)
+        let correctedHostTime: UInt64
+        if correction >= 0 {
+            correctedHostTime = outputHostTime &+ UInt64(correction)
+        } else {
+            correctedHostTime = outputHostTime - UInt64(-correction)
+        }
+
+        let absoluteCorrection = UInt64(abs(correction))
+        frameLock.lock()
+        gamingServoSignedTicks += correction
+        gamingServoAbsoluteTicks &+= absoluteCorrection
+        gamingServoMaximumTicks = max(gamingServoMaximumTicks, absoluteCorrection)
+        gamingServoSamples += 1
+        frameLock.unlock()
+        return correctedHostTime
+    }
+
     private static func waitPrecisely(until hostTime: UInt64) {
         let spinTicks = UInt64(CVGetHostClockFrequency() * gamingLatchSpinSeconds)
         let parkUntil = hostTime > spinTicks ? hostTime - spinTicks : hostTime
@@ -612,67 +716,13 @@ extension MetalRenderer {
         while CVGetCurrentHostTime() < hostTime {}
     }
 
-    // Acquire this refresh's writable surface as soon as Core Video forecasts
-    // it, then keep the pixel mailbox open until the late-latch deadline. This
-    // splits scarce swapchain admission from content admission without owning
-    // a third surface or queueing an extra frame.
-    // swiftlint:disable:next cyclomatic_complexity function_body_length
+    // Keep drawable and pixel admission together at the content latch. The
+    // three-surface pool absorbs ordinary compositor jitter; feedback widens
+    // only the next few latches after a measured outlier breaks that cushion.
     private func drawLateLatchedFrame(pacerGeneration: UInt64,
                                       outputHostTime: UInt64,
                                       latchHostTime: UInt64) {
         guard let layer = gamingLayer(pacerGeneration: pacerGeneration) else { return }
-        let drawableStarted = CVGetCurrentHostTime()
-        var reservation = takePrefetchedGamingDrawable(
-            layer: layer,
-            pacerGeneration: pacerGeneration
-        )
-        if reservation.drawable == nil, reservation.pending {
-            let deadlineLeadTicks = UInt64(
-                CVGetHostClockFrequency() * Self.gamingMinimumTargetLeadSeconds
-            )
-            let deadline = outputHostTime > deadlineLeadTicks
-                ? outputHostTime - deadlineLeadTicks
-                : outputHostTime
-            let waitStarted = CVGetCurrentHostTime()
-            if deadline > waitStarted {
-                let waitNanoseconds = Int(
-                    Double(deadline - waitStarted)
-                        / CVGetHostClockFrequency()
-                        * 1_000_000_000
-                )
-                _ = reservation.ready.wait(timeout: .now() + .nanoseconds(waitNanoseconds))
-            }
-            let waitFinished = CVGetCurrentHostTime()
-            if waitFinished <= deadline {
-                reservation = takePrefetchedGamingDrawable(
-                    layer: layer,
-                    pacerGeneration: pacerGeneration
-                )
-            }
-            frameLock.lock()
-            gamingDrawablePrefetchLatchWaitTicks &+= waitFinished - waitStarted
-            if reservation.drawable == nil {
-                gamingDrawablePrefetchTimeouts += 1
-            } else {
-                gamingDrawablePrefetchRecoveries += 1
-            }
-            frameLock.unlock()
-            guard waitFinished <= deadline else { return }
-        }
-        guard !reservation.pending || reservation.drawable != nil else { return }
-        guard let drawable = reservation.drawable ?? layer.nextDrawable() else { return }
-        let drawableFinished = CVGetCurrentHostTime()
-        frameLock.lock()
-        if reservation.drawable == nil {
-            gamingDrawablePrefetchMisses += 1
-        } else {
-            gamingDrawablePrefetchHits += 1
-        }
-        gamingDrawableTicks &+= drawableFinished - drawableStarted
-        gamingDrawableSamples += 1
-        frameLock.unlock()
-        scheduleNextGamingDrawablePrefetch(layer: layer,
-                                           pacerGeneration: pacerGeneration)
         if latchHostTime > CVGetCurrentHostTime() {
             Self.waitPrecisely(until: latchHostTime)
         }
@@ -680,7 +730,25 @@ extension MetalRenderer {
             pacerGeneration: pacerGeneration,
             outputHostTime: outputHostTime
         ), latchedLayer === layer else { return }
+
+        let drawableStarted = CVGetCurrentHostTime()
+        guard let drawable = layer.nextDrawable() else { return }
         let contentLatched = CVGetCurrentHostTime()
+        let drawableTicks = contentLatched - drawableStarted
+        let recoveryThresholdTicks = UInt64(
+            CVGetHostClockFrequency() * Self.gamingDrawableRecoveryThresholdSeconds
+        )
+
+        frameLock.lock()
+        gamingDrawableTicks &+= drawableTicks
+        gamingDrawableSamples += 1
+        if drawableTicks >= recoveryThresholdTicks {
+            gamingDrawableRecoverySignals += 1
+            if gamingRecoveryTicks == 0 { gamingRecoveryActivations += 1 }
+            gamingRecoveryTicks = max(gamingRecoveryTicks, Self.gamingRecoveryFrameCount)
+        }
+        frameLock.unlock()
+
         let minimumLeadTicks = UInt64(
             CVGetHostClockFrequency() * Self.gamingMinimumTargetLeadSeconds
         )
@@ -690,7 +758,7 @@ extension MetalRenderer {
             // Keep the drawable lifecycle moving even when WindowServer hands
             // this slot back too late for its forecast vblank. Abandoning an
             // acquired drawable delays its recycle and turns one late tick into
-            // a sustained starvation cascade; the pacer resynchronizes below.
+            // a sustained starvation cascade; recovery widens following latches.
             frameLock.lock()
             gamingDeadlineResyncs += 1
             let availableLead = outputHostTime > contentLatched
@@ -701,6 +769,8 @@ extension MetalRenderer {
                 : 0
             gamingDeadlineDeficitTicks &+= deficit
             gamingDeadlineMaximumDeficitTicks = max(gamingDeadlineMaximumDeficitTicks, deficit)
+            if gamingRecoveryTicks == 0 { gamingRecoveryActivations += 1 }
+            gamingRecoveryTicks = max(gamingRecoveryTicks, Self.gamingRecoveryFrameCount)
             frameLock.unlock()
         }
         let presentationTime = Double(outputHostTime) / CVGetHostClockFrequency()
@@ -797,78 +867,6 @@ extension MetalRenderer {
     // swiftlint:enable function_body_length
 }
 
-// MARK: Gaming tick lifetime
-
-extension MetalRenderer {
-    private func takePrefetchedGamingDrawable(
-        layer: CAMetalLayer,
-        pacerGeneration: UInt64
-    ) -> GamingDrawableReservation {
-        frameLock.lock()
-        let valid = gamingPacerGeneration == pacerGeneration
-            && streamLayer === layer
-            && prefetchedGamingGeneration == pacerGeneration
-        let drawable = valid ? prefetchedGamingDrawable : nil
-        if valid { prefetchedGamingDrawable = nil }
-        let pending = gamingPacerGeneration == pacerGeneration
-            && gamingDrawablePrefetchPending
-        let ready = gamingDrawablePrefetchReady
-        frameLock.unlock()
-        return GamingDrawableReservation(drawable: drawable,
-                                         pending: pending,
-                                         ready: ready)
-    }
-
-    private func scheduleNextGamingDrawablePrefetch(
-        layer: CAMetalLayer,
-        pacerGeneration: UInt64
-    ) {
-        frameLock.lock()
-        let valid = gamingPacerGeneration == pacerGeneration
-            && lowLatencyPresentation
-            && !presentationSuspended
-            && streamLayer === layer
-        guard valid, !gamingDrawablePrefetchPending,
-              prefetchedGamingDrawable == nil else {
-            frameLock.unlock()
-            return
-        }
-        gamingDrawablePrefetchPending = true
-        let prefetchQueue = gamingPrefetchQueue
-        let ready = DispatchSemaphore(value: 0)
-        gamingDrawablePrefetchReady = ready
-        frameLock.unlock()
-
-        prefetchQueue.async { [weak self] in
-            let started = CVGetCurrentHostTime()
-            let drawable = layer.nextDrawable()
-            let finished = CVGetCurrentHostTime()
-            guard let self else { return }
-            self.frameLock.lock()
-            let valid = self.gamingPacerGeneration == pacerGeneration
-                && self.lowLatencyPresentation
-                && !self.presentationSuspended
-                && self.streamLayer === layer
-            var retiredDrawable: CAMetalDrawable?
-            if self.gamingPacerGeneration == pacerGeneration {
-                self.gamingDrawablePrefetchPending = false
-                self.gamingDrawablePrefetchTicks &+= finished - started
-                self.gamingDrawablePrefetchSamples += 1
-            }
-            if valid, let drawable {
-                retiredDrawable = self.prefetchedGamingDrawable
-                self.prefetchedGamingDrawable = drawable
-                self.prefetchedGamingGeneration = pacerGeneration
-            } else {
-                retiredDrawable = drawable
-            }
-            self.frameLock.unlock()
-            withExtendedLifetime(retiredDrawable) {}
-            ready.signal()
-        }
-    }
-}
-
 // MARK: Gaming frame admission
 
 extension MetalRenderer {
@@ -942,17 +940,17 @@ extension MetalRenderer {
         let committed = gamingTicksCommitted
         let busy = gamingTicksBusy
         let held = gamingFrameHolds
-        let prefetchHits = gamingDrawablePrefetchHits
-        let prefetchMisses = gamingDrawablePrefetchMisses
-        let prefetchRecoveries = gamingDrawablePrefetchRecoveries
-        let prefetchTimeouts = gamingDrawablePrefetchTimeouts
-        let prefetchLatchWait = gamingDrawablePrefetchLatchWaitTicks
-        let prefetch = gamingDrawablePrefetchTicks
-        let prefetchSamples = gamingDrawablePrefetchSamples
         let lookahead = gamingLookaheadTicks
         let wait = gamingWaitTicks
         let drawable = gamingDrawableTicks
         let drawableSamples = gamingDrawableSamples
+        let recoveryFrames = gamingRecoveryFrames
+        let recoveryActivations = gamingRecoveryActivations
+        let drawableRecoverySignals = gamingDrawableRecoverySignals
+        let servoSigned = gamingServoSignedTicks
+        let servoAbsolute = gamingServoAbsoluteTicks
+        let servoMaximum = gamingServoMaximumTicks
+        let servoSamples = gamingServoSamples
         let deadlineResyncs = gamingDeadlineResyncs
         let deadlineDeficit = gamingDeadlineDeficitTicks
         let deadlineMaximumDeficit = gamingDeadlineMaximumDeficitTicks
@@ -962,22 +960,23 @@ extension MetalRenderer {
         let presentationPhaseSamples = gamingPresentationPhaseSamples
         let staleRetries = gamingStaleRetries
         let staleRecoveries = gamingStaleRecoveries
+        let environment = presentationEnvironment
         gamingTickCallbacks = 0
         gamingTicksScheduled = 0
         gamingTicksCommitted = 0
         gamingTicksBusy = 0
         gamingFrameHolds = 0
-        gamingDrawablePrefetchHits = 0
-        gamingDrawablePrefetchMisses = 0
-        gamingDrawablePrefetchRecoveries = 0
-        gamingDrawablePrefetchTimeouts = 0
-        gamingDrawablePrefetchLatchWaitTicks = 0
-        gamingDrawablePrefetchTicks = 0
-        gamingDrawablePrefetchSamples = 0
         gamingLookaheadTicks = 0
         gamingWaitTicks = 0
         gamingDrawableTicks = 0
         gamingDrawableSamples = 0
+        gamingRecoveryFrames = 0
+        gamingRecoveryActivations = 0
+        gamingDrawableRecoverySignals = 0
+        gamingServoSignedTicks = 0
+        gamingServoAbsoluteTicks = 0
+        gamingServoMaximumTicks = 0
+        gamingServoSamples = 0
         gamingDeadlineResyncs = 0
         gamingDeadlineDeficitTicks = 0
         gamingDeadlineMaximumDeficitTicks = 0
@@ -1002,24 +1001,32 @@ extension MetalRenderer {
             guard samples > 0 else { return "n/a" }
             return String(format: "%.2f", Double(micros) / Double(samples) / 1_000)
         }
+        func averageSignedMilliseconds(_ ticks: Int64, _ samples: Int) -> String {
+            guard samples > 0 else { return "0.000" }
+            return String(format: "%.3f", Double(ticks) / Double(samples) / ticksPerMillisecond)
+        }
         return "present_driver=core_video_latch"
             + " pacer=\(callbacks)/\(scheduled)/\(committed)/\(busy)"
             + " hold=\(held)"
             + " lookahead_ms=\(averageMilliseconds(lookahead, callbacks))"
             + " latch_wait_ms=\(averageMilliseconds(wait, scheduled))"
             + " drawable_wait_ms=\(averageMilliseconds(drawable, drawableSamples))"
-            + " prefetch=\(prefetchHits)/\(prefetchMisses)"
-            + " prefetch_wait_ms=\(averageMilliseconds(prefetch, prefetchSamples))"
-            + " prefetch_latch=\(prefetchRecoveries)/\(prefetchTimeouts)"
-            + "/\(averageMilliseconds(prefetchLatchWait, prefetchRecoveries + prefetchTimeouts))"
+            + " drawable_policy=adaptive_late_acquire_3"
+            + " recovery=\(recoveryFrames)/\(recoveryActivations)"
+            + " recovery_signal=\(drawableRecoverySignals)"
+            + " servo_ms=\(averageSignedMilliseconds(servoSigned, servoSamples))"
+            + "/\(averageMilliseconds(servoAbsolute, servoSamples))"
+            + "/\(averageMilliseconds(servoMaximum, 1))"
             + " cap_target_ms=\(averageMicroseconds(captureTarget, captureTargetSamples))"
             + " present_phase_ms=\(averageSignedMicroseconds(presentationPhase, presentationPhaseSamples))"
             + " latch_lead_ms=\(String(format: "%.2f", Self.gamingLatchLeadSeconds * 1_000))"
+            + "/\(String(format: "%.2f", (Self.gamingLatchLeadSeconds + Self.gamingRecoveryLeadSeconds) * 1_000))"
             + " phase_offset_ms=\(String(format: "%.2f", Self.gamingOutputPhaseOffsetSeconds * 1_000))"
             + " deadline_resync=\(deadlineResyncs)"
             + " deadline_deficit_ms=\(averageMilliseconds(deadlineDeficit, deadlineResyncs))"
             + "/\(averageMilliseconds(deadlineMaximumDeficit, 1))"
             + " stale_retry=\(staleRecoveries)/\(staleRetries)"
+            + " \(environment)"
     }
     // swiftlint:enable function_body_length
 

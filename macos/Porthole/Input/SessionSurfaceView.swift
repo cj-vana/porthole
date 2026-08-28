@@ -121,10 +121,10 @@ final class SessionSurfaceView: MTKView {
 
     private func applyPresentationMode() {
         guard let metalLayer = layer as? CAMetalLayer else { return }
-        // Keep the swapchain at the minimum depth. A third writable surface
-        // lets Core Animation retain another complete frame even though the
-        // cadence wheel submits only once per tick.
-        let drawableCount = 2
+        // Gaming uses a third surface as a recycle cushion. Its renderer keeps
+        // steady-state admission late and briefly widens the latch only after
+        // an observed recycle outlier. Quality stays minimum-depth and synced.
+        let drawableCount = lowLatencyPresentation ? 3 : 2
         if metalLayer.maximumDrawableCount != drawableCount {
             metalLayer.maximumDrawableCount = drawableCount
         }

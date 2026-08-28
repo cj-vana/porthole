@@ -96,7 +96,7 @@ Once per second while connected, one line goes to os_log (subsystem
 `/tmp/porthole-mac-stats.log`:
 
 ```
-stats fps=215 gpu_fps=144 present_fps=144 prep_ms=0.01 decode_ms=1.52 rtt_ms=0.55 enc_ms=1.00 cap_arrive_ms=1.5 cap_decoded_ms=2.9 cap_present_ms=10.3 cap_gpu_ms=6.2 decoded_draw_ms=2.33 draw_present_ms=4.98 submit_present_ms=4.98 submit_gpu_ms=0.90 jitter_ms=0.01/0.15/0.22/0.21/0.58 max_gap_ms=4.7/5.1/5.3/7.5/8.2 loss=0.00% queue=0 agent_fps=215/215 tx_kbps=50430 audio_buf_ms=118 audio_pkts=50 audio_lost=0 audio_drop_ms=0 audio_underrun=0 present_driver=core_video_latch pacer=145/144/144/0 hold=0 lookahead_ms=9.73 latch_wait_ms=6.78 drawable_wait_ms=6.00 prefetch=144/0 prefetch_wait_ms=6.92 prefetch_latch=144/0/5.99 cap_target_ms=9.14 present_phase_ms=1.11 latch_lead_ms=4.00 phase_offset_ms=2.50 deadline_resync=0 deadline_deficit_ms=0.00/0.00 stale_retry=0/0
+stats fps=216 gpu_fps=144 present_fps=144 prep_ms=0.01 decode_ms=1.77 rtt_ms=0.64 enc_ms=1.00 cap_arrive_ms=2.0 cap_decoded_ms=3.6 cap_present_ms=12.1 cap_gpu_ms=7.1 decoded_draw_ms=2.36 draw_present_ms=6.07 submit_present_ms=6.07 submit_gpu_ms=1.06 jitter_ms=0.01/0.14/0.22/0.45/2.50 max_gap_ms=4.7/5.0/5.2/9.6/18.4 loss=0.00% queue=0 agent_fps=216/216 tx_kbps=50660 audio_buf_ms=85 audio_pkts=51 audio_lost=0 audio_drop_ms=0 audio_underrun=0 present_driver=core_video_latch pacer=155/144/144/0 hold=0 lookahead_ms=9.06 latch_wait_ms=6.55 drawable_wait_ms=0.03 drawable_policy=adaptive_late_acquire_3 recovery=0/0 recovery_signal=0 servo_ms=0.002/0.22/0.25 cap_target_ms=9.65 present_phase_ms=2.42 latch_lead_ms=4.00/5.00 phase_offset_ms=1.50 deadline_resync=0 deadline_deficit_ms=0.00/0.00 stale_retry=0/0 surface=active1,visible1,window1,key1,space1,full1,screen144,view144,sync0,buf3,hidden0
 ```
 
 - `fps`: frames decoded this second. `gpu_fps` is successful Metal command
@@ -118,10 +118,10 @@ stats fps=215 gpu_fps=144 present_fps=144 prep_ms=0.01 decode_ms=1.52 rtt_ms=0.5
   the last 60; a sliding window rather than an all-time minimum because the
   two clocks drift apart by tens of ppm, and an all-time minimum would show
   that drift as latency growing over hours).
-- `prefetch` reports ready/missed drawable reservations; its wait is resource
-  lookahead and does not freeze the newest decoded-frame mailbox.
-  `prefetch_latch` is reservations recovered at the latch / timed out / mean
-  bounded latch wait.
+- `drawable_policy=adaptive_late_acquire_3` means Gaming acquires from a
+  three-surface pool only after its content latch. `recovery` is frames using
+  the temporary wider latch / recovery activations; `recovery_signal` counts
+  drawable waits that requested one. No decoded frame is prefetched.
 - `loss`: lost frames as a percentage of frames seen (reassembly gaps, stale
   partials, backlog drops). `queue`: datagrams waiting for the decode queue.
 - `pacer` is hardware callbacks / phase-locked cadence ticks / committed
@@ -134,8 +134,12 @@ stats fps=215 gpu_fps=144 present_fps=144 prep_ms=0.01 decode_ms=1.52 rtt_ms=0.5
   latch.
 - `present_driver=core_video_latch` identifies the active presentation path.
   `present_phase_ms` is actual compositor presentation minus the nominal
-  target. `latch_lead_ms` and `phase_offset_ms` record the two timing constants
-  used for that run, so an A/B result remains reproducible.
+  target. `servo_ms` is signed mean / absolute mean / maximum phase correction
+  applied per tick from fresh Core Video forecasts. `latch_lead_ms` records the
+  steady/recovery leads; `phase_offset_ms` records the target phase.
+- `surface` records whether the app, window, Space, native Full state, screen
+  rate, MTKView rate, layer synchronization, drawable count, and visibility
+  made the sample valid. Use active native-Full samples for timing comparisons.
 - `audio_*`: the audio channel's second (US-009): jitter buffer depth, Opus
   packets received, packets lost to sequence gaps, milliseconds dropped to
   keep the buffer under its cap, and playback underruns. All zeros until
