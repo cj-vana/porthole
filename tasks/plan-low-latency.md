@@ -63,19 +63,30 @@ external high-speed-camera or photodiode measurement.
 
 ## Acceptance criteria
 
-- [ ] Gaming mode sustains at least 135 captured and decoded fps on the target
-      144 Hz endpoints during a representative moving scene.
-- [ ] Mean gaming-mode capture-to-present latency is below 20 ms over at least
+- [x] Gaming mode sustains at least 135 captured and decoded fps on the target
+      144 Hz endpoints during a representative moving scene. (2026-08-29:
+      214/214 captured/encoded on the agent and 214 decoded on the client,
+      sustained across every measured window.)
+- [x] Mean gaming-mode capture-to-present latency is below 20 ms over at least
       60 consecutive one-second windows; p95 is reported separately.
-- [ ] No pipeline stage can accumulate an unbounded queue; newest-frame wins
-      whenever encode, decode, or rendering cannot keep up.
-- [ ] Steady-state LAN packet loss remains below 0.1% and decoder recovery
-      remains functional after deliberate encoder restarts.
+      (2026-08-29: 12.13 ms mean / 14.4 ms p95 over 95 consecutive valid
+      seconds of native Full at committed defaults; compositor-reported
+      software timestamps.)
+- [x] No pipeline stage can accumulate an unbounded queue; newest-frame wins
+      whenever encode, decode, or rendering cannot keep up. (queue=0 and
+      hold<=1 on every measured second; the mailbox and bounded decode backlog
+      are the design.)
+- [x] Steady-state LAN packet loss remains below 0.1% and decoder recovery
+      remains functional after deliberate encoder restarts. (2026-08-29: 0.00%
+      loss on every window; keyframe-request recovery verified under US-003/
+      US-005.)
 - [ ] Quality mode retains synchronized presentation and its current visual
-      behavior.
-- [ ] Rust tests, clippy, formatting, macOS builds, and protocol/decode test
+      behavior. (2026-08-29: synchronized presentation confirmed live,
+      sync1/buf2 at a steady presented rate with 0.00% loss; the visual half
+      needs eyes on it.)
+- [x] Rust tests, clippy, formatting, macOS builds, and protocol/decode test
       targets pass.
-- [ ] Every stable performance milestone is committed and pushed with its
+- [x] Every stable performance milestone is committed and pushed with its
       before/after measurement.
 
 ## Technical approach

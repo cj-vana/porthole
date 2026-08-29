@@ -96,7 +96,7 @@ Once per second while connected, one line goes to os_log (subsystem
 `/tmp/porthole-mac-stats.log`:
 
 ```
-stats fps=216 gpu_fps=144 present_fps=144 prep_ms=0.01 decode_ms=1.77 rtt_ms=0.64 enc_ms=1.00 cap_arrive_ms=2.0 cap_decoded_ms=3.6 cap_present_ms=12.1 cap_gpu_ms=7.1 decoded_draw_ms=2.36 draw_present_ms=6.07 submit_present_ms=6.07 submit_gpu_ms=1.06 jitter_ms=0.01/0.14/0.22/0.45/2.50 max_gap_ms=4.7/5.0/5.2/9.6/18.4 loss=0.00% queue=0 agent_fps=216/216 tx_kbps=50660 audio_buf_ms=85 audio_pkts=51 audio_lost=0 audio_drop_ms=0 audio_underrun=0 present_driver=core_video_latch pacer=155/144/144/0 hold=0 lookahead_ms=9.06 latch_wait_ms=6.55 drawable_wait_ms=0.03 drawable_policy=adaptive_late_acquire_3 recovery=0/0 recovery_signal=0 servo_ms=0.002/0.22/0.25 cap_target_ms=9.65 present_phase_ms=2.42 latch_lead_ms=4.00/5.00 phase_offset_ms=1.50 deadline_resync=0 deadline_deficit_ms=0.00/0.00 stale_retry=0/0 surface=active1,visible1,window1,key1,space1,full1,screen144,view144,sync0,buf3,hidden0
+stats fps=215 gpu_fps=145 present_fps=141 prep_ms=0.01 decode_ms=1.74 rtt_ms=0.56 enc_ms=1.00 cap_arrive_ms=1.9 cap_decoded_ms=3.5 cap_present_ms=12.5 cap_gpu_ms=6.1 decoded_draw_ms=1.59 draw_present_ms=7.44 submit_present_ms=7.44 submit_gpu_ms=1.04 jitter_ms=0.01/0.16/0.22/1.03/2.71 max_gap_ms=4.7/5.3/5.6/13.1/16.0 loss=0.00% queue=0 agent_fps=214/214 tx_kbps=50192 audio_buf_ms=48 audio_pkts=49 audio_lost=0 audio_drop_ms=0 audio_underrun=0 present_driver=core_video_latch pacer=150/144/144/1 hold=0 lookahead_ms=8.71 latch_wait_ms=5.72 drawable_wait_ms=0.22 drawable_policy=predictive_micro_latch_3 predictive=32/32 predictive_wait_ms=0.65 predictive_advance_ms=4.60 decode_period_ms=4.64 predictive_max_ms=1.50 recovery=19/2 recovery_signal=8 servo_ms=-0.075/0.23/0.25 cap_target_ms=8.10 present_phase_ms=4.42 latch_lead_ms=4.00/5.00 phase_offset_ms=1.50 deadline_resync=4 deadline_deficit_ms=0.47/1.00 stale_retry=4/4 surface=active1,visible1,window1,key1,space1,full1,screen144,view144,sync0,buf3,hidden0
 ```
 
 - `fps`: frames decoded this second. `gpu_fps` is successful Metal command
@@ -118,10 +118,19 @@ stats fps=216 gpu_fps=144 present_fps=144 prep_ms=0.01 decode_ms=1.77 rtt_ms=0.6
   the last 60; a sliding window rather than an all-time minimum because the
   two clocks drift apart by tens of ppm, and an all-time minimum would show
   that drift as latency growing over hours).
-- `drawable_policy=adaptive_late_acquire_3` means Gaming acquires from a
-  three-surface pool only after its content latch. `recovery` is frames using
-  the temporary wider latch / recovery activations; `recovery_signal` counts
-  drawable waits that requested one. No decoded frame is prefetched.
+- `drawable_policy` names the Gaming admission policy.
+  `predictive_micro_latch_3`, the default, acquires from a three-surface pool
+  after its content latch, then may hold the acquired drawable for a bounded
+  moment when the learned source decode period predicts the next decode will
+  land inside `predictive_max_ms` (`gamingPredictiveLatchMaxMicros`; 0 turns
+  the wait off and reports `adaptive_late_acquire_3`, plain late acquisition).
+  The hold always keeps a 2 ms submit reserve before the output deadline.
+  `predictive` is hits over attempted waits, `predictive_wait_ms` the mean
+  wait per attempt, `predictive_advance_ms` how much fresher the presented
+  frame's decode timestamp was on a hit, and `decode_period_ms` the learned
+  source period. `recovery` is frames using the temporary wider latch /
+  recovery activations; `recovery_signal` counts drawable waits that
+  requested one. No decoded frame is prefetched.
 - `loss`: lost frames as a percentage of frames seen (reassembly gaps, stale
   partials, backlog drops). `queue`: datagrams waiting for the decode queue.
 - `pacer` is hardware callbacks / phase-locked cadence ticks / committed
@@ -251,12 +260,14 @@ cadence worker behind WindowServer's present handshake; at native 1440p that
 handshake can cross a refresh boundary and collapse an otherwise 144 Hz path
 to 60 Hz.
 
-On the tested fixed-144 Hz panel, Gaming + Auto stays at native 144 Hz. A
-clean 67-second native-Full 2560x1440 soak with a 214-215 fps real VFR source
-averaged 141.4 compositor-reported presentations/s with a 144 fps median.
-Capture-to-present latency averaged 10.49 ms, with a 10.50 ms median, 11.50 ms
-p95, and 9.70-12.70 ms range. Stream loss and deadline resynchronizations were
-both zero. Those are software timestamps, not an optical measurement.
+On the tested fixed-144 Hz panel, Gaming + Auto stays at native 144 Hz.
+Settled single-display native-Full 2560x1440 windows with a 214-215 fps real
+VFR source measured 11.90 ms mean / 12.8 ms p95 capture-to-present at 143.4
+mean / 144 median presentations/s with zero loss and zero deadline
+resynchronizations. The predictive drawable hold then lowered a two-display
+composited session from 12.7 to 12.1 ms mean at a 99% prediction hit rate;
+`docs/latency-tuning.md` holds the full acceptance record. Those are software
+timestamps, not an optical measurement.
 
 ## Audio (US-009)
 

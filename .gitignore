@@ -9,6 +9,7 @@ xcuserdata/
 *.xcuserstate
 macos/Porthole.xcodeproj/
 build/
+build-release/
 
 # Agent scratch/progress logs (never committed)
 .Codex/

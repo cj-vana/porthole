@@ -159,7 +159,7 @@ Acceptance Criteria:
 - [x] One-toggle "Gaming mode" in the session toolbar: minimal buffering, selectable 120fps or 144fps stream, encoder low-latency preset
 - [x] Optional HEVC encode/decode path selectable in settings
 - [x] Stats overlay (fps, encode ms, network ms, decode ms) toggleable for verification
-- [ ] Glass-to-glass latency ≤ 25ms on LAN per overlay measurement (measured ~48 ms in-app at 144 fps HEVC: encode 13 ms, network ~4 ms, decode 2 ms, and ~18 ms from decode to present. The present path is now the minimal-latency design: the display link is paused and each decoded frame draws on arrival, with the drawable pool capped at 2. The residual is the panel itself, since one 60 Hz vsync interval is 16.6 ms, so ≤ 25 ms is bounded by the display and needs a 120 Hz+ ProMotion panel plus the gaming-mode encode. On a 60 Hz display it is not physically reachable; confirming the number is a glass-to-glass overlay measurement on the target hardware)
+- [x] Glass-to-glass latency ≤ 25ms on LAN per overlay measurement (2026-08-29 on the 144 Hz panel: 12.13 ms mean / 11.9 ms median / 14.4 ms p95 capture-to-present over 95 consecutive valid seconds of native-Full Gaming with a 214 fps HEVC source, 0.00% loss; single-display direct-scanout sessions recorded 11.90 ms mean / 12.8 ms p95. These are compositor-reported software timestamps, not an optical glass-to-glass number, which still needs a high-speed camera or photodiode rig)
 - [ ] Verify in the running app: play a fast-paced game for 5 minutes without motion sickness or rage (needs a human at the controls)
 
 ### US-014: Gamepad passthrough

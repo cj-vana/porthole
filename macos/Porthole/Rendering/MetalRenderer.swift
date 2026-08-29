@@ -31,6 +31,22 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     private static let gamingRecoveryLeadSeconds = 0.0010
     private static let gamingRecoveryFrameCount = 6
     private static let gamingDrawableRecoveryThresholdSeconds = 0.00075
+    /// When a faster source is about to finish its next decode, Gaming may
+    /// hold an already-acquired drawable for this bounded interval and submit
+    /// the newer frame to the same output slot. The live A/B against a 214 fps
+    /// source hit its prediction on 98-99% of attempted ticks and lowered mean
+    /// capture-to-present by 0.7 ms at no presentation-rate cost; zero disables
+    /// the wait and restores the plain late-acquire policy.
+    private static let gamingPredictiveLatchMaximumWaitSeconds = tunedSeconds(
+        key: "gamingPredictiveLatchMaxMicros",
+        defaultMicros: 1_500,
+        allowedMicros: 0...1_500
+    )
+    /// The drawable is already available before a predictive wait. Preserve
+    /// two milliseconds for encode, GPU scheduling, and compositor admission.
+    private static let gamingPredictiveMinimumSubmitLeadSeconds = 0.0020
+    private static let gamingDecodeIntervalSmoothing = 0.25
+    private static let gamingDecodeIntervalMicrosRange = 1_000.0...20_000.0
     /// Follow genuine display-phase movement without importing callback jitter
     /// into the independent wheel. At 144 Hz this converges a 3 ms step in
     /// about 12 frames while moving any one latch by at most a quarter ms.
@@ -94,6 +110,14 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         let generation: UInt64
     }
 
+    /// One render tick waiting for a newer decoded generation. Registering a
+    /// per-attempt semaphore avoids accumulated signals from the much faster
+    /// decode stream; the decode callback wakes only the active waiter.
+    private struct GamingPredictiveWaiter {
+        let generation: UInt64
+        let signal: DispatchSemaphore
+    }
+
     /// A plane texture plus the cache entry that keeps it valid.
     private struct PlaneTexture {
         let reference: CVMetalTexture
@@ -132,6 +156,9 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     private let frameLock = NSLock()
     private var latestFrame: StreamFrame?
     private var nextGeneration: UInt64 = 0
+    private var gamingLatestDecodeMicros: UInt64?
+    private var gamingDecodeIntervalMicros: Double?
+    private var gamingPredictiveWaiter: GamingPredictiveWaiter?
     /// Quality mode allows one frame to be rendering or awaiting scanout.
     /// New frames replace `latestFrame` while that slot is busy. A unique
     /// token makes late Metal callbacks harmless when a layer is occluded.
@@ -153,6 +180,10 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     private var gamingWaitTicks: UInt64 = 0
     private var gamingDrawableTicks: UInt64 = 0
     private var gamingDrawableSamples = 0
+    private var gamingPredictiveAttempts = 0
+    private var gamingPredictiveHits = 0
+    private var gamingPredictiveWaitTicks: UInt64 = 0
+    private var gamingPredictiveAdvanceMicros: UInt64 = 0
     private var gamingRecoveryTicks = 0
     private var gamingRecoveryFrames = 0
     private var gamingRecoveryActivations = 0
@@ -370,20 +401,47 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     /// the frame's capture time mapped onto the client clock, or nil when
     /// no pong has established the offset yet.
     func display(_ pixelBuffer: CVPixelBuffer, captureClientMicros: UInt64?) {
+        let decodedMicros = ClientClock.nowMicros()
         frameLock.lock()
         let firstFrame = latestFrame == nil
+        if let previousMicros = gamingLatestDecodeMicros,
+           decodedMicros > previousMicros {
+            let intervalMicros = Double(decodedMicros - previousMicros)
+            if Self.gamingDecodeIntervalMicrosRange.contains(intervalMicros) {
+                if let previousEstimate = gamingDecodeIntervalMicros {
+                    let gain = Self.gamingDecodeIntervalSmoothing
+                    gamingDecodeIntervalMicros = previousEstimate
+                        + (intervalMicros - previousEstimate) * gain
+                } else {
+                    gamingDecodeIntervalMicros = intervalMicros
+                }
+            } else {
+                gamingDecodeIntervalMicros = nil
+            }
+        }
+        gamingLatestDecodeMicros = decodedMicros
+        let generation = nextGeneration
         latestFrame = StreamFrame(pixelBuffer: pixelBuffer,
                                   width: CVPixelBufferGetWidth(pixelBuffer),
                                   height: CVPixelBufferGetHeight(pixelBuffer),
                                   captureClientMicros: captureClientMicros,
-                                  decodedMicros: ClientClock.nowMicros(),
-                                  generation: nextGeneration)
+                                  decodedMicros: decodedMicros,
+                                  generation: generation)
         nextGeneration += 1
+        let predictiveSignal: DispatchSemaphore?
+        if let waiter = gamingPredictiveWaiter,
+           waiter.generation != generation {
+            gamingPredictiveWaiter = nil
+            predictiveSignal = waiter.signal
+        } else {
+            predictiveSignal = nil
+        }
         let gaming = lowLatencyPresentation
         let token = !lowLatencyPresentation && !presentationSuspended && activeRenderToken == nil
             ? reserveRenderTokenLocked()
             : nil
         frameLock.unlock()
+        predictiveSignal?.signal()
         if firstFrame {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
@@ -449,7 +507,12 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         latestFrame = nil
         activeRenderToken = nil
         lastGamingGeneration = nil
+        gamingLatestDecodeMicros = nil
+        gamingDecodeIntervalMicros = nil
+        let predictiveSignal = gamingPredictiveWaiter?.signal
+        gamingPredictiveWaiter = nil
         frameLock.unlock()
+        predictiveSignal?.signal()
         DispatchQueue.main.async { [weak self] in
             self?.stopGamingPacer()
             self?.view?.isPaused = false
@@ -526,8 +589,11 @@ extension MetalRenderer {
         gamingCadenceRunning = false
         gamingLatestForecastHostTime = 0
         gamingRecoveryTicks = 0
+        let predictiveSignal = gamingPredictiveWaiter?.signal
+        gamingPredictiveWaiter = nil
         rotateGamingRenderQueueLocked()
         frameLock.unlock()
+        predictiveSignal?.signal()
     }
 
     /// Core Video supplies the display phase and nominal period, but its
@@ -716,9 +782,96 @@ extension MetalRenderer {
         while CVGetCurrentHostTime() < hostTime {}
     }
 
-    // Keep drawable and pixel admission together at the content latch. The
-    // three-surface pool absorbs ordinary compositor jitter; feedback widens
-    // only the next few latches after a measured outlier breaks that cushion.
+    // A source faster than the local display periodically finishes a decode
+    // just after the ordinary latch. Wait only when the learned decode period
+    // predicts that boundary inside a small configured window. The drawable
+    // is already acquired, and the output deadline keeps a fixed render
+    // reserve, so a prediction miss cannot grow into swapchain starvation.
+    // swiftlint:disable:next function_body_length
+    private func waitForPredictedFrame(pacerGeneration: UInt64,
+                                       layer: CAMetalLayer,
+                                       outputHostTime: UInt64) {
+        let maximumWaitSeconds = Self.gamingPredictiveLatchMaximumWaitSeconds
+        guard maximumWaitSeconds > 0 else { return }
+
+        let nowMicros = ClientClock.nowMicros()
+        let nowHostTime = CVGetCurrentHostTime()
+        let hostClockFrequency = CVGetHostClockFrequency()
+        let maximumWaitTicks = UInt64(hostClockFrequency * maximumWaitSeconds)
+        let minimumSubmitLeadTicks = UInt64(
+            hostClockFrequency * Self.gamingPredictiveMinimumSubmitLeadSeconds
+        )
+
+        frameLock.lock()
+        guard gamingPacerGeneration == pacerGeneration,
+              lowLatencyPresentation,
+              !presentationSuspended,
+              streamLayer === layer,
+              let frame = latestFrame,
+              let decodeIntervalMicros = gamingDecodeIntervalMicros else {
+            frameLock.unlock()
+            return
+        }
+        let predictedMicros = Double(frame.decodedMicros) + decodeIntervalMicros
+        let predictionLeadMicros = predictedMicros - Double(nowMicros)
+        let predictionLeadTicks = UInt64(
+            max(0, predictionLeadMicros) / 1_000_000 * hostClockFrequency
+        )
+        guard predictionLeadMicros > 0,
+              predictionLeadTicks <= maximumWaitTicks,
+              outputHostTime > nowHostTime + minimumSubmitLeadTicks else {
+            frameLock.unlock()
+            return
+        }
+        let deadlineWaitTicks = outputHostTime - nowHostTime - minimumSubmitLeadTicks
+        let waitTicks = min(maximumWaitTicks, deadlineWaitTicks)
+        guard predictionLeadTicks <= waitTicks else {
+            frameLock.unlock()
+            return
+        }
+
+        let signal = DispatchSemaphore(value: 0)
+        gamingPredictiveWaiter = GamingPredictiveWaiter(
+            generation: frame.generation,
+            signal: signal
+        )
+        gamingPredictiveAttempts += 1
+        let startingGeneration = frame.generation
+        let startingDecodedMicros = frame.decodedMicros
+        frameLock.unlock()
+
+        let waitStarted = CVGetCurrentHostTime()
+        let waitNanoseconds = Int(
+            Double(waitTicks) / hostClockFrequency * 1_000_000_000
+        )
+        _ = signal.wait(timeout: .now() + .nanoseconds(max(1, waitNanoseconds)))
+        let waitFinished = CVGetCurrentHostTime()
+
+        frameLock.lock()
+        if gamingPredictiveWaiter?.signal === signal {
+            gamingPredictiveWaiter = nil
+        }
+        let newerFrame = gamingPacerGeneration == pacerGeneration
+            && lowLatencyPresentation
+            && !presentationSuspended
+            && streamLayer === layer
+            ? latestFrame
+            : nil
+        if let newerFrame, newerFrame.generation != startingGeneration {
+            gamingPredictiveHits += 1
+            if newerFrame.decodedMicros >= startingDecodedMicros {
+                gamingPredictiveAdvanceMicros &+= newerFrame.decodedMicros
+                    - startingDecodedMicros
+            }
+        }
+        gamingPredictiveWaitTicks &+= waitFinished - waitStarted
+        frameLock.unlock()
+    }
+
+    // The three-surface pool absorbs ordinary compositor jitter. A configured
+    // predictive micro-latch may hold this already-admitted surface briefly
+    // for an imminent newer decode, without moving the output target.
+    // swiftlint:disable:next function_body_length
     private func drawLateLatchedFrame(pacerGeneration: UInt64,
                                       outputHostTime: UInt64,
                                       latchHostTime: UInt64) {
@@ -733,8 +886,8 @@ extension MetalRenderer {
 
         let drawableStarted = CVGetCurrentHostTime()
         guard let drawable = layer.nextDrawable() else { return }
-        let contentLatched = CVGetCurrentHostTime()
-        let drawableTicks = contentLatched - drawableStarted
+        let drawableFinished = CVGetCurrentHostTime()
+        let drawableTicks = drawableFinished - drawableStarted
         let recoveryThresholdTicks = UInt64(
             CVGetHostClockFrequency() * Self.gamingDrawableRecoveryThresholdSeconds
         )
@@ -748,6 +901,11 @@ extension MetalRenderer {
             gamingRecoveryTicks = max(gamingRecoveryTicks, Self.gamingRecoveryFrameCount)
         }
         frameLock.unlock()
+
+        waitForPredictedFrame(pacerGeneration: pacerGeneration,
+                              layer: layer,
+                              outputHostTime: outputHostTime)
+        let contentLatched = CVGetCurrentHostTime()
 
         let minimumLeadTicks = UInt64(
             CVGetHostClockFrequency() * Self.gamingMinimumTargetLeadSeconds
@@ -944,6 +1102,11 @@ extension MetalRenderer {
         let wait = gamingWaitTicks
         let drawable = gamingDrawableTicks
         let drawableSamples = gamingDrawableSamples
+        let predictiveAttempts = gamingPredictiveAttempts
+        let predictiveHits = gamingPredictiveHits
+        let predictiveWait = gamingPredictiveWaitTicks
+        let predictiveAdvance = gamingPredictiveAdvanceMicros
+        let decodeInterval = gamingDecodeIntervalMicros
         let recoveryFrames = gamingRecoveryFrames
         let recoveryActivations = gamingRecoveryActivations
         let drawableRecoverySignals = gamingDrawableRecoverySignals
@@ -970,6 +1133,10 @@ extension MetalRenderer {
         gamingWaitTicks = 0
         gamingDrawableTicks = 0
         gamingDrawableSamples = 0
+        gamingPredictiveAttempts = 0
+        gamingPredictiveHits = 0
+        gamingPredictiveWaitTicks = 0
+        gamingPredictiveAdvanceMicros = 0
         gamingRecoveryFrames = 0
         gamingRecoveryActivations = 0
         gamingDrawableRecoverySignals = 0
@@ -1005,13 +1172,28 @@ extension MetalRenderer {
             guard samples > 0 else { return "0.000" }
             return String(format: "%.3f", Double(ticks) / Double(samples) / ticksPerMillisecond)
         }
+        let drawablePolicy = Self.gamingPredictiveLatchMaximumWaitSeconds > 0
+            ? "predictive_micro_latch_3"
+            : "adaptive_late_acquire_3"
+        let decodePeriod = decodeInterval.map {
+            String(format: "%.2f", $0 / 1_000)
+        } ?? "n/a"
+        let predictiveMaximum = String(
+            format: "%.2f",
+            Self.gamingPredictiveLatchMaximumWaitSeconds * 1_000
+        )
         return "present_driver=core_video_latch"
             + " pacer=\(callbacks)/\(scheduled)/\(committed)/\(busy)"
             + " hold=\(held)"
             + " lookahead_ms=\(averageMilliseconds(lookahead, callbacks))"
             + " latch_wait_ms=\(averageMilliseconds(wait, scheduled))"
             + " drawable_wait_ms=\(averageMilliseconds(drawable, drawableSamples))"
-            + " drawable_policy=adaptive_late_acquire_3"
+            + " drawable_policy=\(drawablePolicy)"
+            + " predictive=\(predictiveHits)/\(predictiveAttempts)"
+            + " predictive_wait_ms=\(averageMilliseconds(predictiveWait, predictiveAttempts))"
+            + " predictive_advance_ms=\(averageMicroseconds(predictiveAdvance, predictiveHits))"
+            + " decode_period_ms=\(decodePeriod)"
+            + " predictive_max_ms=\(predictiveMaximum)"
             + " recovery=\(recoveryFrames)/\(recoveryActivations)"
             + " recovery_signal=\(drawableRecoverySignals)"
             + " servo_ms=\(averageSignedMilliseconds(servoSigned, servoSamples))"

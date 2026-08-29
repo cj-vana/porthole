@@ -30,15 +30,17 @@ It is two programs that share one wire protocol:
   VideoToolbox decode. Direct private-LAN traffic is paced for 2.5 GbE;
   tunnel/public peers retain a conservative 1 Gb/s burst ceiling.
 - A Maximum gaming mode that requests a 288 Hz VFR source and late-latches the
-  freshest real frame onto the physical display. On the fixed-144 Hz test
-  panel, Gaming + Auto now phase-locks to the native 144 Hz cadence. A clean
-  67-second native-Full 2560x1440 soak with a 214-215 fps real VFR source
-  averaged 141.4 actual presentations/s and had a 144 fps median. Measured
-  capture-to-present latency averaged 10.49 ms, with a 10.50 ms median,
-  11.50 ms p95, and 9.70-12.70 ms range; loss and deadline resynchronizations
-  were both zero. Presentation time is reported by the Metal drawable; it is
-  a compositor timestamp, not an optical glass-to-glass measurement. The
-  latter needs a high-speed camera or photodiode rig.
+  freshest real frame onto the physical display, holding an acquired drawable
+  a bounded moment when the learned source period predicts the next decode is
+  imminent. On the fixed-144 Hz test panel, Gaming + Auto phase-locks to the
+  native 144 Hz cadence. Settled single-display native-Full 2560x1440 windows
+  with a 214-215 fps real VFR source measured 11.90 ms mean / 12.8 ms p95
+  capture-to-present at 143.4 mean / 144 median presentations/s with zero
+  loss and zero deadline resynchronizations; the predictive hold then took a
+  two-display composited session from 12.7 to 12.1 ms mean at a 99% prediction
+  hit rate. Presentation time is reported by the Metal drawable; it is a
+  compositor timestamp, not an optical glass-to-glass measurement. The latter
+  needs a high-speed camera or photodiode rig.
 - Native Mac input: pixel-precise trackpad scrolling, modifier keys, exclusive
   remote shortcut capture (including Command-Space and Command-Tab), a
   pointer-lock mode for games, and a single on-screen cursor.

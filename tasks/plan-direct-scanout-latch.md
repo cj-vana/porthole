@@ -83,6 +83,9 @@ optical glass-to-glass result. Five milliseconds is not a truthful claim on a
 - [x] Presentation-phase telemetry identifies full-refresh misses.
 - [x] Fit and Full viewport resizing remain unchanged.
 - [ ] Sixty-second live Full soak stays smooth with 0% packet loss and no
-      deadline resyncs.
-- [ ] SwiftLint, Rust tests, Mac builds, input/decode gates, signed universal
+      deadline resyncs. (2026-08-29: 95 valid Full seconds at 0.00% loss, but
+      with the built-in panel active alongside the external the session is
+      composited and the baseline alone logs ~2 resyncs/s; the zero-resync bar
+      needs the single-display direct-scanout state.)
+- [x] SwiftLint, Rust tests, Mac builds, input/decode gates, signed universal
       Release, deployment, and final UI regression pass.
